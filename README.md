@@ -45,12 +45,17 @@ This is the heart of the farm.
   can hold its own against the youngsters.
 - **Colored eggs.** Optional egg colors, so a full nest isn't all the same.
 - **Fresh blood.** Brand-new random dragons keep the gene pool from going stale.
+- **Islands.** The farm can split into separate islands that breed apart and only swap a champion now and then.
+- **Elders and seasons.** Great dragons that leave pass their wisdom to future eggs, and every season has a champion
+  that wakes up when its season returns.
 - **Natural selection.** Dragons that keep failing rest, then retire to make room for the next generation.
 - **Adaptive evolution.** When the farm gets stuck, mutations get bolder; when it's thriving, they get careful.
 
 <p align="center"><img src="docs/screenshots/family-tree.png" alt="Family tree" width="85%"></p>
 
 **Family tree:** see every dragon's ancestry, which bloodlines thrived and which died out.
+
+<p align="center"><img src="docs/screenshots/bloodlines.png" alt="Bloodlines" width="90%"></p>
 
 ## What's in a dragon's genes
 Every gene is inherited, mutated and crossbred, and every dragon carries a different mix:
@@ -79,6 +84,18 @@ and its habits. It hatches as a royal egg, competes like everyone else, and its 
 
 <p align="center"><img src="docs/screenshots/designer.png" alt="Design an egg" width="65%"></p>
 
+## Put them to the test
+Send any dragon through a trial on a stretch of history: how it did in every part of it, how it copes with bad luck
+and higher costs, and where it shines or struggles. Then **save the lesson to its memory**, so its children inherit
+it, or teach the whole farm. Champions can be re-tested every night, and the ones losing their edge go **rusty**.
+
+<p align="center"><img src="docs/screenshots/backtest.png" alt="Trial" width="80%"></p>
+
+**See and edit what they learned:** open any dragon's rules, with the evidence behind each one, change what you like,
+and hatch your edit as its child.
+
+<p align="center"><img src="docs/screenshots/edit-rules.png" alt="Edit rules" width="75%"></p>
+
 ## Bot Lab
 Raise a fresh farm on one stretch of history, freeze the best dragons, then send them into a later stretch
 they have never seen. Only the ones that still win there **pass**. Run several rounds to tell real talent from luck.
@@ -102,6 +119,12 @@ Press **Catch!** on any dragon to keep it in your **Library**.
 ## The farm never forgets
 Close the app and come back later: the farm picks up exactly where it left off, with every dragon, egg,
 family line and lesson intact.
+
+## Choose what they learn
+A **Learning** page lets you switch each kind of learning on or off: how dragons are judged, how they breed, which
+rules they can grow, and what they remember.
+
+<p align="center"><img src="docs/screenshots/settings-learning.png" alt="Learning" width="85%"></p>
 
 ## Make it yours
 - Dragons, simple cards or a plain list
