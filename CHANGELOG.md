@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.7.1
+- **Fix: 1.7.0 crashed on start.** Fixed.
+- **Bot Collection** (Ctrl+B): press **Catch!** on any bot to collect it. Each gets a name, a rarity (Common to
+  Legendary, rare shinies) and a level that rises as it keeps proving itself. Pick a **team of up to 6** and tick
+  "Trade with my team". Hall of Fame bots are caught automatically.
+- **Your bots are little dragons** now: working ones flap and look around, sleeping ones snooze, and they breathe fire
+  when they buy. Hover for details, click to select, double-click for the full card. New dragon app icon.
+- **Portfolio tab**: coin badges, value, profit/loss, average cost vs price, 24h change, share of the portfolio,
+  and an allocation bar.
+- **Buy and Sell by hand** (Portfolio tab, or the buttons on each coin), in Practice and Live mode.
+- **Staking info** for each coin: whether it can be staked, plus estimated earnings at the rate you're offered.
+- **Bots set the stops**: in Wildcard, the account's Safety stop and Lock in profit can follow what the winning bots
+  learned (Settings > Orders). Your own numbers are the fallback.
+- Clearer Settings > Basics, with examples.
+- Fixed a possible crash when the coin list or a test alert came back from the internet.
+
 ## 1.7.0
 **Renamed to CBBF.** Your data, saved login and bot files carry over automatically on first start.
 
