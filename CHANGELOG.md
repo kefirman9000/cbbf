@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.9.1
+- **Design an egg** (Bot Farm tab or Ctrl+E): write your own bot. Pick a strategy and its numbers (for example RSI:
+  buy below 28, sell above 72), how often it decides, its own safety stop and profit target, and habits like a
+  trailing stop, minimum hold or which markets it may trade. Hatch it on the farm as a royal egg, save it to your
+  Library, or both. Right-click any saved bot and choose "Use as a template" to start from it.
+- **Pick up where you left off**: if the bot was running when CBBF closed (or the computer restarted), the session
+  resumes on the next start. Practice resumes straight away; Live asks first and you still type LIVE.
+  (Settings > Library & Hall of Fame; stopping the bot yourself turns it off for next time.)
+- **Lighter**: hidden tabs no longer redraw on every decision (Trades and the Bot Farm catch up when you open them).
+
 ## 1.9.0
 Smarter learning
 - **Prove it on new prices**: a bot can only become Winning after it has also made money on live prices that

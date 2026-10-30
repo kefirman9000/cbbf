@@ -143,6 +143,8 @@ SETTING_GROUPS = [
         ("hof_min_trades", "...and at least this many finished (sold) trades", int),
         ("auto_catch", "Save long-term winners to the Bot Library automatically", bool),
         ("auto_hof", "Also put long-term winners straight into the Hall of Fame (off = you choose who goes in)", bool),
+        ("auto_resume", "Pick up where you left off: if the bot was running when CBBF closed, resume that session on the "
+                        "next start (Live asks first)", bool),
         ("hof_load", "When the whole farm trades, bring the 10 best Hall of Fame bots back to compete", bool),
         ("team_locked", "Trading with my team: keep exactly those bots (untick to let the team breed new bots)", bool),
     ]),
@@ -618,6 +620,7 @@ class App:
         root.after(700, self.maybe_welcome)
         root.after(1500, self.maybe_setup)
         root.after(4000, self.auto_check_update)
+        root.after(2500, self.auto_resume)
         if self.migrated:
             root.after(900, lambda: self.write("Welcome to CBBF. Your data from the old Desk Utils folder was copied over.", "good"))
         self.fit_and_center()
@@ -684,6 +687,7 @@ class App:
         if self.running and not messagebox.askyesno(
                 "Quit", "The bot is running. Quitting stops it (open positions stay open).\n\nQuit anyway?"):
             return
+        self.cfg["was_running"] = bool(self.running)  # closed while running: pick it up next time
         self.running = False
         self.awake.off()
         try:
@@ -908,6 +912,7 @@ class App:
         self.split = split
         nb = self.nb = ttk.Notebook(nbf)
         nb.pack(fill="both", expand=True, pady=(8, 0))
+        nb.bind("<<NotebookTabChanged>>", lambda e: self.refresh_visible())
         t0, t1, t2, t3, t4, t5, t6 = (ttk.Frame(nb) for _ in range(7))
         nb.add(t0, text="  \u25c6 Bot Farm  ")
         nb.add(t1, text="  Portfolio  ")
@@ -997,7 +1002,7 @@ class App:
         self.update_status()
         self.refresh_view()
         for seq, fn in (("<Control-Return>", self.toggle), ("<Control-l>", self.open_lab), ("<Control-h>", self.open_hof),
-                        ("<Control-k>", self.open_coin_browser), ("<Control-b>", self.open_collection), ("<Control-comma>", self.open_settings),
+                        ("<Control-k>", self.open_coin_browser), ("<Control-b>", self.open_collection), ("<Control-e>", self.open_designer), ("<Control-comma>", self.open_settings),
                         ("<F5>", self.refresh_trades)):
             root.bind_all(seq, lambda e, f=fn: (f(), "break")[1])
         root.after(60, self.set_farm_style)
@@ -1023,6 +1028,7 @@ class App:
         m.add_command(label="Bot Lab...", command=self.open_lab, accelerator="Ctrl+L")
         m.add_command(label="Hall of Fame...", command=self.open_hof, accelerator="Ctrl+H")
         m.add_command(label="Bot family tree...", command=self.open_family)
+        m.add_command(label="Design an egg...", command=self.open_designer, accelerator="Ctrl+E")
         m.add_command(label="Bot Library...", command=self.open_collection, accelerator="Ctrl+B")
         m.add_command(label="Browse Coinbase coins...", command=self.open_coin_browser, accelerator="Ctrl+K")
         m.add_command(label="Settings...", command=self.open_settings, accelerator="Ctrl+,")
@@ -2421,6 +2427,11 @@ class App:
     def toggle(self):
         if self.running:
             self.running = False
+            self.cfg["was_running"] = False  # stopped on purpose: don't auto-resume next time
+            try:
+                E.save_json(CONFIG_PATH, self.cfg)
+            except OSError:
+                pass
             self.ui_running(False)
             self.save_state()
             if self.session:
@@ -2452,6 +2463,11 @@ class App:
         if self.session and self.live and not self.client:
             return messagebox.showerror("Live mode", "Log in to Coinbase first.")
         self.running = True
+        self.cfg.update(was_running=True, last_mode="live" if self.live else "paper", last_wild=bool(self.wild_var.get()))
+        try:
+            E.save_json(CONFIG_PATH, self.cfg)
+        except OSError:
+            pass
         self.ui_running(True)
         self.write(f"Started ({'LIVE' if self.live else 'paper'}, {'wildcard' if self.wild else ', '.join(self.active)}, "
                    f"{E.fmt_bar(self.session_bar)} bars, {self.settings.get('order_type', 'market')} orders).")
@@ -2463,7 +2479,9 @@ class App:
         live = self.mode_var.get() == "live"
         saved = E.load_json(E.state_path(live))
         resume = False
-        if saved:
+        if saved and getattr(self, "_auto_resume", False):
+            resume = True
+        elif saved:
             ans = messagebox.askyesnocancel(
                 "Resume session?",
                 f"A saved {'live' if live else 'paper'} session exists (cash ${saved['cash']:,.2f}, "
@@ -3016,7 +3034,10 @@ class App:
                     who=friendly_label(t["name"], t["params"], t.get("tf", 1), self.session_bar)))
             del self.shadow_trades[:-2000]
             if new:
-                self.refresh_trades()
+                if self.nb.tab(self.nb.select(), "text").strip() == "Trades":
+                    self.refresh_trades()
+                else:
+                    self._trades_dirty = True  # redrawn when you open the Trades tab
         except Exception:
             note = self._record_error("listing the bots' trades")
             if note:
@@ -3684,6 +3705,9 @@ class App:
         ttk.Button(top, text="Catch!", style="Accent.TButton", command=self.catch_selected).pack(side="right")
         eb = ttk.Button(top, text="+ Add eggs", style="Plain.TButton", command=self.add_eggs)
         eb.pack(side="right", padx=(0, 6))
+        db = ttk.Button(top, text="Design an egg...", style="Plain.TButton", command=self.open_designer)
+        db.pack(side="right", padx=(0, 6))
+        Tip(db, "Write your own bot: strategy, numbers (like RSI buy below 28 / sell above 72), pace, exits and habits. (Ctrl+E)")
         Tip(eb, "Hatch brand-new random bots now. They learn on recent prices and have to earn their place.")
         self.farm_size = tk.StringVar(value=str(int(self.settings.get("max_bots", 30))))
         fs = ttk.Spinbox(top, from_=14, to=200, increment=2, width=5, textvariable=self.farm_size, command=self.set_farm_size)
@@ -3954,6 +3978,11 @@ class App:
                                    + "   |   goal: make money after fees, and more than just holding"))
         f = self.grid_filter.get()
         style = self.farm_style.get()
+        try:
+            if "Bot Farm" not in self.nb.tab(self.nb.select(), "text"):
+                return  # not visible: drawn when you open the tab
+        except Exception:
+            pass
         if style == "List" and self.grid_list is not None:
             self._fill_grid_list(items)
             return
@@ -4170,6 +4199,201 @@ class App:
     def _after_select(self):
         self.draw_chart()
         if self.farm_style.get() != "Dragons":  # dragons show the selection on their own animated layer
+            self.grid_refresh()
+
+    # ---------------- custom egg designer ----------------
+    def open_designer(self, preset=None):
+        """Design a bot by hand: strategy and its numbers, pace, own exits and traits. Hatch it on the farm
+        (a royal egg) and/or save it to the Library."""
+        w = tk.Toplevel(self.root)
+        w.title("Design an egg")
+        w.resizable(False, False)
+        f = ttk.Frame(w, padding=14)
+        f.pack()
+        ttk.Label(f, text="Design an egg", font=("", 13, "bold")).grid(row=0, column=0, columnspan=4, sticky="w")
+        ttk.Label(f, foreground=MUTED, wraplength=560, text=(
+            "Write your own rules: pick a strategy and its numbers (for example RSI: buy below 28, sell above 72), how "
+            "often it decides, its own exits and habits. It hatches as a royal egg and competes like any other bot, "
+            "and its children keep your bloodline.")).grid(row=1, column=0, columnspan=4, sticky="w", pady=(2, 10))
+        names = [n for n in E.WILDCARD_STRATS]
+        labels = {STRAT_LABELS.get(n, n): n for n in names}
+        strat = tk.StringVar(value=STRAT_LABELS.get((preset or {}).get("name", "RSI"), "Buy dips / sell peaks"))
+        ttk.Label(f, text="Strategy").grid(row=2, column=0, sticky="w")
+        sb = ttk.Combobox(f, textvariable=strat, values=list(labels), state="readonly", width=28)
+        sb.grid(row=2, column=1, columnspan=2, sticky="w", padx=6)
+        tip = ttk.Label(f, foreground=MUTED, wraplength=560, justify="left")
+        tip.grid(row=3, column=0, columnspan=4, sticky="w", pady=(2, 6))
+        pbox = ttk.LabelFrame(f, text=" Its numbers ", padding=8)
+        pbox.grid(row=4, column=0, columnspan=4, sticky="ew")
+        pvars = {}
+
+        def build_params(*_):
+            for ch in pbox.winfo_children():
+                ch.destroy()
+            pvars.clear()
+            n = labels[strat.get()]
+            tip.config(text=STRAT_TIPS.get(n, ""))
+            given = (preset or {}).get("params", {}) if (preset or {}).get("name") == n else {}
+            for r, (k, dv) in enumerate(E.STRATS[n]["params"].items()):
+                lo, hi = E.STRATS[n]["bounds"][k]
+                ttk.Label(pbox, text=PARAM_NAMES.get(k, k)).grid(row=r, column=0, sticky="w")
+                var = tk.StringVar(value=str(given.get(k, dv)))
+                ttk.Entry(pbox, textvariable=var, width=8).grid(row=r, column=1, padx=6)
+                ttk.Label(pbox, text=f"{lo:g} to {hi:g}", foreground=MUTED).grid(row=r, column=2, sticky="w")
+                pvars[k] = (var, type(dv), lo, hi)
+        sb.bind("<<ComboboxSelected>>", build_params)
+        build_params()
+        row = 5
+        ttk.Label(f, text="Decides every").grid(row=row, column=0, sticky="w", pady=(8, 0))
+        paces = {E.fmt_bar(tf * self.session_bar) + (f"  ({tf} bars)" if tf > 1 else "  (every bar)"): tf for tf in E.TIMEFRAMES}
+        pace = tk.StringVar(value=next(k for k, v in paces.items() if v == E.clamp_tf((preset or {}).get("tf", 1))))
+        ttk.Combobox(f, textvariable=pace, values=list(paces), state="readonly", width=22).grid(
+            row=row, column=1, columnspan=2, sticky="w", padx=6, pady=(8, 0))
+        row += 1
+        risk = (preset or {}).get("risk") or {}
+        sl, tp = tk.StringVar(value=str(risk.get("sl", 0) or "")), tk.StringVar(value=str(risk.get("tp", 0) or ""))
+        ttk.Label(f, text="Own safety stop %").grid(row=row, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(f, textvariable=sl, width=8).grid(row=row, column=1, sticky="w", padx=6, pady=(6, 0))
+        ttk.Label(f, text="Own profit target %").grid(row=row, column=2, sticky="w", pady=(6, 0))
+        ttk.Entry(f, textvariable=tp, width=8).grid(row=row, column=3, sticky="w", padx=6, pady=(6, 0))
+        row += 1
+        tbox = ttk.LabelFrame(f, text=" Habits (traits), tick to use ", padding=8)
+        tbox.grid(row=row, column=0, columnspan=4, sticky="ew", pady=(10, 0))
+        given_t = (preset or {}).get("traits") or {}
+        tvars = {}
+        for r, k in enumerate(k for k in E.TRAITS if k not in ("exit", "moods")):
+            spec = E.TRAITS[k]
+            on = tk.BooleanVar(value=k in given_t)
+            start = spec["lo"] + (spec["hi"] - spec["lo"]) / 4  # a sensible starting value inside the allowed range
+            val = tk.StringVar(value=str(given_t.get(k, round(start, 2) if spec["kind"] is float else int(round(start)))))
+            ttk.Checkbutton(tbox, text=E.TRAIT_NAMES.get(k, k), variable=on).grid(row=r // 2, column=(r % 2) * 3, sticky="w")
+            ttk.Entry(tbox, textvariable=val, width=6).grid(row=r // 2, column=(r % 2) * 3 + 1, padx=4)
+            ttk.Label(tbox, text=f"{spec['lo']:g}-{spec['hi']:g}", foreground=MUTED).grid(row=r // 2, column=(r % 2) * 3 + 2,
+                                                                                          sticky="w", padx=(0, 12))
+            tvars[k] = (on, val)
+        rr = (len(tvars) + 1) // 2
+        exit_only = tk.BooleanVar(value=bool(given_t.get("exit")))
+        ttk.Checkbutton(tbox, text="Sell only through its own exits (stop / target / trailing / max hold)",
+                        variable=exit_only).grid(row=rr, column=0, columnspan=6, sticky="w", pady=(4, 0))
+        mood_vars = []
+        mrow = ttk.Frame(tbox)
+        mrow.grid(row=rr + 1, column=0, columnspan=6, sticky="w", pady=(4, 0))
+        ttk.Label(mrow, text="Only trade when the market is:").pack(side="left")
+        gm = int(given_t.get("moods") or 0)
+        for i, m in enumerate(E.MOODS):
+            var = tk.BooleanVar(value=bool(gm & (1 << i)) if gm else True)
+            ttk.Checkbutton(mrow, text=m, variable=var).pack(side="left", padx=(6, 0))
+            mood_vars.append(var)
+        size = tk.StringVar(value=str((preset or {}).get("size", 1.0)))
+        row += 1
+        ttk.Label(f, text="Trade size (x normal)").grid(row=row, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(f, textvariable=size, width=8).grid(row=row, column=1, sticky="w", padx=6, pady=(8, 0))
+
+        def build():
+            n = labels[strat.get()]
+            try:
+                params = {}
+                for k, (var, typ, lo, hi) in pvars.items():
+                    v = float(var.get())
+                    if not lo <= v <= hi:
+                        raise ValueError(f"{PARAM_NAMES.get(k, k)} must be {lo:g} to {hi:g}")
+                    params[k] = int(round(v)) if typ is int else v
+                if E.fix_params(n, dict(params)) != params:
+                    raise ValueError("short averages must be below long ones, and buy levels well below sell levels")
+                traits = {}
+                for k, (on, val) in tvars.items():
+                    if on.get():
+                        traits[k] = float(val.get())
+                if exit_only.get():
+                    traits["exit"] = 1
+                mask = sum(1 << i for i, v in enumerate(mood_vars) if v.get())
+                if 0 < mask < 15:
+                    traits["moods"] = mask
+                entry = dict(name=n, params=params, tf=paces[pace.get()], size=min(max(float(size.get() or 1), 0.25), 3.0),
+                             risk=E.clean_risk({"sl": float(sl.get() or 0), "tp": float(tp.get() or 0)}),
+                             traits=E.clean_traits(traits), stats={}, notes="designed by you")
+                return entry
+            except ValueError as ex:
+                messagebox.showerror("Design an egg", f"Please check the numbers: {ex}", parent=w)
+                return None
+
+        def hatch(save=False, farm=True):
+            entry = build()
+            if not entry:
+                return
+            if farm:
+                if not self.tourn or not self.seeded:
+                    return messagebox.showinfo("Design an egg", "Start the bot with Wildcard ticked first, or use "
+                                                                "'Save to Library' to keep it for later.", parent=w)
+                v = self.tourn.add_variant(entry["name"], entry["params"], {c: self.hist[c] for c in self.session_coins},
+                                           entry["size"], note="Designed egg:", tf=entry["tf"], risk=entry["risk"],
+                                           traits=entry["traits"], origin="designed")
+                if v:
+                    if len(self.tourn.vars) > self.tourn.cap:
+                        self.tourn.cap = len(self.tourn.vars)
+                    self.flush_events()
+                    self.refresh_board()
+                    self.write(f"♛ Your egg {E.bot_nickname(v.key())} is on the farm: {E.describe_bot(entry, self.session_bar)}", "good")
+            if save:
+                self.catch_rows([dict(entry, lifetime=dict(bar_minutes=self.session_bar, source="designed by you"))], "designed")
+            w.destroy()
+        b = ttk.Frame(f)
+        b.grid(row=row + 1, column=0, columnspan=4, sticky="e", pady=(14, 0))
+        ttk.Button(b, text="Cancel", command=w.destroy).pack(side="left", padx=4)
+        ttk.Button(b, text="Save to Library", command=lambda: hatch(save=True, farm=False)).pack(side="left", padx=4)
+        ttk.Button(b, text="Hatch & save", command=lambda: hatch(save=True)).pack(side="left", padx=4)
+        ttk.Button(b, text="Hatch on the farm", style="Accent.TButton", command=lambda: hatch()).pack(side="left", padx=4)
+
+    # ---------------- auto-resume ----------------
+    def auto_resume(self):
+        """If the bot was running when CBBF last closed, pick that session back up."""
+        if not self.settings.get("auto_resume", True) or not self.cfg.get("was_running") or self.session:
+            return
+        mode = self.cfg.get("last_mode", "paper")
+        saved = E.load_json(E.state_path(mode == "live"))
+        if not saved:
+            return
+        if mode == "live":
+            if not self.client:  # wait for the saved login to connect (up to about 30 seconds)
+                self._resume_tries = getattr(self, "_resume_tries", 0) + 1
+                if self._resume_tries < 30 and E.load_login():
+                    self.root.after(1000, self.auto_resume)
+                elif self._resume_tries >= 30:
+                    self.write("Your LIVE session was running when CBBF closed, but Coinbase didn't connect, so it "
+                               "was not resumed. Log in and press Start to resume it.", "warn")
+                return
+            if not messagebox.askyesno("Resume LIVE session?", "Your LIVE session was running when CBBF closed.\n\n"
+                                                               "Resume it now? (You'll be asked to type LIVE.)"):
+                return
+        self.mode_var.set(mode)
+        self.wild_var.set(bool(self.cfg.get("last_wild", True)))
+        self.toggle_wild()
+        self._auto_resume = True
+        self.write(f"Picking up where you left off ({'LIVE' if mode == 'live' else 'Practice'} session).", "good")
+        self.toggle()
+        self._auto_resume = False
+
+    # ---------------- only redraw what you can see ----------------
+    def tab_visible(self, widget):
+        try:
+            return self.nb.select() == str(self.nb.nametowidget(widget.winfo_parent())) or \
+                self.nb.select() == str(widget)
+        except Exception:
+            return True
+
+    def refresh_visible(self):
+        """Catches up the tab you just opened (hidden tabs skip their redraws to save effort)."""
+        try:
+            tab = self.nb.tab(self.nb.select(), "text").strip()
+        except Exception:
+            return
+        if tab == "Trades" and getattr(self, "_trades_dirty", False):
+            self._trades_dirty = False
+            self.refresh_trades()
+        elif tab == "Strategy scoreboard" and getattr(self, "_board_dirty", False):
+            self._board_dirty = False
+            self.refresh_board()
+        elif "Bot Farm" in tab:
             self.grid_refresh()
 
     # ---------------- watchlist ----------------
@@ -5065,6 +5289,8 @@ class App:
             m.add_command(label="Add to team", command=lambda: (E.set_team([E.bot_key(b) for b in entries], True), self.col_refresh()))
             m.add_command(label="Remove from team", command=lambda: (E.set_team([E.bot_key(b) for b in entries], False), self.col_refresh()))
         m.add_command(label="Add to farm (they compete and breed)", command=lambda: self._add_entries_to_run(entries))
+        if len(entries) == 1:
+            m.add_command(label="Use as a template (Design an egg)...", command=lambda: self.open_designer(preset=entries[0]))
         if where == "library" and len(entries) == 2:
             m.add_command(label="\u265b Breed these two", command=self._col_breed)
         m.add_separator()
@@ -5872,7 +6098,8 @@ class App:
             "Ctrl+L        Bot Lab\n"
             "Ctrl+H        Hall of Fame\n"
             "Ctrl+K        Browse coins\n"
-            "Ctrl+B        Bot Collection\n"
+            "Ctrl+B        Bot Library\n"
+            "Ctrl+E        Design an egg\n"
             "Ctrl+,        Settings\n"
             "F5            Refresh the Trades tab\n\n"
             "Scoreboard: double-click a strategy for its detail card and chart. Select a strategy and pick a coin in "
