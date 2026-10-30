@@ -27,6 +27,7 @@ Every dragon climbs the same ladder, and the farm sorts them into four dens:
 | **Hall of Fame** | Your hand-picked champions. Only you decide who gets in |
 
 <p align="center"><img src="docs/screenshots/farm-eggs.png" alt="Eggs" width="100%"></p>
+<p align="center"><img src="docs/screenshots/farm-rising.png" alt="Rising" width="100%"></p>
 
 Each dragon has **XP, health and power**. Health drops when it stumbles and recovers when it does well.
 Power only grows from real, lasting wins, so a dragon with a full power bar has truly earned it. Working
@@ -107,6 +108,13 @@ family line and lesson intact.
 - Full, light or no animation, so even hundreds of dragons stay smooth
 - Dark and light themes, custom sounds (each one can be switched off), keyboard shortcuts
 - Farm size up to 200, and **+ Add eggs** whenever you want more
+
+## More screens
+<p align="center"><img src="docs/screenshots/chart-split-candles.png" width="100%"></p>
+<p align="center"><img src="docs/screenshots/chart-entries-exits.png" width="100%"></p>
+<p align="center"><img src="docs/screenshots/portfolio.png" width="100%"></p>
+<p align="center"><img src="docs/screenshots/watchlist.png" width="100%"></p>
+<p align="center"><img src="docs/screenshots/main-light.png" width="100%"></p>
 
 ## Your data
 Everything stays on your computer in `~/.cbbf/` (Windows: `C:\Users\<you>\.cbbf`): settings, saved farms,
