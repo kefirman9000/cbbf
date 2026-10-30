@@ -614,10 +614,118 @@ def risk_text(r):
     return ", ".join(parts)
 
 
+# Traits: extra habits every bot can evolve on top of its strategy. 0 / empty = off.
+TRAITS = {
+    "trail":   dict(lo=0.5, hi=12.0, kind=float, text=lambda v: f"trailing stop {v:g}%"),
+    "maxhold": dict(lo=3, hi=200, kind=int, text=lambda v: f"sells after {v} decisions"),
+    "cool":    dict(lo=1, hi=30, kind=int, text=lambda v: f"waits {v} decisions after selling"),
+    "trend":   dict(lo=20, hi=250, kind=int, text=lambda v: f"buys only above its {v}-bar average"),
+    "minvol":  dict(lo=0.02, hi=1.5, kind=float, text=lambda v: f"skips markets moving under {v:g}% a bar"),
+    "rsicap":  dict(lo=55, hi=90, kind=int, text=lambda v: f"won't buy if RSI is over {v}"),
+    "confirm": dict(lo=2, hi=3, kind=int, text=lambda v: f"waits for {v} signals in a row"),
+    "entries": dict(lo=1, hi=5, kind=int, text=lambda v: f"buys at most {v}x per position"),
+    "exit":    dict(lo=1, hi=1, kind=int, text=lambda v: "sells only through its stops"),
+    "moods":   dict(lo=1, hi=14, kind=int, text=lambda v: "trades only when " + " / ".join(
+        m for i, m in enumerate(MOODS) if v & (1 << i))),
+}
+TRAIT_NAMES = {"trail": "Trailing stop", "maxhold": "Max hold", "cool": "Cooldown", "trend": "Trend filter",
+               "minvol": "Min volatility", "rsicap": "Overbought guard", "confirm": "Confirmation",
+               "entries": "Max entries", "exit": "Stops-only exit", "moods": "Mood gate"}
+
+
+def clean_traits(t):
+    out = {}
+    for k, spec in TRAITS.items():
+        try:
+            v = float((t or {}).get(k, 0) or 0)
+        except (TypeError, ValueError):
+            v = 0
+        if v <= 0:
+            continue
+        v = min(max(v, spec["lo"]), spec["hi"])
+        out[k] = int(round(v)) if spec["kind"] is int else round(v, 2)
+    return out
+
+
+def traits_text(t):
+    return ", ".join(TRAITS[k]["text"](v) for k, v in sorted((t or {}).items()) if k in TRAITS)
+
+
+def bot_step(v, closes, n, coins, extra=None):
+    """One decision of one bot on every coin: its own exits first (stop-loss, take-profit, trailing stop,
+    max hold), then its strategy signal filtered by its traits. Returns the trades made [(coin, trade)]."""
+    last = {c: closes[c][-1] for c in coins}
+    tr, made = v.traits, []
+    for c in coins:
+        sim = v.sim
+        sim.last = None
+        q = sim.pos.get(c, 0)
+        if q > 0:
+            v.hi[c] = max(v.hi.get(c, last[c]), last[c])
+            r = (last[c] / (sim.cost[c] / q) - 1) * 100
+            why = None
+            if v.risk["sl"] and r <= -v.risk["sl"]:
+                why = "stop"
+            elif v.risk["tp"] and r >= v.risk["tp"]:
+                why = "target"
+            elif tr.get("trail") and last[c] <= v.hi[c] * (1 - tr["trail"] / 100):
+                why = "trail"
+            elif tr.get("maxhold") and n - v.since.get(c, n) >= tr["maxhold"] * v.tf:
+                why = "time"
+            if why:
+                sim.sell(c, last[c], n)
+                v.sig[c] = "sell"
+        if sim.last is None:
+            if n % v.tf:  # between this bot's own decisions: no signal, no trade
+                v.sig[c] = None
+                continue
+            s = strat_signal(v.name, closes[c], n, v.params, v.tf, (extra or {}).get(c))
+            if tr.get("confirm"):
+                v.run_sig[c] = (s, v.run_sig.get(c, (None, 0))[1] + 1) if s and s == v.run_sig.get(c, (None, 0))[0] else (s, 1 if s else 0)
+                if s and v.run_sig[c][1] < tr["confirm"]:
+                    s = None
+            if s == "buy":
+                ser = None
+                if tr.get("cool") and n - v.sold_at.get(c, -10 ** 9) < tr["cool"] * v.tf:
+                    s = None
+                elif tr.get("entries") and v.entries.get(c, 0) >= tr["entries"]:
+                    s = None
+                else:
+                    if tr.get("trend") or tr.get("minvol") or tr.get("rsicap"):
+                        ser = tail_series(closes[c], v.tf)
+                    if tr.get("trend") and (len(ser) < tr["trend"] or ser[-1] <= _avg(ser, tr["trend"])):
+                        s = None
+                    elif tr.get("minvol") and (len(ser) < 21 or sum(abs(ser[i] / ser[i - 1] - 1) for i in range(-20, 0)) / 20 * 100 < tr["minvol"]):
+                        s = None
+                    elif tr.get("rsicap") and len(ser) > 15 and _rsi(ser, 14) > tr["rsicap"]:
+                        s = None
+                    elif tr.get("moods") and not (tr["moods"] & (1 << MOODS.index(m)) if (m := market_mood(closes[c])[0]) in MOODS else False):
+                        s = None
+            elif s == "sell" and tr.get("exit") and (v.risk["sl"] or v.risk["tp"] or tr.get("trail") or tr.get("maxhold")):
+                s = None  # this bot only leaves through its own exits
+            v.sig[c] = s
+            sim.act(c, s, last[c], n)
+        t = sim.last
+        if t:
+            if t["side"] == "buy":
+                v.entries[c] = v.entries.get(c, 0) + 1
+                v.since.setdefault(c, n)
+                v.hi[c] = max(v.hi.get(c, last[c]), last[c])
+            else:
+                v.entries.pop(c, None)
+                v.since.pop(c, None)
+                v.hi.pop(c, None)
+                v.sold_at[c] = n
+            made.append((c, t))
+    return made
+
+
 class Variant:
-    def __init__(self, name, params, sim, maxlen, tf=1, risk=None):
+    def __init__(self, name, params, sim, maxlen, tf=1, risk=None, traits=None):
         self.name, self.params, self.sim = name, params, sim
         self.risk = clean_risk(risk)
+        self.traits = clean_traits(traits)
+        self.hi, self.since, self.entries, self.sold_at, self.run_sig = {}, {}, {}, {}, {}
         self.uid, self.parents, self.gen = 0, [], 0
         self.tf = clamp_tf(tf)  # decides once every tf bars, on tf-bar candles
         self.eq = deque(maxlen=maxlen)
@@ -637,19 +745,20 @@ class Variant:
 
     @property
     def label(self):
-        rt = risk_text(self.risk)
+        rt = ", ".join(x for x in (risk_text(self.risk), traits_text(self.traits)) if x)
         return (f"{self.name} ({', '.join(f'{k}={v}' for k, v in self.params.items())})"
                 + (f" on {self.tf}-bar candles" if self.tf > 1 else "") + (f" [{rt}]" if rt else ""))
 
     def key(self):
         return (self.name, self.tf, tuple(sorted((k, round(float(v), 4)) for k, v in self.params.items())),
-                tuple(sorted(self.risk.items())))
+                tuple(sorted(self.risk.items())), tuple(sorted(self.traits.items())))
 
 
 def bot_key(d):
     return (d["name"], clamp_tf(d.get("tf", 1)),
             tuple(sorted((k, round(float(v), 4)) for k, v in d["params"].items())),
-            tuple(sorted(clean_risk(d.get("risk")).items())))
+            tuple(sorted(clean_risk(d.get("risk")).items())),
+            tuple(sorted(clean_traits(d.get("traits")).items())))
 
 
 class Tournament:
@@ -701,14 +810,40 @@ class Tournament:
         while len(self.vars) < min(self.cap, 24):  # a bigger, more varied field from the start
             name = self.rng.choice(WILDCARD_STRATS)
             self.vars.append(self._new(name, self._rand_params(name), tf=self.rng.choice(TIMEFRAMES),
-                                       risk=self.rand_risk()))
+                                       risk=self.rand_risk(), traits=self.rand_traits()))
         del self.vars[max(self.cap, 14):]
         for v in self.vars:
             self._register(v, [], "starter")
 
-    def _new(self, name, params, tf=1, risk=None):
+    def _new(self, name, params, tf=1, risk=None, traits=None):
         return Variant(name, params, Sim(self.start_cash, self.fee, self.pct, slip=self.o.get("slip", 0.0)),
-                       self.W + 1, tf, risk)
+                       self.W + 1, tf, risk, traits)
+
+    def rand_traits(self, chance=0.3):
+        t = {}
+        for k, spec in TRAITS.items():
+            if self.rng.random() < chance:
+                v = self.rng.uniform(spec["lo"], spec["hi"])
+                if k == "moods":
+                    v = self.rng.randint(1, 14)
+                t[k] = v
+        return clean_traits(t)
+
+    def mutate_traits(self, t):
+        out = dict(t)
+        for k, spec in TRAITS.items():
+            roll = self.rng.random()
+            if roll < 0.08:  # switch a trait on or off
+                if k in out:
+                    out.pop(k)
+                else:
+                    out[k] = self.rng.randint(1, 14) if k == "moods" else self.rng.uniform(spec["lo"], spec["hi"])
+            elif k in out and roll < 0.35:
+                if k == "moods":
+                    out[k] = out[k] ^ (1 << self.rng.randrange(len(MOODS))) or out[k]
+                else:
+                    out[k] = out[k] * self.rng.uniform(0.75, 1.3)
+        return clean_traits(out)
 
     def _register(self, v, parents, origin):
         """Gives a bot its id and family-tree entry."""
@@ -758,35 +893,18 @@ class Tournament:
         last = {c: closes[c][-1] for c in self.coins}
         if v.born_px is None:
             v.born_px = dict(last)
-        tf = v.tf
         prev_eq = v.eq[-1] if v.eq else None
         x = extra if extra is not None else self.xfull
-        for c in self.coins:
-            v.sim.last = None
-            q = v.sim.pos.get(c, 0)
-            if q > 0 and (v.risk["sl"] or v.risk["tp"]):  # the bot's own stop-loss / take-profit, checked every bar
-                r = (last[c] / (v.sim.cost[c] / q) - 1) * 100
-                if (v.risk["sl"] and r <= -v.risk["sl"]) or (v.risk["tp"] and r >= v.risk["tp"]):
-                    v.sim.sell(c, last[c], n)
-                    v.sig[c] = "sell"
-            if v.sim.last is None:
-                if n % tf:  # between this bot's own decisions: no signal, no trade
-                    v.sig[c] = None
-                    continue
-                s = strat_signal(v.name, closes[c], n, v.params, tf, (x or {}).get(c))
-                v.sig[c] = s
-                v.sim.act(c, s, last[c], n)
-            t = v.sim.last
-            if t:
-                v.log.append((n, c, t["side"], last[c]))
-                v.ntrades += 1
-                if t["side"] == "sell":
-                    if t["pl"] > 0:
-                        v.wins += 1
-                    else:
-                        v.losses += 1
-                if self.recording:
-                    self.shadow.append(dict(t, name=v.name, params=dict(v.params), tf=v.tf, uid=v.uid))
+        for c, t in bot_step(v, closes, n, self.coins, x):
+            v.log.append((n, c, t["side"], last[c]))
+            v.ntrades += 1
+            if t["side"] == "sell":
+                if t["pl"] > 0:
+                    v.wins += 1
+                else:
+                    v.losses += 1
+            if self.recording:
+                self.shadow.append(dict(t, name=v.name, params=dict(v.params), tf=v.tf, uid=v.uid))
         e = v.sim.equity(last)
         v.eq.append(e)
         v.age += 1
@@ -989,7 +1107,7 @@ class Tournament:
                      stake=d["stake"], status=d["status"], trades=len(v.sim.tbars), strikes=v.strikes, tf=v.tf,
                      failing=d.get("failing", False), driving=d["status"] == "active", v=v, size=v.size_mult,
                      edge=d.get("edge"), behind=d.get("behind", False), life=self.life(v), origin=v.origin,
-                     risk=dict(v.risk), uid=v.uid, parents=list(v.parents), gen=v.gen)
+                     risk=dict(v.risk), traits=dict(v.traits), uid=v.uid, parents=list(v.parents), gen=v.gen)
                 for v, d in rows]
 
     def mutate(self, name, params, scale=0.25):
@@ -1089,20 +1207,25 @@ class Tournament:
                 mate = self.rng.choice(good)
         if mate:
             risk = {k: self.rng.choice((parent.risk[k], mate.risk[k])) for k in RISK_BOUNDS}
+            traits = {}
+            for k in TRAITS:
+                pick = self.rng.choice((parent, mate)).traits
+                if k in pick:
+                    traits[k] = pick[k]
             child = self._new(parent.name, self.crossover(parent.name, parent.params, mate.params),
-                              self.rng.choice((parent.tf, mate.tf)), self.mutate_risk(risk))
+                              self.rng.choice((parent.tf, mate.tf)), self.mutate_risk(risk), self.mutate_traits(traits))
             self._register(child, [parent, mate], "bred")
             note = f"Bred {child.label} from two winners"
         else:
             child = self._new(parent.name, self.mutate(parent.name, parent.params), self.mutate_tf(parent.tf),
-                              self.mutate_risk(parent.risk))
+                              self.mutate_risk(parent.risk), self.mutate_traits(parent.traits))
             self._register(child, [parent], "tweaked")
             note = f"Spawned {child.label} (tweaked from {parent.label})"
         self.replay(child, closes)
         self.vars.append(child)
         self.events.append(note)
 
-    def add_variant(self, name, params, closes=None, size=1.0, note="Added", tf=1, origin="added", risk=None):
+    def add_variant(self, name, params, closes=None, size=1.0, note="Added", tf=1, origin="added", risk=None, traits=None):
         """Adds a strategy with the given settings (clamped to sane bounds) and replays recent prices."""
         if name not in STRATS:
             return None
@@ -1115,7 +1238,7 @@ class Tournament:
                 val = dv
             p[k] = int(round(val)) if isinstance(dv, int) else round(val, 2)
         fix_params(name, p)
-        v = self._new(name, p, tf, risk)
+        v = self._new(name, p, tf, risk, traits)
         self._register(v, [], origin)
         v.size_mult = min(max(float(size), 0.25), 3.0)
         if closes:
@@ -1150,7 +1273,7 @@ class Tournament:
             else:
                 return None
         return self.add_variant(name, p, closes, note="Random new strategy:", tf=self.rng.choice(TIMEFRAMES),
-                                origin="random", risk=self.rand_risk())
+                                origin="random", risk=self.rand_risk(), traits=self.rand_traits(0.35))
 
     def hall_of_fame_candidates(self, min_win_steps, min_trades):
         """Bots that have earned a place: enough time Winning, enough finished trades, and ahead of
@@ -1167,7 +1290,8 @@ class Tournament:
     def export_lineup(self):
         """Strategies worth keeping (everything not stopped), as plain data for saving."""
         keep = [v for v in self.vars if self.info.get(id(v), {}).get("status") != "benched"] or list(self.vars)
-        return [dict(name=v.name, params=dict(v.params), size=v.size_mult, tf=v.tf, risk=dict(v.risk)) for v in keep]
+        return [dict(name=v.name, params=dict(v.params), size=v.size_mult, tf=v.tf, risk=dict(v.risk), traits=dict(v.traits))
+                for v in keep]
 
     def family(self):
         """Family-tree records for living and recently removed bots, with live stats for the living."""
@@ -1251,6 +1375,21 @@ def bot_sigfn(name, params, tf, coins):
     return sig
 
 
+def replay_bot(v, closes, extra, start, start_cash, fee, pct, slip=0.0):
+    """A frozen copy of bot v trading on its own from bar `start` to the end, exactly as it would in the
+    tournament (strategy, pace, own stops and traits). Returns (equity curve, trade count)."""
+    coins = list(closes)
+    b = Variant(v.name, dict(v.params), Sim(start_cash, fee, pct, slip=slip), 2, v.tf, dict(v.risk), dict(v.traits))
+    L = min(len(x) for x in closes.values())
+    eq, trades = [start_cash], 0
+    for i in range(start, L):
+        pre = {c: closes[c][max(0, i + 1 - 4600):i + 1] for c in coins}
+        ex = {c: {k: d[k][max(0, i + 1 - 4600):i + 1] for k in d} for c, d in extra.items()} if extra else None
+        trades += len(bot_step(b, pre, i, coins, ex))
+        eq.append(b.sim.equity({c: closes[c][i] for c in coins}))
+    return eq, trades
+
+
 def slice_extra(extra, i):
     """The extra data (highs/lows/volumes) cut to the first i bars."""
     if not extra:
@@ -1326,8 +1465,7 @@ def run_lab(closes, settings, train_frac=0.7, top_n=12, start_cash=1000.0, seed=
     test_hold = sum(closes[c][-1] / closes[c][split] for c in coins) / len(coins) - 1
     rows = []
     for k, (v, lf, info) in enumerate(cands):
-        eq, tr = simulate(closes, bot_sigfn(v.name, v.params, v.tf, coins), start_cash, fee, pct,
-                          stop=v.risk["sl"] / 100, take=v.risk["tp"] / 100, warm=split, slip=slip, extra=extra)
+        eq, tr = replay_bot(v, closes, extra, split, start_cash, fee, pct, slip)
         ret, dd = metrics(eq)
         if ret > 0 and ret > test_hold and tr >= 2:
             verdict = "Passed"
@@ -1338,6 +1476,7 @@ def run_lab(closes, settings, train_frac=0.7, top_n=12, start_cash=1000.0, seed=
         else:
             verdict = "Failed"
         rows.append(dict(name=v.name, params=dict(v.params), tf=v.tf, size=v.size_mult, risk=dict(v.risk),
+                         traits=dict(v.traits),
                          train_ret=lf["ret"], train_edge=lf["edge"], train_status=info.get("status", ""),
                          test_ret=ret, test_edge=ret - test_hold, test_dd=dd, test_trades=tr, verdict=verdict,
                          passed=verdict == "Passed",
@@ -1524,7 +1663,8 @@ def load_strategies():
     data = load_json(strategies_path(), [])
     if not isinstance(data, list):
         return []
-    return [dict(d, risk=clean_risk(d.get("risk") if isinstance(d.get("risk"), dict) else None))
+    return [dict(d, risk=clean_risk(d.get("risk") if isinstance(d.get("risk"), dict) else None),
+                 traits=clean_traits(d.get("traits") if isinstance(d.get("traits"), dict) else None))
             for d in data if isinstance(d, dict) and d.get("name") in STRATS and isinstance(d.get("params"), dict)]
 
 
@@ -1543,7 +1683,8 @@ def export_bots(rows, app_version="", note=""):
     for r in rows:
         if r.get("stats") and "score" not in r:  # already a bot-file entry (Hall of Fame, Bot Lab)
             b = dict(name=r["name"], params=dict(r["params"]), size=round(float(r.get("size", 1.0)), 2),
-                     tf=int(r.get("tf", 1)), risk=clean_risk(r.get("risk")), stats=dict(r["stats"]),
+                     tf=int(r.get("tf", 1)), risk=clean_risk(r.get("risk")), traits=clean_traits(r.get("traits")),
+                     stats=dict(r["stats"]),
                      notes=r.get("notes", note))
             if r.get("lifetime"):
                 b["lifetime"] = dict(r["lifetime"])
@@ -1551,7 +1692,7 @@ def export_bots(rows, app_version="", note=""):
             continue
         b = dict(
             name=r["name"], params=dict(r["params"]), size=round(float(r.get("size", 1.0)), 2), tf=int(r.get("tf", 1)),
-            risk=clean_risk(r.get("risk")),
+            risk=clean_risk(r.get("risk")), traits=clean_traits(r.get("traits")),
             stats=dict(recent_gain_pct=None if r.get("score") is None else round(r["score"] * 100, 2),
                        consistency_pct=None if r.get("cons") is None else int(r["cons"] * 100),
                        trades=int(r.get("trades", 0)), status=r.get("status", "")),
@@ -1795,7 +1936,8 @@ def read_bots_file(path):
             continue
         stats = d.get("stats") if isinstance(d.get("stats"), dict) else {}
         item = dict(name=d["name"], params=params, size=size, stats=stats, tf=clamp_tf(d.get("tf", 1)),
-                    risk=clean_risk(d.get("risk") if isinstance(d.get("risk"), dict) else None))
+                    risk=clean_risk(d.get("risk") if isinstance(d.get("risk"), dict) else None),
+                    traits=clean_traits(d.get("traits") if isinstance(d.get("traits"), dict) else None))
         if isinstance(d.get("lifetime"), dict):
             item["lifetime"] = {k: v for k, v in d["lifetime"].items()
                                 if isinstance(v, (int, float, str)) or v is None}

@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.7.2
+- **Bot Farm grid** (the new first tab): a live card for every bot with an animated dragon, level, XP and health
+  bars, a status badge and stats. Filter by All / Working / Winning / Sleeping / Caught. Click to select (Ctrl-click
+  for several), double-click for the full card, **Catch!** to collect.
+- **Traits the bots evolve themselves**: trailing stop, max hold time, cooldown after selling, trend filter,
+  minimum volatility, overbought guard, signal confirmation, max entries, stops-only exit and a market-mood
+  gate. They mutate, crossbreed and get selected like everything else. The Bot Lab tests bots with their traits
+  exactly as they'd run live.
+- **Charts**: Line, Area or Candles; Split view (account and a coin side by side); ranges up to 1 day (long ranges
+  switch to bar history); grid on/off; coin lines in the coin's colour.
+- Bot cards show traits; exported, collected and Hall of Fame bots keep them.
+
 ## 1.7.1
 - **Fix: 1.7.0 crashed on start.** Fixed.
 - **Bot Collection** (Ctrl+B): press **Catch!** on any bot to collect it. Each gets a name, a rarity (Common to
