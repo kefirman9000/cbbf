@@ -2764,7 +2764,9 @@ class App:
                 pl, hold = self.equity() - self.start_cash, self.bench_equity() - self.start_cash
                 self.write(f"Stopped. Profit/loss {pl:+,.2f} (just holding would be {hold:+,.2f}).")
             return
-        if (not self.session and self.wild_var.get() and int(self.settings.get("auto_coins", 0)) > 0
+        resuming = bool(E.load_json(E.state_path(self.mode_var.get() == "live"))) and \
+            getattr(self, "_choice", "continue") != "new"
+        if (not self.session and not resuming and self.wild_var.get() and int(self.settings.get("auto_coins", 0)) > 0
                 and not getattr(self, "_scouted", False)):
             return self.scout_then_start()
         self._scouted = False
@@ -2778,6 +2780,7 @@ class App:
             return messagebox.showinfo("Pick strategies", "Tick a strategy, or tick 'Let the bot choose (Wildcard)'.")
         if not self.session and not self.begin_session(coins):
             return
+        coins = list(self.session_coins) or coins  # a resumed session keeps its own coins
         if self.halted_day == date.today():
             if not messagebox.askyesno("Daily limit", "The daily max-loss limit was hit today. Resume anyway?"):
                 return
@@ -2957,7 +2960,8 @@ class App:
         tourn = None
         restored = getattr(self, "_restored_farm", None)
         self._restored_farm = None
-        if wild and restored is not None and restored.coins == list(coins):
+        if wild and restored is not None and set(restored.coins) == set(coins):
+            restored.coins = list(coins)
             restored.o.update(E.tournament_opts(self.settings))
             restored.xfull = None
             self.q.put(("log", (f"Carrying on with your farm of {len(restored.vars)} bots where it left off.", "good")))
@@ -3325,6 +3329,9 @@ class App:
             del h[:-keep]
             for k in ("h", "l", "v"):
                 del x[k][:-keep]
+        if self.wild and self.tourn and set(self.tourn.coins) != set(self.session_coins):
+            fixed = self.tourn.align_coins(self.session_coins, {c: self.hist[c][-1] for c in self.session_coins if self.hist.get(c)})
+            self.write(f"The farm's coins were out of step with the session; it now trades {', '.join(fixed)}.", "warn")
         if self.wild and self.tourn:
             self.save_farm()
             self.tourn.step({c: self.hist[c] for c in self.session_coins}, {c: self.hx[c] for c in self.session_coins})

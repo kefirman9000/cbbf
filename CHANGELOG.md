@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.13.1
+- Fixed: "KeyError" every minute (for example 'XRP') after the bot picked its own coins and you then continued a
+  saved session. The saved session now keeps its own coins (scouting only happens for a brand-new session), and if
+  the farm and the session ever disagree about coins again, the farm quietly lines itself up instead of erroring.
+
 ## 1.13.0
 **A Learning page, real backtesting with memory, islands, and safety for real money**
 
