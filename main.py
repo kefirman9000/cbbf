@@ -101,12 +101,21 @@ def recolor(widget, mapping):
     for ch in widget.winfo_children():
         recolor(ch, mapping)
 SETTING_GROUPS = [
-    ("Basics", "These are the main knobs. If you're unsure, leave them alone or use a Risk style instead.", [
-        ("trade_pct", "How big is each trade? (% of your money)", float),
-        ("max_coin_pct", "Most money allowed in one coin (%)", float),
-        ("stop_loss", "Safety stop: sell a coin if it drops this % (0 = off)", float),
-        ("take_profit", "Lock in profit: sell a coin if it rises this % (0 = off)", float),
-        ("daily_loss", "Daily loss limit: pause if you lose this % in a day (0 = off)", float),
+    ("Basics", "Your account's money and safety rules. All % are of the money you started this session with "
+               "(the 'Practice money' / 'Money to trade with' box). Not sure? Pick a Risk style on the main screen "
+               "instead (Cautious, Balanced, Adventurous): it fills these five in for you. With Wildcard and "
+               "'Let the winning bots set stops' (Orders tab) on, the bots may use their own learned Safety stop and "
+               "Lock in profit; these numbers are then the fallback.", [
+        ("trade_pct", "Trade size: each buy spends this % of your starting money. Example: 10 with $1,000 = $100 per buy "
+                      "(winning bots can scale this up to their trade-size multiplier)", float),
+        ("max_coin_pct", "Limit per coin: never have more than this % of your starting money in any single coin. "
+                         "Example: 50 with $1,000 = at most $500 in BTC", float),
+        ("stop_loss", "Safety stop: automatically sell a coin if it falls this % below the price you paid. "
+                      "Example: 5 = sell if a $100 position drops to $95 (0 = off)", float),
+        ("take_profit", "Lock in profit: automatically sell a coin once it is up this % on what you paid. "
+                        "Example: 10 = sell when a $100 position reaches $110 (0 = off)", float),
+        ("daily_loss", "Daily loss limit: stop trading for the rest of the day if the account falls this % since "
+                       "midnight. Open coins are kept, not sold (0 = off)", float),
     ]),
     ("Wildcard", "How the bot treats strategies that are winning, shaky or failing.", [
         ("beat_hold", "A strategy only counts as Winning if it also beats just holding the coins", bool),
@@ -125,6 +134,8 @@ SETTING_GROUPS = [
         ("hof_hours", "Hours a strategy must spend Winning (in total) to get in", float),
         ("hof_min_trades", "...and at least this many finished (sold) trades", int),
         ("hof_load", "Bring the 10 best Hall of Fame bots back each time Wildcard starts", bool),
+        ("auto_catch", "Hall of Fame bots also go into your Bot Collection automatically", bool),
+        ("team_locked", "Trading with my team: keep exactly those bots (untick to let the team breed new bots)", bool),
     ]),
     ("Orders", "How orders are placed, and the extra costs Practice mode pretends to pay.", [
         ("order_type", "Order type", "order"),
@@ -132,6 +143,8 @@ SETTING_GROUPS = [
         ("limit_fallback", "Limit orders: if nothing fills in time, use a market order instead", bool),
         ("trail_stop", "Trailing stop: sell if a coin falls this % from its high since buying (0 = off)", float),
         ("max_trades_hour", "Brake: at most this many strategy trades per hour (0 = no limit). Safety stops always run", int),
+        ("bot_stops", "Wildcard: let the winning bots set the Safety stop and Lock-in-profit levels they learned "
+                      "(your Basics numbers are used when they don't)", bool),
         ("fee_pct", "Market order fee used in Practice mode (%)", float),
         ("maker_fee_pct", "Limit order (maker) fee used in Practice mode (%)", float),
         ("slippage", "Spread and slippage on market orders in Practice mode (%)", float),
@@ -159,6 +172,7 @@ STRAT_LABELS = {
     "Bollinger bands": "Buy low / sell high", "Dollar-cost averaging": "Steady buyer (DCA)",
     "Breakout": "Breakout chaser", "MACD": "Momentum shift", "Mean reversion": "Snap-back",
     "EMA crossover": "Quick trend (EMA)", "Stochastic": "Range bounce", "Trend + dip": "Dips in an uptrend",
+    "Volume breakout": "Volume breakout", "VWAP snap-back": "VWAP snap-back", "ATR channel": "Range channel (ATR)",
 }
 STRAT_TIPS = {
     "SMA crossover": "Buys when the short-term price trend crosses above the long-term trend, sells when it crosses below.",
@@ -174,13 +188,19 @@ STRAT_TIPS = {
     "Stochastic": "Buys when the price climbs back up out of the bottom of its recent range, sells when it falls "
                   "back from the top.",
     "Trend + dip": "Only buys short dips while the bigger trend is up, and gets out when the uptrend breaks.",
+    "Volume breakout": "Buys a breakout above the recent high only when trading volume is well above normal, "
+                       "sells when the price breaks below the recent low.",
+    "VWAP snap-back": "Buys when the price is well below its volume-weighted average price, sells when well above.",
+    "ATR channel": "Buys a push above the average plus a few typical bar ranges (from highs and lows), sells a drop "
+                   "below it.",
 }
 PARAM_NAMES = {"fast": "short average", "slow": "long average", "period": "lookback", "lo": "buy below",
                "hi": "sell above", "n": "lookback", "thr": "move needed %", "k": "band width", "every": "buy every N decisions",
-               "signal": "signal smoothing", "min_gap": "smallest gap %", "trend": "trend lookback"}
+               "signal": "signal smoothing", "min_gap": "smallest gap %", "trend": "trend lookback",
+               "vmult": "volume x normal", "m": "range multiple"}
 REASON_TEXT = {"bot-test": "bot's own test trade", "signal": "strategy signal", "stop-loss": "safety stop", "take-profit": "locked in profit",
-               "manual": "you pressed Sell all", "add-on": "adding to a winning strategy's position",
-               "trailing-stop": "trailing stop (fell from its high)"}
+               "manual": "you sold by hand", "add-on": "adding to a winning strategy's position",
+               "trailing-stop": "trailing stop (fell from its high)", "manual buy": "you bought by hand"}
 MOOD_TEXT = {"trending up": "Trending up", "trending down": "Trending down", "choppy": "Choppy (back and forth)",
              "quiet": "Quiet", "unknown": "-"}
 
@@ -280,6 +300,108 @@ def resort(t):
             pass
 
 
+
+COIN_COLORS = {"BTC": "#f7931a", "ETH": "#627eea", "SOL": "#9945ff", "XRP": "#4b5563", "DOGE": "#c2a633",
+               "ADA": "#0033ad", "AVAX": "#e84142", "LINK": "#2a5ada", "LTC": "#345d9d", "DOT": "#e6007a",
+               "ATOM": "#2e3148", "XTZ": "#2c7df7", "NEAR": "#00c08b", "ALGO": "#6b7280", "SUI": "#4da2ff",
+               "SHIB": "#f00500", "PEPE": "#3d8c40", "USDC": "#2775ca", "BCH": "#8dc351", "ETC": "#328332"}
+STAKING = {  # whether the coin itself can be staked (how its network works); reward rates are up to you
+    "BTC": ("No", "Bitcoin runs on proof of work (mining), so there is no native staking."),
+    "ETH": ("Yes", "Ethereum runs on proof of stake. Many exchanges offer ETH staking; unstaking can take a while."),
+    "SOL": ("Yes", "Solana runs on proof of stake. Staked SOL earns rewards each epoch (about every 2 days)."),
+    "XRP": ("No", "The XRP Ledger has no staking. Some platforms offer lending products instead, which carry other risks."),
+    "DOGE": ("No", "Dogecoin runs on proof of work (mining), so there is no native staking."),
+    "ADA": ("Yes", "Cardano runs on proof of stake. Delegated ADA stays in your wallet."),
+    "AVAX": ("Yes", "Avalanche runs on proof of stake. Native staking locks coins for a set period."),
+    "LINK": ("Limited", "Chainlink has staking pools with limited capacity; availability depends on the platform."),
+    "LTC": ("No", "Litecoin runs on proof of work (mining), so there is no native staking."),
+    "DOT": ("Yes", "Polkadot runs on proof of stake. Unstaking has a waiting (unbonding) period."),
+    "ATOM": ("Yes", "Cosmos runs on proof of stake. Unstaking has a waiting (unbonding) period."),
+    "XTZ": ("Yes", "Tezos runs on proof of stake (baking/delegation)."),
+    "NEAR": ("Yes", "NEAR runs on proof of stake."),
+    "ALGO": ("Yes", "Algorand runs on pure proof of stake."),
+    "SUI": ("Yes", "Sui runs on proof of stake."),
+    "APT": ("Yes", "Aptos runs on proof of stake."),
+    "POL": ("Yes", "Polygon (POL) can be staked to validators."),
+    "BCH": ("No", "Bitcoin Cash runs on proof of work (mining)."),
+    "ETC": ("No", "Ethereum Classic runs on proof of work (mining)."),
+    "SHIB": ("No", "SHIB is a token with no native staking of its own."),
+    "PEPE": ("No", "PEPE is a token with no staking of its own."),
+    "USDC": ("No", "A stablecoin. It isn't staked, though some platforms pay rewards for holding it."),
+}
+
+
+def coin_color(c):
+    if c in COIN_COLORS:
+        return COIN_COLORS[c]
+    h = sum(ord(ch) * (i + 7) for i, ch in enumerate(c))
+    return "#%02x%02x%02x" % (80 + h % 150, 80 + (h // 7) % 150, 80 + (h // 49) % 150)
+
+
+def draw_coin_badge(cv, x, y, size, c):
+    """A round coin badge in the coin's colour with its ticker (not an official logo)."""
+    col = coin_color(c)
+    cv.create_oval(x, y, x + size, y + size, fill=col, outline="")
+    cv.create_oval(x + 3, y + 3, x + size - 3, y + size - 3, outline="#ffffff", width=1)
+    label = c if len(c) <= 3 else c[:3]
+    cv.create_text(x + size / 2, y + size / 2, text=label, fill="white", font=("", max(7, int(size / (2.6 + len(label) * 0.35))), "bold"))
+
+
+def fmt_px(px):
+    if not px:
+        return "-"
+    return f"${px:,.2f}" if px >= 1 else f"${px:,.6f}"
+
+
+def draw_dragon(c, x, y, size, color, awake=True, phase=0, mood="plain", fire=False, flash=False, gold=False):
+    """A small dragon on a Tk canvas, inside a size x size box at (x, y). Awake dragons flap their wings
+    and look around; sleeping ones curl up with their eyes shut. fire = a little puff of flame."""
+    k = size / 26.0
+
+    def P(*pts):
+        return [v * k + (x if i % 2 == 0 else y) for i, v in enumerate(pts)]
+    belly = "#fde68a" if gold else "#f5f5f4"
+    edge = "white" if flash else ""
+    flap = (math.sin(phase / 1.6) * 5) if awake else 0
+    # tail
+    c.create_line(*P(6, 20, 1, 22, -1, 17, 1, 14), fill=color, width=max(1, 2 * k), smooth=True)
+    c.create_polygon(*P(1, 14, -2, 12, 2, 11), fill=color, outline="")
+    # far wing (flaps)
+    if awake:
+        c.create_polygon(*P(9, 12, 3, 2 - flap, 8, 5 - flap / 2, 14, 10), fill=color, outline=edge, stipple="gray75")
+    else:
+        c.create_polygon(*P(8, 13, 6, 9, 14, 11), fill=color, outline="")
+    # body and belly
+    c.create_oval(*P(4, 11, 21, 25), fill=color, outline=edge, width=1)
+    c.create_oval(*P(9, 16, 19, 24), fill=belly, outline="")
+    # legs
+    c.create_line(*P(8, 23, 7, 26), fill=color, width=max(1, 2 * k))
+    c.create_line(*P(16, 23, 17, 26), fill=color, width=max(1, 2 * k))
+    hy = 0 if awake else 6  # sleeping dragons rest their head low
+    look = math.sin(phase / 5.0) * 1.2 if awake else 0
+    # neck and head
+    c.create_polygon(*P(15, 14, 18, 8 + hy, 21, 9 + hy, 19, 16), fill=color, outline="")
+    c.create_oval(*P(16 + look, 3 + hy, 26 + look, 11 + hy), fill=color, outline=edge)
+    # horns
+    c.create_line(*P(18 + look, 4 + hy, 17 + look, 0 + hy), fill=belly, width=max(1, 1.5 * k))
+    c.create_line(*P(21 + look, 3 + hy, 21 + look, -1 + hy), fill=belly, width=max(1, 1.5 * k))
+    # eye
+    if awake:
+        c.create_oval(*P(21 + look, 5 + hy, 23.5 + look, 7.5 + hy), fill="white", outline="")
+        c.create_oval(*P(22 + look, 5.6 + hy, 23.3 + look, 7 + hy), fill="#111827", outline="")
+    else:
+        c.create_line(*P(20.5, 6.5 + hy, 23.5, 6.5 + hy), fill="#111827", width=max(1, 1.2 * k))
+    if mood == "happy" and awake:
+        c.create_line(*P(23 + look, 9 + hy, 25 + look, 8.5 + hy), fill="#111827", width=1)
+    # near wing
+    if awake:
+        c.create_polygon(*P(10, 13, 6, 3 + flap, 12, 6 + flap / 2, 16, 12), fill=color, outline="#111827", width=1)
+    if fire:
+        f = (phase % 3)
+        c.create_polygon(*P(26 + look, 7 + hy, 31 + f, 5 + hy, 30 + f, 7 + hy, 33 + f, 8 + hy, 26 + look, 9 + hy),
+                         fill="#f97316", outline="#fde047")
+
+
 class Tip:
     """Small hover tooltip."""
 
@@ -318,6 +440,12 @@ class App:
         self.version = read_version()
         root.title("CBBF")
         root.withdraw()  # stay hidden until the window is sized and centred
+        try:  # the little dragon in the title bar and taskbar
+            import icon_data
+            self._icons = [tk.PhotoImage(data="".join(icon_data.ICON_64)), tk.PhotoImage(data="".join(icon_data.ICON_32))]
+            root.iconphoto(True, *self._icons)
+        except Exception:
+            pass
         root.geometry("1050x720")
         self.q = queue.Queue()
         self.running = False
@@ -543,6 +671,13 @@ class App:
         mb = ttk.Checkbutton(c, text="Winners trade more", variable=self.more_var, style="Card.TCheckbutton",
                              command=self.toggle_more)
         mb.pack(anchor="w", padx=(18, 0))
+        self.team_var = tk.BooleanVar(value=bool(self.cfg.get("team_mode", False)) and bool(E.team()))
+        self.team_cb = ttk.Checkbutton(c, text="Trade with my team", variable=self.team_var, style="Card.TCheckbutton",
+                                       command=self.toggle_team_mode)
+        self.team_cb.pack(anchor="w", padx=(18, 0))
+        Tip(self.team_cb, "Wildcard runs only the bots on your team from the Bot Collection (Ctrl+B). "
+                          "Settings > Wildcard decides whether the team may breed new bots or stays exactly as picked.")
+        self.update_team_label()
         Tip(mb, "Strategies that keep winning get bigger trades and keep adding while they hold a coin. "
                 "Shaky ones are slowed down and failing ones are stopped. Turn off for calmer, less frequent trading. "
                 "More trading means more fees.")
@@ -611,15 +746,12 @@ class App:
         nb = ttk.Notebook(nbf)
         nb.pack(fill="both", expand=True, pady=(8, 0))
         t1, t2, t3, t4, t5 = (ttk.Frame(nb) for _ in range(5))
-        nb.add(t1, text="  What I own  ")
+        nb.add(t1, text="  Portfolio  ")
         nb.add(t4, text="  Live prices  ")
         nb.add(t5, text="  Trades  ")
         nb.add(t2, text="  Strategy scoreboard  ")
         nb.add(t3, text="  What the bot did  ")
-        self.empty_hold = tk.Label(t1, text="You don't own any coins right now.\nThe bot buys when a strategy sees a good moment.",
-                                   bg=CARD, fg=MUTED, pady=18)
-        self.tree = self.make_tree(t1, ("coin", "qty", "price", "value", "pl"), (70, 120, 110, 110, 110),
-                                   ("Coin", "Amount", "Price now", "Worth now", "Profit / loss"))
+        self.build_portfolio(t1)
         tk.Label(t2, bg=CARD, fg=MUTED, justify="left", anchor="w", padx=8, pady=4, wraplength=700,
                  text="The bot tests every strategy with pretend trades. Winning = copied with bigger trades. "
                       "Shaky = copied slowly with small trades. Stopped = ignored.").pack(fill="x", side="top")
@@ -642,15 +774,20 @@ class App:
                  "Loads bots from a file. They replay recent prices, then compete with your own."),
                 ("Hall of Fame...", self.open_hof,
                  "Bots that kept winning for a long time are saved here automatically. Export them or bring them back. (Ctrl+H)"),
+                ("Catch!", self.catch_selected, "Catch the selected bots for your Bot Collection. They get a name, a rarity "
+                 "and a level, and you can trade with your favourite team later."),
+                ("Collection...", self.open_collection, "Your caught bots, their rarities and levels, and your team. (Ctrl+B)"),
                 ("Family tree...", self.open_family, "Which bot was bred or tweaked from which, including ones that died out."),
                 ("Bot Lab...", self.open_lab,
                  "Evolve bots on months of past prices, then test them on prices they never saw. Only the ones that "
                  "pass are worth keeping. (Ctrl+L)"))):
-            sb = ttk.Button(bar2 if i < 5 else bar3, text=txt, style="Plain.TButton", command=cmd)
+            sb = ttk.Button(bar2 if i < 6 else bar3, text=txt, style="Accent.TButton" if txt == "Catch!" else "Plain.TButton",
+                            command=cmd)
             sb.pack(side="left", padx=(0, 4))
             Tip(sb, tip)
         self.best_lbl = tk.Label(t2, text="", bg=BG, fg=MUTED, anchor="w", padx=6)
         self.best_lbl.pack(fill="x")
+        self.build_farm_strip(t2)
         self.board = self.make_tree(t2, ("strategy", "recent", "edge", "consistent", "winrate", "life", "size", "status", "trades"),
                                     (230, 70, 80, 70, 65, 70, 55, 170, 55),
                                     ("Strategy", "Recent gain", "vs holding", "Wins lately", "Win rate", "Lifetime",
@@ -690,7 +827,7 @@ class App:
         self.update_status()
         self.refresh_view()
         for seq, fn in (("<Control-Return>", self.toggle), ("<Control-l>", self.open_lab), ("<Control-h>", self.open_hof),
-                        ("<Control-k>", self.open_coin_browser), ("<Control-comma>", self.open_settings),
+                        ("<Control-k>", self.open_coin_browser), ("<Control-b>", self.open_collection), ("<Control-comma>", self.open_settings),
                         ("<F5>", self.refresh_trades)):
             root.bind_all(seq, lambda e, f=fn: (f(), "break")[1])
 
@@ -715,6 +852,7 @@ class App:
         m.add_command(label="Bot Lab...", command=self.open_lab, accelerator="Ctrl+L")
         m.add_command(label="Hall of Fame...", command=self.open_hof, accelerator="Ctrl+H")
         m.add_command(label="Bot family tree...", command=self.open_family)
+        m.add_command(label="Bot Collection...", command=self.open_collection, accelerator="Ctrl+B")
         m.add_command(label="Browse Coinbase coins...", command=self.open_coin_browser, accelerator="Ctrl+K")
         m.add_command(label="Settings...", command=self.open_settings, accelerator="Ctrl+,")
         m.add_command(label="Install add-ons (setup)...", command=self.open_setup)
@@ -1212,10 +1350,10 @@ class App:
         def work():
             try:
                 items = E.list_products(self.cur_quote())
-                self.root.after(0, lambda: loaded(items))
+                self.q.put(("call", lambda: loaded(items)))
             except Exception as ex:
                 msg = str(ex)
-                self.root.after(0, lambda: loaded([], msg))
+                self.q.put(("call", lambda: loaded([], msg)))
         threading.Thread(target=work, daemon=True).start()
 
         def add_sel():
@@ -1766,18 +1904,12 @@ class App:
             self.tiles["hold"].config(text=f"{lead:+,.2f}", fg=RED)
         dd = eq - self.day_eq if self.day_eq else 0.0
         self.tiles["day"].config(text=f"{dd:+,.2f}", fg=GREEN if dd >= 0 else RED)
-        self.tree.delete(*self.tree.get_children())
-        for c, q in self.pos.items():
-            if q > 0:
-                px = self.position_price(c)
-                self.tree.insert("", "end", values=(c, f"{q:.6f}", f"{px:,.2f}", f"{q * px:,.2f}",
-                                                    f"{q * px - self.cost[c]:+,.2f}"))
-        held = any(q > 0 for q in self.pos.values())
-        if held:
-            self.empty_hold.place_forget()
-        else:
-            self.empty_hold.place(relx=0.5, rely=0.55, anchor="center")
-            self.empty_hold.lift()
+        try:
+            self.refresh_portfolio()
+        except Exception:
+            note = self._record_error("updating the portfolio")
+            if note:
+                self.write(note, "bad")
         gap = pl - hold
         if not self.session or not self.curve:
             self.verdict_lbl.config(text="Press 'Start the bot' to begin. Practice mode uses pretend money.", fg=MUTED)
@@ -1974,13 +2106,24 @@ class App:
                                  retire_steps=self.retire_steps(bar_min))
             if L > E.WARM:
                 tourn.warmup(hist, extra=hx)
-            saved = E.load_strategies()
+            squad = E.team() if self.cfg.get("team_mode") else []
+            if squad:
+                for v in list(tourn.vars):
+                    tourn._remove(v, "benched for your team")
+                for b in squad:
+                    tourn.add_variant(b["name"], b["params"], hist, b.get("size", 1.0), note=f"Team: {b.get('nickname')}",
+                                      tf=b.get("tf", 1), risk=b.get("risk"), origin="team")
+                if self.settings.get("team_locked", True):
+                    tourn.retire_steps, tourn.evolve_every = 0, 10 ** 9
+                self.q.put(("log", (f"Trading with your team: {', '.join(b.get('nickname', '?') for b in squad)}"
+                                    + (" (locked)." if self.settings.get("team_locked", True) else " (they may breed)."), "good")))
+            saved = [] if squad else E.load_strategies()
             for d in saved:
                 tourn.add_variant(d["name"], d["params"], hist, d.get("size", 1.0), note="Loaded saved", tf=d.get("tf", 1),
                                   risk=d.get("risk"), origin="saved")
             if saved:
                 self.q.put(("log", f"Loaded {len(saved)} saved strategies into the tournament."))
-            if self.settings.get("hof_load", True):
+            if self.settings.get("hof_load", True) and not squad:
                 have = {v.key() for v in tourn.vars}
                 hof = [b for b in E.load_hof() if E.bot_key(b) not in have][:10]
                 for b in hof:
@@ -2233,6 +2376,8 @@ class App:
             self.on_fail(*data)
         elif kind == "bt":
             self.show_backtest(*data)
+        elif kind == "call":  # run a small UI update that a background thread asked for
+            data()
         elif kind == "net":
             self.on_net(*data)
         elif kind == "vols":
@@ -2367,6 +2512,8 @@ class App:
             rows = [dict(r, bar_minutes=self.session_bar) for r in self.tourn.board() if r["v"] in cands]
             entries = E.export_bots(rows, self.version, note=f"Hall of Fame, {', '.join(self.session_coins)}")["bots"]
             new = E.induct(entries, self.version)
+            if self.settings.get("auto_catch", True):
+                self.catch_rows(entries, "hall of fame")
             for v in cands:
                 v.inducted = True
                 rec = self.tourn.lineage.get(v.uid)
@@ -2423,8 +2570,29 @@ class App:
             self.write(msg)
             self.last_wild_msg = msg
 
-    def risk_checks(self):
+    def account_stops(self):
+        """(stop, take, who decided) as fractions. With 'bot_stops' on in Wildcard, the account uses the
+        weighted average stop-loss / take-profit that the current winners evolved, as long as winners holding
+        most of the weight actually use one. Otherwise your own Safety stop / Lock in profit settings."""
         stop, take = self.settings["stop_loss"] / 100, self.settings["take_profit"] / 100
+        src = ["you", "you"]
+        t = self.tourn
+        if self.settings.get("bot_stops", True) and self.wild and t and t.active:
+            tot = sum(t.info[id(v)]["weight"] for v in t.active) or 0
+            for i, k in enumerate(("sl", "tp")):
+                using = [(t.info[id(v)]["weight"], v.risk[k]) for v in t.active if v.risk.get(k)]
+                w = sum(x for x, _ in using)
+                if tot > 0 and w * 2 >= tot:
+                    val = sum(x * r for x, r in using) / w / 100
+                    if i == 0:
+                        stop = val
+                    else:
+                        take = val
+                    src[i] = "bots"
+        return stop, take, src
+
+    def risk_checks(self):
+        stop, take, _ = self.account_stops()
         trail = float(self.settings.get("trail_stop", 0) or 0) / 100
         for c, q in list(self.pos.items()):
             if q <= 0 or c in self.pending or c not in self.last:
@@ -2991,6 +3159,707 @@ class App:
                        "settings are included. The wildcard row only starts ranking after ~100 bars.").pack()
         self.write("Backtest complete.")
 
+    # ---------------- portfolio tab ----------------
+    def build_portfolio(self, parent):
+        top = tk.Frame(parent, bg=CARD)
+        top.pack(fill="x", padx=6, pady=(6, 2))
+        self.pf_stats = {}
+        for i, (k, t) in enumerate((("value", "Total value"), ("invested", "In coins"), ("cash", "Cash"),
+                                    ("unreal", "Open profit / loss"), ("real", "Closed profit / loss"), ("n", "Positions"))):
+            f = tk.Frame(top, bg=CARD)
+            f.grid(row=0, column=i, sticky="w", padx=(0, 22))
+            tk.Label(f, text=t.upper(), bg=CARD, fg=MUTED, font=("", 7, "bold")).pack(anchor="w")
+            l = tk.Label(f, text="-", bg=CARD, fg=TEXT, font=("", 11, "bold"))
+            l.pack(anchor="w")
+            self.pf_stats[k] = l
+        btns = tk.Frame(top, bg=CARD)
+        btns.grid(row=0, column=7, sticky="e")
+        top.columnconfigure(6, weight=1)
+        ttk.Button(btns, text="Buy...", style="Accent.TButton", command=lambda: self.trade_dialog("buy")).pack(side="left")
+        ttk.Button(btns, text="Sell...", style="Plain.TButton", command=lambda: self.trade_dialog("sell")).pack(side="left", padx=4)
+        self.pf_alloc = tk.Canvas(parent, height=26, bg=CARD, highlightthickness=0)
+        self.pf_alloc.pack(fill="x", padx=6, pady=(2, 4))
+        self.pf_alloc.bind("<Configure>", lambda e: self.draw_alloc())
+        self.pf_stops = tk.Label(parent, text="", bg=CARD, fg=MUTED, anchor="w", font=("", 8))
+        self.pf_stops.pack(fill="x", padx=8)
+        self.show_watch = tk.BooleanVar(value=bool(self.cfg.get("pf_watch", True)))
+        bar = tk.Frame(parent, bg=CARD)
+        bar.pack(fill="x", padx=6)
+        ttk.Checkbutton(bar, text="Also show coins I'm watching but don't own", variable=self.show_watch,
+                        style="Card.TCheckbutton", command=lambda: (self.cfg.__setitem__("pf_watch", self.show_watch.get()),
+                                                                    self.refresh_portfolio(force=True))).pack(side="left")
+        tk.Label(bar, text="Click a coin's name to see its chart.", bg=CARD, fg=MUTED, font=("", 8)).pack(side="right")
+        self.pf_scroll = ScrollFrame(parent, CARD, width=600)
+        self.pf_scroll.pack(fill="both", expand=True, padx=2, pady=(2, 2))
+        self.pf_rows, self.pf_order = {}, []
+
+    def _pf_row(self, c):
+        box = self.pf_scroll.inner
+        r = tk.Frame(box, bg=CARD, highlightthickness=1, highlightbackground=LINE)
+        badge = tk.Canvas(r, width=40, height=40, bg=CARD, highlightthickness=0)
+        badge.grid(row=0, column=0, rowspan=2, padx=8, pady=6)
+        draw_coin_badge(badge, 4, 4, 32, c)
+        name = tk.Label(r, text=c, bg=CARD, fg=TEXT, font=("", 11, "bold"), cursor="hand2")
+        name.grid(row=0, column=1, sticky="w")
+        name.bind("<Button-1>", lambda e: (self.chart_view.set(c), self.draw_chart()))
+        sub = tk.Label(r, text="", bg=CARD, fg=MUTED, font=("", 8))
+        sub.grid(row=1, column=1, sticky="w")
+        cols = {}
+        for j, (k, t) in enumerate((("value", "Worth now"), ("pl", "Profit / loss"), ("avg", "Avg cost / now"),
+                                    ("day", "24h"), ("stake", "Staking"))):
+            tk.Label(r, text=t, bg=CARD, fg=MUTED, font=("", 7, "bold")).grid(row=0, column=2 + j, sticky="w", padx=(14, 0))
+            l = tk.Label(r, text="-", bg=CARD, fg=TEXT, font=("", 9, "bold") if k in ("value", "pl") else ("", 9))
+            l.grid(row=1, column=2 + j, sticky="w", padx=(14, 0))
+            cols[k] = l
+        cols["stake"].config(cursor="hand2")
+        cols["stake"].bind("<Button-1>", lambda e: self.staking_info(c))
+        share = tk.Canvas(r, width=90, height=8, bg=CARD, highlightthickness=0)
+        share.grid(row=1, column=7, padx=(14, 0))
+        b = tk.Frame(r, bg=CARD)
+        b.grid(row=0, column=8, rowspan=2, sticky="e", padx=8)
+        ttk.Button(b, text="Buy", width=5, command=lambda: self.trade_dialog("buy", c)).pack(side="left")
+        ttk.Button(b, text="Sell", width=5, command=lambda: self.trade_dialog("sell", c)).pack(side="left", padx=(4, 0))
+        r.columnconfigure(7, weight=1)
+        return dict(frame=r, sub=sub, share=share, **cols)
+
+    def refresh_portfolio(self, force=False):
+        if not hasattr(self, "pf_rows"):
+            return
+        held = [c for c, q in self.pos.items() if q > 0]
+        watch = [c for c in (self.session_coins or [c for c, v in self.coin_vars.items() if v.get()]) if c not in held]
+        held.sort(key=lambda c: -self.pos[c] * self.position_price(c))
+        order = held + (watch if self.show_watch.get() else [])
+        if order != self.pf_order or force:
+            for c in list(self.pf_rows):
+                if c not in order:
+                    self.pf_rows.pop(c)["frame"].destroy()
+            for c in order:
+                if c not in self.pf_rows:
+                    self.pf_rows[c] = self._pf_row(c)
+                self.pf_rows[c]["frame"].pack_forget()
+            for c in order:
+                self.pf_rows[c]["frame"].pack(fill="x", padx=4, pady=3)
+            self.pf_order = order
+            if not order:
+                if not hasattr(self, "pf_empty"):
+                    self.pf_empty = tk.Label(self.pf_scroll.inner, bg=CARD, fg=MUTED, pady=18, text=(
+                        "You don't own any coins right now.\nThe bot buys when a strategy sees a good moment, or press Buy."))
+                self.pf_empty.pack(fill="x")
+            elif hasattr(self, "pf_empty"):
+                self.pf_empty.pack_forget()
+        eq = self.equity()
+        invested = sum(q * self.position_price(c) for c, q in self.pos.items() if q > 0)
+        unreal = sum(q * self.position_price(c) - self.cost.get(c, 0) for c, q in self.pos.items() if q > 0)
+        real = 0.0
+        for t in self.trades:
+            try:
+                real += float(t.get("pl") or 0)
+            except (TypeError, ValueError):
+                pass
+        st = self.pf_stats
+        st["value"].config(text=f"${eq:,.2f}")
+        st["invested"].config(text=f"${invested:,.2f}")
+        st["cash"].config(text=f"${self.cash:,.2f}")
+        st["unreal"].config(text=f"{unreal:+,.2f}", fg=GREEN if unreal >= 0 else RED)
+        st["real"].config(text=f"{real:+,.2f}", fg=GREEN if real >= 0 else RED)
+        st["n"].config(text=str(len(held)))
+        stop, take, src = self.account_stops()
+        trail = float(self.settings.get("trail_stop", 0) or 0)
+        self.pf_stops.config(text=(f"Safety stop: {'off' if not stop else f'-{stop * 100:.1f}%'} (set by {src[0]})   |   "
+                                   f"Lock in profit: {'off' if not take else f'+{take * 100:.1f}%'} (set by {src[1]})"
+                                   + (f"   |   Trailing stop: {trail:g}%" if trail else "")))
+        n24 = int(1440 // self.session_bar)
+        for c in order:
+            w = self.pf_rows[c]
+            q = self.pos.get(c, 0)
+            px = self.position_price(c)
+            h = self.hist.get(c, [])
+            day = f"{(px / h[-n24 - 1] - 1) * 100:+.2f}%" if len(h) > n24 and px else "-"
+            w["day"].config(text=day, fg=(GREEN if day.startswith("+") else RED) if day != "-" else MUTED)
+            kind = STAKING.get(c, ("?", ""))[0]
+            apy = float(self.cfg.get("stake_apy", {}).get(c, 0) or 0)
+            if q > 0:
+                val, basis = q * px, self.cost.get(c, 0)
+                pl = val - basis
+                w["sub"].config(text=f"{q:,.6f}".rstrip("0").rstrip(".") + f" {c}  |  " + MOOD_TEXT.get(E.market_mood(h)[0], "-"))
+                w["value"].config(text=f"${val:,.2f}")
+                w["pl"].config(text=f"{pl:+,.2f} ({pl / basis * 100 if basis else 0:+.1f}%)", fg=GREEN if pl >= 0 else RED)
+                w["avg"].config(text=f"{fmt_px(basis / q)} / {fmt_px(px)}")
+                stake = (f"{kind}: ~${val * apy / 100:,.2f}/yr at {apy:g}%" if apy and kind == "Yes"
+                         else f"{kind} (details)" if kind != "?" else "unknown (details)")
+                share = val / eq if eq else 0
+            else:
+                w["sub"].config(text="watching  |  " + MOOD_TEXT.get(E.market_mood(h)[0], "-"))
+                w["value"].config(text="-")
+                w["pl"].config(text="-", fg=MUTED)
+                w["avg"].config(text=f"now {fmt_px(px)}" if px else "-")
+                stake = f"{kind} (details)" if kind != "?" else "unknown (details)"
+                share = 0
+            w["stake"].config(text=stake, fg=GREEN if kind == "Yes" else MUTED)
+            cv = w["share"]
+            cv.delete("all")
+            cv.create_rectangle(0, 0, 90, 8, fill=LINE, outline="")
+            cv.create_rectangle(0, 0, 90 * min(share, 1), 8, fill=coin_color(c), outline="")
+        self.draw_alloc()
+
+    def draw_alloc(self):
+        c = self.pf_alloc
+        c.delete("all")
+        W = c.winfo_width()
+        eq = self.equity()
+        if W < 50 or eq <= 0:
+            return
+        parts = [(k, q * self.position_price(k)) for k, q in self.pos.items() if q > 0]
+        parts.sort(key=lambda x: -x[1])
+        parts.append(("Cash", self.cash))
+        x = 0
+        for name, v in parts:
+            wd = W * max(v, 0) / eq
+            if wd <= 0:
+                continue
+            col = LINE if name == "Cash" else coin_color(name)
+            c.create_rectangle(x, 2, x + wd, 14, fill=col, outline=CARD)
+            if wd > 48:
+                c.create_text(x + 4, 20, anchor="w", text=f"{name} {v / eq * 100:.0f}%", fill=MUTED, font=("", 7))
+            x += wd
+
+    def staking_info(self, c):
+        kind, note = STAKING.get(c, ("?", "Not in the built-in list. Check whether this coin uses proof of stake "
+                                            "and whether your exchange offers staking for it."))
+        w = tk.Toplevel(self.root)
+        w.title(f"Staking: {c}")
+        f = ttk.Frame(w, padding=16)
+        f.pack()
+        ttk.Label(f, text=f"{c}: can it be staked? {kind}", font=("", 12, "bold")).pack(anchor="w")
+        ttk.Label(f, text=note, wraplength=460, justify="left").pack(anchor="w", pady=(6, 10))
+        ttk.Label(f, foreground=MUTED, wraplength=460, justify="left", text=(
+            "Staking means locking coins to help run the network in exchange for a reward. Rates change often and "
+            "differ by exchange and country, so CBBF doesn't guess them: type the rate you're offered below to see "
+            "estimated earnings for what you hold. Coins the bot is trading are NOT staked. Staked coins usually "
+            "can't be sold instantly (there can be an unstaking wait), so don't stake coins the bot needs to trade.")
+        ).pack(anchor="w")
+        row = ttk.Frame(f)
+        row.pack(anchor="w", pady=(10, 0))
+        ttk.Label(row, text="Reward rate you're offered (% per year)").pack(side="left")
+        apy = tk.StringVar(value=str(self.cfg.get("stake_apy", {}).get(c, "")))
+        ttk.Entry(row, textvariable=apy, width=7).pack(side="left", padx=6)
+        out = ttk.Label(f, text="", font=("", 10, "bold"))
+        out.pack(anchor="w", pady=(8, 0))
+
+        def calc(*_):
+            try:
+                r = float(apy.get())
+            except ValueError:
+                return out.config(text="")
+            val = self.pos.get(c, 0) * self.position_price(c)
+            out.config(text=(f"On your ${val:,.2f} of {c}: about ${val * r / 100:,.2f} a year, "
+                             f"${val * r / 1200:,.2f} a month (before fees, if the price stayed the same)."
+                             if val else f"You don't hold {c} right now; $1,000 would earn about ${10 * r:,.2f} a year."))
+        apy.trace_add("write", calc)
+        calc()
+
+        def save():
+            try:
+                r = float(apy.get() or 0)
+                assert 0 <= r < 100
+            except Exception:
+                return messagebox.showerror("Staking", "Type a yearly rate like 3.5", parent=w)
+            self.cfg.setdefault("stake_apy", {})[c] = r
+            E.save_json(CONFIG_PATH, self.cfg)
+            w.destroy()
+            self.refresh_portfolio(force=True)
+        b = ttk.Frame(f)
+        b.pack(anchor="e", pady=(12, 0))
+        ttk.Button(b, text="Close", command=w.destroy).pack(side="left", padx=6)
+        ttk.Button(b, text="Save rate", style="Accent.TButton", command=save).pack(side="left")
+
+    # ---------------- buying and selling by hand ----------------
+    def trade_dialog(self, side, coin=None):
+        if not self.session:
+            return messagebox.showinfo("Trade", "Press 'Start the bot' first to open a session (Practice or Live). "
+                                                "You can stop the bot right away and still trade by hand.")
+        coins = list(dict.fromkeys(list(self.session_coins) + [c for c, q in self.pos.items() if q > 0]))
+        if side == "sell":
+            coins = [c for c in coins if self.pos.get(c, 0) > 0]
+            if not coins:
+                return messagebox.showinfo("Sell", "You don't own any coins right now.")
+        coin = coin if coin in coins else coins[0]
+        w = tk.Toplevel(self.root)
+        w.title("Buy" if side == "buy" else "Sell")
+        w.resizable(False, False)
+        f = ttk.Frame(w, padding=16)
+        f.pack()
+        mode = "LIVE: real money" if self.live else "Practice: pretend money"
+        ttk.Label(f, text=f"{'Buy' if side == 'buy' else 'Sell'}  ({mode})", font=("", 12, "bold"),
+                  foreground=RED if self.live else TEXT).grid(row=0, column=0, columnspan=3, sticky="w")
+        cv = tk.Canvas(f, width=40, height=40, bg=BG, highlightthickness=0)
+        cv.grid(row=1, column=0, rowspan=2, pady=8)
+        cvar = tk.StringVar(value=coin)
+        cb = ttk.Combobox(f, textvariable=cvar, values=coins, state="readonly", width=8)
+        cb.grid(row=1, column=1, sticky="w", padx=8)
+        info = ttk.Label(f, text="", foreground=MUTED)
+        info.grid(row=2, column=1, columnspan=2, sticky="w", padx=8)
+        amt = tk.StringVar()
+        if side == "buy":
+            ttk.Label(f, text=f"Amount ({self.quote})").grid(row=3, column=0, sticky="w", pady=(8, 0))
+            amt.set(f"{self.trade_size(coin):.2f}")
+            ttk.Entry(f, textvariable=amt, width=12).grid(row=3, column=1, sticky="w", padx=8, pady=(8, 0))
+            quick = ttk.Frame(f)
+            quick.grid(row=4, column=1, columnspan=2, sticky="w", padx=8)
+            for p in (10, 25, 50, 100):
+                ttk.Button(quick, text=f"{p}% of cash", width=10,
+                           command=lambda p=p: amt.set(f"{self.cash * p / 100:.2f}")).pack(side="left", padx=(0, 4))
+        else:
+            ttk.Label(f, text="How much").grid(row=3, column=0, sticky="w", pady=(8, 0))
+            amt.set("100")
+            quick = ttk.Frame(f)
+            quick.grid(row=3, column=1, columnspan=2, sticky="w", padx=8, pady=(8, 0))
+            for p in (25, 50, 75, 100):
+                ttk.Radiobutton(quick, text=f"{p}%", value=str(p), variable=amt).pack(side="left", padx=(0, 6))
+        est = ttk.Label(f, text="", font=("", 10, "bold"))
+        est.grid(row=5, column=0, columnspan=3, sticky="w", pady=(10, 0))
+
+        def update(*_):
+            c = cvar.get()
+            cv.delete("all")
+            draw_coin_badge(cv, 4, 4, 32, c)
+            px = self.last.get(c) or self.position_price(c)
+            q = self.pos.get(c, 0)
+            info.config(text=f"Price {fmt_px(px)}  |  you own {q:,.6f}".rstrip("0").rstrip(".") + f"  |  cash ${self.cash:,.2f}")
+            fee, slip = E.cost_model(dict(self.settings, order_type="market"))
+            try:
+                a = float(amt.get())
+            except ValueError:
+                return est.config(text="")
+            if side == "buy":
+                est.config(text=f"About {a * (1 - fee) / (px * (1 + slip)) if px else 0:,.6f} {c} after fees" if px else "")
+            else:
+                est.config(text=f"About ${q * a / 100 * px * (1 - fee) * (1 - slip):,.2f} after fees" if px else "")
+        cb.bind("<<ComboboxSelected>>", update)
+        amt.trace_add("write", update)
+        update()
+
+        def go():
+            c = cvar.get()
+            px = self.last.get(c)
+            if not px:
+                return messagebox.showerror("Trade", f"No live price for {c} yet. Start the bot so prices come in.", parent=w)
+            if c in self.pending:
+                return messagebox.showinfo("Trade", f"An order for {c} is still being filled. Try again in a moment.", parent=w)
+            try:
+                a = float(amt.get())
+                assert a > 0
+            except Exception:
+                return messagebox.showerror("Trade", "Type an amount above zero.", parent=w)
+            if side == "buy":
+                if a > self.cash + 1e-9:
+                    return messagebox.showerror("Buy", f"That's more than your cash (${self.cash:,.2f}).", parent=w)
+                if self.live and a < MIN_LIVE_ORDER:
+                    return messagebox.showerror("Buy", f"Live orders must be at least ${MIN_LIVE_ORDER:.0f}.", parent=w)
+                if self.live and not messagebox.askyesno("Buy", f"Place a REAL market order to buy ${a:,.2f} of {c}?", parent=w):
+                    return
+                self.manual_buy(c, a, px)
+            else:
+                frac = min(a, 100) / 100
+                if self.live and not messagebox.askyesno("Sell", f"Place a REAL market order to sell {frac * 100:.0f}% of your {c}?",
+                                                         parent=w):
+                    return
+                self.manual_sell(c, frac, px)
+            w.destroy()
+        b = ttk.Frame(f)
+        b.grid(row=6, column=0, columnspan=3, sticky="e", pady=(14, 0))
+        ttk.Button(b, text="Cancel", command=w.destroy).pack(side="left", padx=6)
+        ttk.Button(b, text="Buy" if side == "buy" else "Sell", style="Accent.TButton" if side == "buy" else "Stop.TButton",
+                   command=go).pack(side="left")
+
+    def manual_buy(self, c, usd, px):
+        self.pending_who[c] = "you (by hand)"
+        if self.live:
+            self.cash -= usd
+            self.pending.add(c)
+            self.executor.submit(self.live_buy, c, usd, "manual buy")
+            return
+        fee, slip = E.cost_model(dict(self.settings, order_type="market"))
+        fill = px * (1 + slip)
+        qty = usd * (1 - fee) / fill
+        self.cash -= usd
+        self.pos[c] = self.pos.get(c, 0) + qty
+        self.cost[c] = self.cost.get(c, 0) + usd
+        self.log_trade("buy", c, qty, fill, usd, None, "manual buy")
+
+    def manual_sell(self, c, frac, px):
+        held = self.pos.get(c, 0)
+        if held <= 0:
+            return
+        qty = held if frac >= 0.999 else held * frac
+        self.pending_who[c] = "you (by hand)"
+        if self.live:
+            self.pending.add(c)
+            self.executor.submit(self.live_sell, c, qty, "manual")
+            return
+        fee, slip = E.cost_model(dict(self.settings, order_type="market"))
+        fill = px * (1 - slip)
+        proceeds = qty * fill * (1 - fee)
+        basis = self.cost.get(c, 0) * (qty / held)
+        self.cash += proceeds
+        self.pos[c] = held - qty
+        self.cost[c] = self.cost.get(c, 0) - basis
+        if self.pos[c] < 1e-12:
+            self.pos[c], self.cost[c] = 0, 0
+        self.log_trade("sell", c, qty, fill, proceeds, proceeds - basis, "manual")
+
+    # ---------------- animated bot farm strip ----------------
+    def build_farm_strip(self, parent):
+        self.farm = tk.Canvas(parent, height=46, bg=CARD, highlightthickness=0)
+        self.farm.pack(fill="x", padx=4, pady=(0, 4))
+        self.farm_phase = 0
+        self.farm_hits = []  # (x0, y0, x1, y1, variant) for clicks
+        self.farm_hover = None
+        self.farm.bind("<Motion>", self._farm_motion)
+        self.farm.bind("<Leave>", lambda e: setattr(self, "farm_hover", None))
+        self.farm.bind("<Button-1>", self._farm_click)
+        self.farm.bind("<Double-1>", lambda e: (self._farm_click(e), self.bot_detail()))
+        self.root.after(200, self.animate_farm)
+
+    def _farm_at(self, x, y):
+        for x0, y0, x1, y1, v in self.farm_hits:
+            if x0 <= x <= x1 and y0 <= y <= y1:
+                return v
+        return None
+
+    def _farm_motion(self, e):
+        self.farm_hover = self._farm_at(e.x, e.y)
+
+    def _farm_click(self, e):
+        v = self._farm_at(e.x, e.y)
+        if v and self.board.exists(str(id(v))):
+            self.board.selection_set(str(id(v)))
+            self.board.see(str(id(v)))
+
+    def animate_farm(self):
+        """Little robots for every bot: working ones bob and blink, sleeping ones snooze, a bot that just
+        traded flashes. Runs about 6 times a second; cheap enough to never slow the app down."""
+        try:
+            self._draw_farm()
+        except Exception:
+            pass
+        self.root.after(170, self.animate_farm)
+
+    def _draw_farm(self):
+        c = self.farm
+        if not c.winfo_ismapped():
+            return
+        c.delete("all")
+        self.farm_phase += 1
+        ph = self.farm_phase
+        W = max(c.winfo_width(), 100)
+        self.farm_hits = []
+        if not self.tourn:
+            msg = "Your bot farm appears here when Wildcard is running." if not self.running else "Waking the bots up..."
+            c.create_text(W // 2, 22, text=msg, fill=MUTED)
+            c.config(height=46)
+            return
+        rows = self.tourn.board()
+        size, gap = 26, 6
+        per_row = max(1, (W - 8) // (size + gap))
+        nrows = (len(rows) + per_row - 1) // per_row
+        want_h = nrows * (size + 18) + 6
+        if int(c.cget("height")) != want_h:
+            c.config(height=want_h)
+        amber = "#fbbf24" if DARK else "#d97706"
+        colors = {"active": GREEN, "slowed": amber, "standby": ACCENT, "benched": "#6b7280", "warming up": "#8b5cf6"}
+        awake_now = self.running and self.seeded
+        for i, r in enumerate(rows):
+            v = r["v"]
+            st = r["status"]
+            col = colors.get(st, MUTED)
+            x0 = 6 + (i % per_row) * (size + gap)
+            y0 = 12 + (i // per_row) * (size + 18)
+            working = awake_now and st in ("active", "slowed", "standby", "warming up")
+            just_traded = bool(v.log) and v.log[-1][0] == self.tourn.n and awake_now
+            bob = round(2 * math.sin((ph + i * 3) / 2.2)) if working else 0
+            y = y0 + bob
+            mood = "happy" if st == "active" else "plain"
+            draw_dragon(c, x0, y, size, col, awake=working, phase=ph + i * 3, mood=mood,
+                        fire=just_traded and v.log[-1][2] == "buy", flash=just_traded and ph % 2 == 0)
+            if not working:
+                k = (ph + i * 5) % 18
+                if k < 12:
+                    c.create_text(x0 + size + 1 + k / 3, y + 2 - k, text="z" if k < 6 else "Z", fill=MUTED,
+                                  font=("", 7 + k // 6, "bold"))
+            if just_traded:
+                side = v.log[-1][2]
+                c.create_text(x0 + size / 2, y - 9, text="$" if side == "sell" else "+", fill=GREEN if side == "buy" else amber,
+                              font=("", 9, "bold"))
+            if v.inducted:
+                c.create_text(x0 + size - 1, y + 5, text="★", fill="#f59e0b", font=("", 8))
+            sel = self.board.selection()
+            if sel and sel[0] == str(id(v)):
+                c.create_rectangle(x0 - 3, y0 - 8, x0 + size + 3, y0 + size + 5, outline=TEXT, dash=(2, 2))
+            self.farm_hits.append((x0 - 2, y0 - 8, x0 + size + 2, y0 + size + 4, v))
+        hv = self.farm_hover
+        if hv is not None and hv in self.tourn.vars:
+            d = self.tourn.info.get(id(hv), {})
+            nick = E.bot_nickname(hv.key())
+            txt = (f"{nick}: {friendly_label(hv.name, hv.params, hv.tf, self.session_bar)}  |  "
+                   f"{STATUS_TEXT.get(d.get('status'), d.get('status', ''))}  |  recent {pct_txt(d.get('score'))}  |  "
+                   f"{'working' if (awake_now and d.get('status') != 'benched') else 'sleeping'}")
+            t = c.create_text(6, 1, text=txt, anchor="nw", fill=TEXT, font=("", 8))
+            bb = c.bbox(t)
+            c.create_rectangle(bb[0] - 3, bb[1] - 1, bb[2] + 3, bb[3] + 1, fill=CARD, outline=LINE)
+            c.tag_raise(t)
+
+    # ---------------- Bot Collection ----------------
+    def catch_rows(self, rows, source):
+        """rows: tournament board rows or bot-file entries. Returns the caught entries."""
+        entries = []
+        for r in rows:
+            if "v" in r:
+                entries += E.export_bots([dict(r, bar_minutes=self.session_bar)], self.version)["bots"]
+            else:
+                entries += E.export_bots([r], self.version)["bots"]
+        new, ups, caught = E.catch(entries, source)
+        for b in caught:
+            shiny = " ✨ SHINY" if b.get("shiny") else ""
+            self.write(f"Caught {b['nickname']}{shiny}: {b['rarity']}, level {b['level']} "
+                       f"({friendly_label(b['name'], b['params'])}).", "good")
+        if ups:
+            self.write(f"{ups} bot{'s' if ups != 1 else ''} in your collection levelled up.", "good")
+        if getattr(self, "col_win", None) is not None and self.col_win.winfo_exists():
+            self.col_refresh()
+        return caught
+
+    def catch_selected(self):
+        vs = self.selected_variants()
+        if not vs:
+            return messagebox.showinfo("Catch", "Select one or more bots on the scoreboard (or in the farm above it) first.")
+        ids = {id(v) for v in vs}
+        self.catch_rows([r for r in self.tourn.board() if id(r["v"]) in ids], "scoreboard")
+
+    def toggle_team_mode(self):
+        on = self.team_var.get()
+        self.cfg["team_mode"] = on
+        E.save_json(CONFIG_PATH, self.cfg)
+        n = len(E.team())
+        if on and not n:
+            self.team_var.set(False)
+            self.cfg["team_mode"] = False
+            return messagebox.showinfo("Team", "Your team is empty. Open the Bot Collection (Ctrl+B), pick up to "
+                                               f"{E.TEAM_MAX} bots and press 'Add to team'.")
+        if on and not self.wild_var.get():
+            self.wild_var.set(True)
+            self.toggle_wild()
+        self.update_team_label()
+        if self.session and self.tourn:
+            self.write("The team change applies when Wildcard next starts (File > Reset session).", "warn")
+
+    def update_team_label(self):
+        n = len(E.team())
+        self.team_cb.config(text=f"Trade with my team ({n}/{E.TEAM_MAX})")
+
+    def open_collection(self):
+        if getattr(self, "col_win", None) is not None and self.col_win.winfo_exists():
+            return self.col_win.lift()
+        w = self.col_win = tk.Toplevel(self.root)
+        w.title("Bot Collection")
+        w.geometry("1020x680")
+        top = ttk.Frame(w, padding=(12, 10, 12, 4))
+        top.pack(fill="x")
+        self.col_head = ttk.Label(top, text="Bot Collection", font=("", 13, "bold"))
+        self.col_head.pack(anchor="w")
+        ttk.Label(top, foreground=MUTED, wraplength=980, text=(
+            "Catch bots from the scoreboard, the Bot Lab or the Hall of Fame. Rarity comes from how much they beat "
+            "holding, their win rate and how long they kept winning; catching a bot again levels it up. Pick a team "
+            f"of up to {E.TEAM_MAX} and tick 'Trade with my team' to run Wildcard with just them.")).pack(anchor="w", pady=(2, 6))
+        bar = ttk.Frame(top)
+        bar.pack(fill="x")
+        ttk.Label(bar, text="Show").pack(side="left")
+        self.col_filter = tk.StringVar(value="All")
+        cb = ttk.Combobox(bar, textvariable=self.col_filter, values=["All", "Team"] + list(reversed(E.RARITIES)),
+                          state="readonly", width=10)
+        cb.pack(side="left", padx=(4, 12))
+        ttk.Label(bar, text="Sort by").pack(side="left")
+        self.col_sort = tk.StringVar(value="Rarity")
+        sb = ttk.Combobox(bar, textvariable=self.col_sort, values=["Rarity", "Level", "vs holding", "Newest", "Name"],
+                          state="readonly", width=10)
+        sb.pack(side="left", padx=4)
+        for box in (cb, sb):
+            box.bind("<<ComboboxSelected>>", lambda e: self.col_refresh())
+        self.col_canvas = tk.Canvas(w, bg=BG, highlightthickness=0)
+        ys = ttk.Scrollbar(w, orient="vertical", command=self.col_canvas.yview)
+        self.col_canvas.configure(yscrollcommand=ys.set)
+        btns = ttk.Frame(w, padding=10)
+        btns.pack(side="bottom", fill="x")
+        ys.pack(side="right", fill="y")
+        self.col_canvas.pack(fill="both", expand=True, padx=(12, 0))
+        self.col_canvas.bind("<Configure>", lambda e: self.col_draw())
+        self.col_canvas.bind("<Button-1>", self._col_click)
+        self.col_canvas.bind("<Double-1>", lambda e: (self._col_click(e), self._col_team(None)))
+        self.col_canvas.bind("<MouseWheel>", lambda e: self.col_canvas.yview_scroll(-1 if e.delta > 0 else 1, "units"))
+        self.col_canvas.bind("<Button-4>", lambda e: self.col_canvas.yview_scroll(-1, "units"))
+        self.col_canvas.bind("<Button-5>", lambda e: self.col_canvas.yview_scroll(1, "units"))
+        self.col_sel = set()
+        for txt, cmd, tip in (("Add to team", lambda: self._col_team(True), "Your team trades together when "
+                               "'Trade with my team' is ticked. Double-click a card to add or remove it."),
+                              ("Remove from team", lambda: self._col_team(False), ""),
+                              ("Add to this run", self._col_add_run, "Drop the selected bots into the running tournament."),
+                              ("Export...", self._col_export, "Save the selected bots (or all) to a bot file to share."),
+                              ("Release", self._col_release, "Remove the selected bots from your collection.")):
+            b = ttk.Button(btns, text=txt, command=cmd, style="Accent.TButton" if txt == "Add to team" else "TButton")
+            b.pack(side="left", padx=(0, 6))
+            if tip:
+                Tip(b, tip)
+        self.col_team_lbl = ttk.Label(btns, foreground=MUTED)
+        self.col_team_lbl.pack(side="left", padx=10)
+        ttk.Button(btns, text="Close", command=w.destroy).pack(side="right")
+        self.col_refresh()
+
+    def col_refresh(self):
+        self.col_bots = E.load_collection()
+        keys = {E.bot_key(b) for b in self.col_bots}
+        self.col_sel &= keys
+        counts = {r: sum(1 for b in self.col_bots if b.get("rarity") == r) for r in E.RARITIES}
+        shiny = sum(1 for b in self.col_bots if b.get("shiny"))
+        self.col_head.config(text=f"Bot Collection: {len(self.col_bots)} caught  |  "
+                                  + "  ".join(f"{n} {r}" for r, n in reversed(list(counts.items())) if n)
+                                  + (f"  |  ✨ {shiny} shiny" if shiny else ""))
+        n_team = sum(1 for b in self.col_bots if b.get("team"))
+        self.col_team_lbl.config(text=f"Team: {n_team}/{E.TEAM_MAX}")
+        if hasattr(self, "team_cb"):
+            self.update_team_label()
+        self.col_draw()
+
+    def col_draw(self):
+        c = self.col_canvas
+        c.delete("all")
+        bots = list(self.col_bots)
+        f = self.col_filter.get()
+        if f == "Team":
+            bots = [b for b in bots if b.get("team")]
+        elif f in E.RARITIES:
+            bots = [b for b in bots if b.get("rarity") == f]
+        srt = self.col_sort.get()
+        rk = {r: i for i, r in enumerate(E.RARITIES)}
+        if srt == "Rarity":
+            bots.sort(key=lambda b: (-rk.get(b.get("rarity"), 0), -int(b.get("level") or 1)))
+        elif srt == "Level":
+            bots.sort(key=lambda b: -int(b.get("level") or 1))
+        elif srt == "vs holding":
+            bots.sort(key=lambda b: -float((b.get("lifetime") or {}).get("vs_holding_pct") or -999))
+        elif srt == "Newest":
+            bots.sort(key=lambda b: str(b.get("caught_at", "")), reverse=True)
+        else:
+            bots.sort(key=lambda b: str(b.get("nickname", "")))
+        W = max(c.winfo_width(), 300)
+        cw, ch, g = 230, 150, 12
+        per = max(1, (W - g) // (cw + g))
+        self.col_cards = []
+        if not bots:
+            c.create_text(W // 2, 80, fill=MUTED, justify="center", text=(
+                "No bots here yet.\nSelect bots on the scoreboard and press 'Catch!', or catch Bot Lab passes and "
+                "Hall of Fame bots.\nHall of Fame bots are caught automatically."))
+        for i, b in enumerate(bots):
+            x = g + (i % per) * (cw + g)
+            y = g + (i // per) * (ch + g)
+            k = E.bot_key(b)
+            rc = E.RARITY_COLORS.get(b.get("rarity"), "#9ca3af")
+            sel = k in self.col_sel
+            c.create_rectangle(x, y, x + cw, y + ch, fill=CARD, outline=TEXT if sel else rc, width=3 if sel else 2)
+            c.create_rectangle(x, y, x + cw, y + 26, fill=rc, outline=rc)
+            c.create_text(x + 8, y + 13, anchor="w", fill="white", font=("", 10, "bold"),
+                          text=("✨ " if b.get("shiny") else "") + b.get("nickname", "?"))
+            c.create_text(x + cw - 8, y + 13, anchor="e", fill="white", font=("", 9, "bold"), text=f"Lv {b.get('level', 1)}")
+            draw_dragon(c, x + 8, y + 40, 42, rc, awake=True, phase=0, mood="happy", gold=bool(b.get("shiny")))
+            lt = b.get("lifetime") or {}
+
+            def p(key):
+                v = lt.get(key)
+                return "-" if v is None else f"{v:+.1f}%"
+            lines = [f"{STRAT_LABELS.get(b['name'], b['name'])}",
+                     f"{b.get('rarity', 'Common')}  |  XP {b.get('xp', 0)}",
+                     f"vs holding {p('vs_holding_pct')}",
+                     f"win rate {'-' if lt.get('win_rate_pct') is None else str(round(lt['win_rate_pct'])) + '%'}",
+                     E.risk_text(b.get("risk")) or "no own stops"]
+            for j, line in enumerate(lines):
+                c.create_text(x + 56, y + 36 + j * 16, anchor="w", text=line, fill=TEXT if j == 0 else MUTED,
+                              font=("", 9, "bold") if j == 0 else ("", 8))
+            settings = "/".join(f"{v:g}" for v in b["params"].values()) + (f", pace x{b.get('tf', 1)}" if b.get("tf", 1) > 1 else "")
+            c.create_text(x + 8, y + ch - 12, anchor="w", text=settings, fill=MUTED, font=("", 7))
+            if b.get("team"):
+                c.create_text(x + cw - 8, y + ch - 12, anchor="e", text="★ TEAM", fill="#f59e0b", font=("", 8, "bold"))
+            self.col_cards.append((x, y, x + cw, y + ch, k))
+        rows = (len(bots) + per - 1) // per
+        c.configure(scrollregion=(0, 0, W, rows * (ch + g) + g))
+
+    def _col_click(self, e):
+        x, y = self.col_canvas.canvasx(e.x), self.col_canvas.canvasy(e.y)
+        for x0, y0, x1, y1, k in self.col_cards:
+            if x0 <= x <= x1 and y0 <= y <= y1:
+                if e.state & 0x0004 or e.state & 0x0001:  # ctrl / shift: add to the selection
+                    self.col_sel ^= {k}
+                else:
+                    self.col_sel = {k}
+                break
+        else:
+            self.col_sel = set()
+        self.col_draw()
+
+    def _col_chosen(self, all_if_none=False):
+        bots = [b for b in self.col_bots if E.bot_key(b) in self.col_sel]
+        return bots or (list(self.col_bots) if all_if_none else [])
+
+    def _col_team(self, on):
+        bots = self._col_chosen()
+        if not bots:
+            return messagebox.showinfo("Team", "Click a card first (Ctrl-click for several).", parent=self.col_win)
+        if on is None:  # double-click toggles
+            on = not bots[0].get("team")
+        size, full = E.set_team([E.bot_key(b) for b in bots], on)
+        if full:
+            messagebox.showinfo("Team", f"A team has at most {E.TEAM_MAX} bots. Remove one first.", parent=self.col_win)
+        self.col_refresh()
+
+    def _col_add_run(self):
+        if not self.tourn or not self.seeded:
+            return messagebox.showinfo("Bot Collection", "Start the bot with Wildcard ticked first.", parent=self.col_win)
+        bots = self._col_chosen()
+        if not bots:
+            return messagebox.showinfo("Bot Collection", "Click a card first.", parent=self.col_win)
+        closes = {c: self.hist[c] for c in self.session_coins}
+        have, n = {v.key() for v in self.tourn.vars}, 0
+        for b in bots:
+            if E.bot_key(b) in have:
+                continue
+            if self.tourn.add_variant(b["name"], b["params"], closes, b.get("size", 1.0), note=f"{b.get('nickname')} joined:",
+                                      tf=b.get("tf", 1), risk=b.get("risk"), origin="collection"):
+                n += 1
+        self.flush_events()
+        self.refresh_board()
+        self.write(f"Added {n} bots from your collection to this run." if n else "Those bots are already competing.")
+
+    def _col_export(self):
+        bots = self._col_chosen(all_if_none=True)
+        if not bots:
+            return
+        p = filedialog.asksaveasfilename(title="Export bots", defaultextension=".json", parent=self.col_win,
+                                         initialfile="my-bot-collection.json", filetypes=[("Bot file", "*.json")])
+        if p:
+            payload = E.export_bots(bots, self.version)
+            for out, b in zip(payload["bots"], bots):
+                out.update({k: b[k] for k in E.COLLECT_FIELDS if k in b and k != "team"})
+            E.save_bots_file(p, payload)
+            self.write(f"Exported {len(bots)} collected bots to {p}")
+
+    def _col_release(self):
+        bots = self._col_chosen()
+        if not bots:
+            return messagebox.showinfo("Release", "Click a card first.", parent=self.col_win)
+        names = ", ".join(b.get("nickname", "?") for b in bots[:5]) + ("..." if len(bots) > 5 else "")
+        if messagebox.askyesno("Release", f"Release {names}? They leave your collection.", parent=self.col_win):
+            E.release([E.bot_key(b) for b in bots])
+            self.col_sel = set()
+            self.col_refresh()
+
     # ---------------- bot detail card ----------------
     def bot_detail(self, v=None):
         v = v or self.selected_variant()
@@ -3103,6 +3972,8 @@ class App:
             self.write(f"{title} trade size is now {v.size_mult:.2f}x.")
         ttk.Button(b, text="Export this bot...", command=export_one).pack(side="left")
         ttk.Button(b, text="Add to Hall of Fame", command=to_hof).pack(side="left", padx=6)
+        ttk.Button(b, text="Catch!", style="Accent.TButton", command=lambda: self.catch_rows(
+            [r for r in self.tourn.board() if r["v"] is v], "detail card")).pack(side="left", padx=(0, 6))
         ttk.Button(b, text="Size -", command=lambda: size(-0.25)).pack(side="left")
         ttk.Button(b, text="Size +", command=lambda: size(0.25)).pack(side="left", padx=(4, 0))
         ttk.Button(b, text="Show on main chart", command=lambda: (
@@ -3259,6 +4130,7 @@ class App:
         ttk.Button(b, text="Export...", style="Accent.TButton", command=export).pack(side="left")
         ttk.Button(b, text="Add to this run", command=add_run).pack(side="left", padx=6)
         ttk.Button(b, text="Remove", command=remove).pack(side="left")
+        ttk.Button(b, text="Catch", command=lambda: self.catch_rows(chosen(), "hall of fame")).pack(side="left", padx=(6, 0))
         ttk.Button(b, text="Refresh", command=fill).pack(side="left", padx=6)
         ttk.Button(b, text="Close", command=w.destroy).pack(side="right")
         status = ttk.Label(b, foreground=MUTED)
@@ -3373,6 +4245,8 @@ class App:
         ttk.Button(b, text="Export passed...", style="Accent.TButton", command=export).pack(side="left")
         ttk.Button(b, text="Add passed to Hall of Fame", command=to_hof).pack(side="left", padx=6)
         ttk.Button(b, text="Add passed to this run", command=to_run).pack(side="left")
+        ttk.Button(b, text="Catch passed", command=lambda: self.catch_rows(picked(), "bot lab") if picked() else
+                   messagebox.showinfo("Bot Lab", "No bots passed. Select rows to catch them anyway.", parent=w)).pack(side="left", padx=6)
         ttk.Label(b, text="Select rows to use them instead of the passed ones.", foreground=MUTED).pack(side="left", padx=10)
         ttk.Button(b, text="Close", command=w.destroy).pack(side="right")
 
@@ -3507,6 +4381,7 @@ class App:
             "Ctrl+L        Bot Lab\n"
             "Ctrl+H        Hall of Fame\n"
             "Ctrl+K        Browse coins\n"
+            "Ctrl+B        Bot Collection\n"
             "Ctrl+,        Settings\n"
             "F5            Refresh the Trades tab\n\n"
             "Scoreboard: double-click a strategy for its detail card and chart. Select a strategy and pick a coin in "
@@ -3561,8 +4436,8 @@ class App:
 
                     def work():
                         probs = E.send_alert(trial, "CBBF test alert: alerts are working.")
-                        self.root.after(0, lambda: messagebox.showinfo(
-                            "Alerts", "\n".join(probs) if probs else "Sent. Check your phone.", parent=w))
+                        self.q.put(("call", lambda: messagebox.showinfo(
+                            "Alerts", "\n".join(probs) if probs else "Sent. Check your phone.", parent=w)))
                     threading.Thread(target=work, daemon=True).start()
                 ttk.Button(f, text="Send a test alert", command=test).grid(row=len(fields) + 1, column=0, sticky="w", pady=(10, 0))
             if title == "Orders":

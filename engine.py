@@ -455,7 +455,10 @@ DEFAULT_SETTINGS = {
     "hof_hours": 6.0,            # hours a strategy must spend Winning (in total) to get in
     "hof_min_trades": 4,         # and at least this many finished (sold) trades
     "hof_load": True,            # bring the best Hall of Fame bots back when Wildcard starts
+    "auto_catch": True,          # Hall of Fame bots also go into your Bot Collection
+    "team_locked": True,         # trading with your team: keep exactly those bots (False = they may breed new ones)
     # Orders and costs
+    "bot_stops": True,           # Wildcard: the account's safety stop / lock-in-profit follow what the winning bots learned
     "max_trades_hour": 30,       # brake: most signal trades the account may make in an hour (0 = no limit)
     "trail_stop": 0.0,           # % trailing stop: sell if a coin falls this far from its high since buying (0 = off)
     "slippage": 0.05,            # % lost to the bid/ask spread and price movement on each market order (Practice)
@@ -1575,6 +1578,138 @@ def lifetime_record(lf, bar_minutes=None):
     return out
 
 
+# ---------------- Bot Collection (catch bots, give them names, rarities and levels, pick a team) ----------------
+COLLECT_FIELDS = ("nickname", "rarity", "level", "xp", "caught_at", "source", "team", "shiny")
+TEAM_MAX = 6
+RARITIES = ("Common", "Uncommon", "Rare", "Epic", "Legendary")
+RARITY_COLORS = {"Common": "#9ca3af", "Uncommon": "#22c55e", "Rare": "#3b82f6", "Epic": "#a855f7", "Legendary": "#f59e0b"}
+_ADJ = ("Swift", "Silent", "Lucky", "Iron", "Golden", "Shadow", "Turbo", "Patient", "Crimson", "Frosty", "Clever", "Bold",
+        "Sneaky", "Mighty", "Cosmic", "Thunder", "Velvet", "Rusty", "Neon", "Stormy", "Quiet", "Brave", "Jade", "Solar",
+        "Lunar", "Atomic", "Wild", "Steady", "Nimble", "Electric", "Mystic", "Copper")
+_BEAST = ("Falcon", "Otter", "Badger", "Lynx", "Mantis", "Viper", "Panda", "Heron", "Wolf", "Gecko", "Raven", "Bison",
+          "Fox", "Shark", "Owl", "Tiger", "Moth", "Yak", "Cobra", "Koala", "Puma", "Hawk", "Beetle", "Marten", "Orca",
+          "Ibex", "Lemur", "Jackal", "Stoat", "Kestrel", "Tapir", "Walrus")
+
+
+def bot_nickname(key):
+    """A stable, friendly name for a bot (the same settings always get the same name)."""
+    import hashlib
+    h = hashlib.sha1(repr(key).encode()).digest()
+    return f"{_ADJ[h[0] % len(_ADJ)]} {_BEAST[h[1] % len(_BEAST)]}"
+
+
+def is_shiny(key):
+    import hashlib
+    return hashlib.sha1(("shiny" + repr(key)).encode()).digest()[0] < 5  # about 1 in 50
+
+
+def rarity_for(lt):
+    """Rarity from a bot's track record (lifetime dict from a bot file): beating holding counts most,
+    then win rate and time spent winning."""
+    lt = lt or {}
+    edge = float(lt.get("vs_holding_pct") or 0)
+    wr = lt.get("win_rate_pct")
+    hrs = float(lt.get("hours_winning") or 0)
+    score = edge + (0 if wr is None else (float(wr) - 50) * 0.08) + min(hrs, 48) * 0.15
+    if lt.get("source") == "Bot Lab unseen-data test" and edge > 0:
+        score += 1.5  # passing on unseen prices is worth extra
+    for name, need in (("Legendary", 12), ("Epic", 7), ("Rare", 3.5), ("Uncommon", 1.5)):
+        if score >= need:
+            return name
+    return "Common"
+
+
+def xp_for(lt):
+    lt = lt or {}
+    return int(float(lt.get("hours_winning") or 0) * 10 + float(lt.get("trades") or 0) * 2
+               + max(0.0, float(lt.get("vs_holding_pct") or 0)) * 5)
+
+
+def level_for(xp):
+    return min(99, 1 + int((max(0, xp) / 10) ** 0.5))
+
+
+def collection_path():
+    return os.path.join(HOME_DIR, "collection.json")
+
+
+def load_collection():
+    if not os.path.exists(collection_path()):
+        return []
+    bots, _ = read_bots_file(collection_path())
+    return bots
+
+
+def save_collection(bots):
+    save_json(collection_path(), dict(format=BOT_FORMAT, version=BOT_FORMAT_VERSION, kind="collection",
+                                      exported_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                                      bots=bots[:200]))
+
+
+def catch(entries, source=""):
+    """Adds bots to the collection, or updates ones you already have (they can level up and rank up,
+    never down). Returns (new, levelled_up, [caught entries])."""
+    col = load_collection()
+    index = {bot_key(b): i for i, b in enumerate(col)}
+    new = ups = 0
+    out = []
+    for e in entries:
+        k = bot_key(e)
+        lt = e.get("lifetime") or {}
+        xp = xp_for(lt)
+        r = rarity_for(lt)
+        if k in index:
+            old = col[index[k]]
+            xp = max(xp, int(old.get("xp") or 0))
+            if RARITIES.index(old.get("rarity", "Common")) > RARITIES.index(r):
+                r = old.get("rarity", "Common")
+            if level_for(xp) > int(old.get("level") or 1) or r != old.get("rarity"):
+                ups += 1
+            merged = dict(e, nickname=old.get("nickname") or bot_nickname(k), rarity=r, xp=xp, level=level_for(xp),
+                          caught_at=old.get("caught_at"), source=old.get("source") or source, team=bool(old.get("team")),
+                          shiny=bool(old.get("shiny")))
+            col[index[k]] = merged
+            out.append(merged)
+        else:
+            if len(col) >= 200:
+                continue
+            item = dict(e, nickname=bot_nickname(k), rarity=r, xp=xp, level=level_for(xp),
+                        caught_at=datetime.now().isoformat(timespec="seconds"), source=source, team=False,
+                        shiny=is_shiny(k))
+            index[k] = len(col)
+            col.append(item)
+            out.append(item)
+            new += 1
+    save_collection(col)
+    return new, ups, out
+
+
+def release(keys):
+    keys = set(keys)
+    col = [b for b in load_collection() if bot_key(b) not in keys]
+    save_collection(col)
+    return col
+
+
+def set_team(keys, on):
+    """Adds bots to (or removes them from) your team. Returns (team size, refused because the team is full)."""
+    keys, col, full = set(keys), load_collection(), 0
+    size = sum(1 for b in col if b.get("team"))
+    for b in col:
+        if bot_key(b) in keys and bool(b.get("team")) != on:
+            if on and size >= TEAM_MAX:
+                full += 1
+                continue
+            b["team"] = on
+            size += 1 if on else -1
+    save_collection(col)
+    return size, full
+
+
+def team():
+    return [b for b in load_collection() if b.get("team")]
+
+
 # ---------------- Hall of Fame (long-term winners, saved automatically) ----------------
 def hof_path():
     return os.path.join(HOME_DIR, "hall-of-fame.json")
@@ -1666,6 +1801,12 @@ def read_bots_file(path):
                                 if isinstance(v, (int, float, str)) or v is None}
         if isinstance(d.get("inducted_at"), str):
             item["inducted_at"] = d["inducted_at"][:32]
+        for k in COLLECT_FIELDS:  # Bot Collection extras (plain text / numbers only)
+            v = d.get(k)
+            if isinstance(v, bool) or isinstance(v, (int, float)) or (isinstance(v, str) and len(v) <= 80):
+                item[k] = v
+        if isinstance(d.get("notes"), str):
+            item["notes"] = d["notes"][:200]
         good.append(item)
     return good, problems
 
