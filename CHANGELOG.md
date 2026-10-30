@@ -1,5 +1,42 @@
 # Changelog
 
+## 1.12.0
+**Smarter breeding, safer live trading, a fresher farm**
+
+Bots learn more
+- **Seasons:** the farm keeps a champion for each market mood (trending up, down, choppy, quiet). When the mood
+  changes and holds, that season's champion is woken up again from its genes if it had left the farm.
+- **Elders teach:** good bots that leave the farm are remembered; new eggs of the same family are sometimes nudged
+  toward their settings instead of mutating purely at random.
+- **Twin test:** each winner's exact twin is run on an older stretch of prices it was never scored on. If the twin
+  loses to just holding, the winner was probably lucky and counts for less. Shown on the bot's card.
+- **Favourite coins:** bots learn which coins they keep losing on and skip them. Every skip is graded in hindsight,
+  and bad records fade, so a bot re-tries a coin one day.
+- **Confidence sizing:** when a bot's studies clearly agree it buys bigger; on a close vote, smaller.
+
+Live safety
+- **Allowance per bot** (Settings > Basics): the most of your starting money one bot's votes may have tied up.
+- **Why did it trade?** Every account trade records which bots voted and what each one saw. Double-click a trade on
+  the Trades tab, and LIVE trades pop up a short note (can be switched off).
+- **Daily loss limit meter** on the TODAY tile.
+- **Weekly report** of what the farm learned and how the account did, saved to the data folder and sent to
+  Discord / Telegram if set up (Tools > Weekly report now).
+
+Look and feel
+- Den colours: green eggs, blue Rising, orange BEASTS, gold Hall of Fame, with matching glows and tabs.
+- Promotion moments: a hatch burst when an egg becomes Rising, a fiery ROAR when a bot becomes a BEAST.
+- The bot card shows its **family**: parents and children as little clickable portraits.
+- **Search** the farm by name, strategy, trait, never-rule or study.
+- **Drag a card** onto the Hall of Fame or Library tab to promote or save it.
+- **Undo** after releasing bots or removing them from the Hall of Fame.
+- **Farm presets:** Calm, Balanced or Wild in one click.
+- **Compact top bar** (File menu) for more farm room, and a short **tour** for new users (Help > Take the tour).
+
+Faster
+- **Background mode:** while minimized, screens skip their redraws and catch up when you come back.
+- **History cache:** price history is kept on disk, so restarts only download what's new.
+- Dark-mode number boxes (like Farm size) are readable again.
+
 ## 1.11.0
 **Studies: several reasons to buy, several reasons not to**
 - Each bot can now weigh **several positive studies** (its main strategy plus up to 4 more strategies from any
