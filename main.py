@@ -132,6 +132,9 @@ SETTING_GROUPS = [
         ("max_bots", "Farm size: most bots competing at once (14 to 200)", int),
         ("retire_hours", "Replace a strategy that hasn't been winning for this many hours (0 = never)", float),
         ("crossbreed", "New strategies can mix the settings of two winners (crossbreeding)", bool),
+        ("classics", "Mix famous strategies into the eggs (golden cross, turtle breakout, RSI-2, MACD 12/26/9... plus a few "
+                     "controversial ones). They hatch from silver eggs", bool),
+        ("classic_rate", "...% of new eggs that are a famous strategy", float),
         ("prove_live", "New bots must also make money on fresh live prices before they can be Winning (guards against luck)", bool),
         ("risk_adjusted", "Rank winners by steady gains (gain per unit of downside), not just the biggest gain", bool),
         ("long_holds", "Include slow, longer-holding bots from the start (not everything is a quick trade)", bool),
@@ -166,7 +169,8 @@ SETTING_GROUPS = [
         ("bar_minutes", "How often strategies decide (15 sec is the fastest)", "bar"),
         ("refresh", "Check prices every N seconds (1 or more)", int),
         ("animations", "Animations (Light uses less computer power)", "anim"),
-        ("egg_colors", "Egg colours: by dragon type, or all purple (royal eggs from your own bots are always gold)", "eggs"),
+        ("egg_colors", "Egg colours: by dragon type, or all purple (royal eggs from your own bots are always gold, "
+                       "famous strategies silver)", "eggs"),
         ("characters", "Dragons: themed by strategy (fire, ice, lightning, space; resting bots are skeletons) or classic (coloured by status)", "chars"),
     ]),
     ("Alerts", "Get a message on your phone when something happens. Leave blank to turn off.", [
@@ -379,7 +383,7 @@ def fmt_px(px):
     return f"${px:,.2f}" if px >= 1 else f"${px:,.6f}"
 
 
-def draw_egg(c, x, y, size, color, progress=0.0, phase=0, tags=(), royal=False):
+def draw_egg(c, x, y, size, color, progress=0.0, phase=0, tags=(), royal=False, classic=False):
     """A speckled dragon egg. It wobbles more and cracks open as it gets closer to hatching (progress 0..1)."""
     k = size / 40.0
     wob = math.sin(phase / 1.7) * (1 + 3 * progress) if phase else 0
@@ -395,6 +399,9 @@ def draw_egg(c, x, y, size, color, progress=0.0, phase=0, tags=(), royal=False):
         c.create_line(*P(8, 26, 13, 22, 17, 27, 21, 23), fill="#57534e", width=max(1, 1.5 * k), tags=tags)
     if progress > 0.6:
         c.create_line(*P(21, 23, 25, 28, 29, 24, 33, 27), fill="#57534e", width=max(1, 1.5 * k), tags=tags)
+    if classic and not royal:  # silver egg: a famous strategy
+        c.create_line(*P(5, 30, 35, 30), fill="#e2e8f0", width=max(1, 3 * k), tags=tags)
+        c.create_text(*P(20, 22), text="\u272a", fill="#475569", font=("", max(7, int(9 * k)), "bold"), tags=tags)
     if royal:  # royal egg: gold band and a little crown mark
         c.create_line(*P(5, 30, 35, 30), fill="#facc15", width=max(1, 3 * k), tags=tags)
         c.create_text(*P(20, 22), text="\u265b", fill="#a16207", font=("", max(7, int(9 * k)), "bold"), tags=tags)
@@ -4117,6 +4124,9 @@ class App:
                           font=("", 12 if big else 10, "bold"), tags="card")
             c.create_text(tx, y + 58, anchor="w", text=STRAT_LABELS.get(v.name, v.name), fill=MUTED, font=("", 8), tags="card")
             sub = "hatching..." if t == "egg" else f"every {E.fmt_bar(v.tf * self.session_bar)}  |  {rar}"
+            if v.classic:
+                sub = f"\u272a Classic: {v.classic}" + ("  \u26a0" if any(cl.get("controversial") and cl["title"] == v.classic
+                                                                        for cl in E.CLASSICS) else "")
             c.create_text(tx, y + 72, anchor="w", text=sub, fill=rc, font=("", 8, "bold"), tags="card")
             c.create_text(x + 10, y + 15, anchor="w", text=f"LV {lvl}", fill=rc, font=("", 9, "bold"), tags="card")
             by = y + (port + 12)
@@ -4175,6 +4185,8 @@ class App:
     def egg_color(self, v):
         if v.royal:
             return "#f59e0b"  # royal egg: descends from bots you saved
+        if v.classic:
+            return "#94a3b8"  # silver egg: a famous strategy
         if self.settings.get("egg_colors", "By dragon type") == "Purple":
             return "#8b5cf6"
         th = theme_for(v.name)
@@ -4199,7 +4211,7 @@ class App:
             if t == "egg":
                 prog = min(1, len(v.eq) / max(1, self.tourn.W)) if self.tourn else 0
                 draw_egg(c, x0 + 20, y0 + 12, 40, self.egg_color(v), prog, ph if awake else 0, tags="anim",
-                         royal=v.royal)
+                         royal=v.royal, classic=bool(v.classic))
                 continue
             label, col = self.GRID_STATUS.get(st, ("?", MUTED))
             working = awake and st != "benched"
@@ -5678,7 +5690,7 @@ class App:
             st = STATUS_TEXT.get(d.get("status"), d.get("status", "removed")) if v in self.tourn.vars else "Removed"
             hrs = v.win_steps * self.session_bar / 60
             parents = self.tourn.lineage.get(v.uid, {}).get("parents", [])
-            fam = {"starter": "starter bot", "bred": f"bred from #{' and #'.join(map(str, parents))}",
+            fam = {"starter": "starter bot", "classic": f"famous strategy: {v.classic}", "bred": f"bred from #{' and #'.join(map(str, parents))}",
                    "tweaked": f"tweaked copy of #{parents[0]}" if parents else "tweaked copy"}.get(v.origin, v.origin or "-")
             vals = {"Status": st, "Recent gain": pct_txt(d.get("score")), "vs holding (recent)": pct_txt(d.get("edge")),
                     "Lifetime return": pct_txt(lf["ret"]), "Lifetime vs holding": pct_txt(lf["edge"]),
@@ -5687,7 +5699,8 @@ class App:
                     "Time winning": f"{hrs:.1f} h" if hrs >= 1 else f"{hrs * 60:.0f} min",
                     "Best market": MOOD_TEXT.get(lf["best_mood"], "not sure yet") if lf["best_mood"] else "not sure yet",
                     "Own stops": E.risk_text(v.risk) or "none", "Family": f"#{v.uid}, {fam}, generation {v.gen}",
-                    "Traits": E.traits_text(v.traits) or "none yet", "Fees paid": f"${v.sim.fees:,.2f}"}
+                    "Traits": (E.traits_text(v.traits) or "none yet") + (
+                        "  |  " + next((cl["note"] for cl in E.CLASSICS if cl["title"] == v.classic), "") if v.classic else ""), "Fees paid": f"${v.sim.fees:,.2f}"}
             for k, l in info_lbls.items():
                 l.config(text=vals[k])
             cv.delete("all")
