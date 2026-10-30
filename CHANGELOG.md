@@ -1,5 +1,53 @@
 # Changelog
 
+## 1.9.0
+Smarter learning
+- **Prove it on new prices**: a bot can only become Winning after it has also made money on live prices that
+  came in after it was created (new bots are first judged partly on replayed history, where luck looks like skill).
+  Until then it shows "Proving itself".
+- **Risk-adjusted ranking**: winners are ranked by steady gains (gain per unit of downside swing), so smooth
+  gainers beat wild lucky ones.
+- **Diversity**: parents are picked with fitness sharing, so one lucky strategy family can't crowd out the rest.
+- **Adaptive evolution**: bolder mutations when nothing is winning, fine-tuning when several bots are.
+
+Your own bloodlines
+- **Breed from your own bots**: drop Library or Hall of Fame bots onto the farm ("Add to farm") to compete and breed,
+  or select two in the Library and press **Breed pair**. Everything descended from your saved bots hatches from a
+  **royal egg** (gold, with a crown mark), and the royal line carries on through their children.
+- **Coloured eggs** by dragon type (fire red, ice blue, lightning yellow, space purple), or all purple
+  (Settings > Timing).
+
+More strategies
+- Four new strategy families the farm can mutate and breed: **Supertrend**, **Cloud cross (Ichimoku)**,
+  **Speed shift (rate of change)** and **Trend ribbon** (three moving averages in line).
+
+Exports other programs (and AIs) can understand
+- **Export bots** now asks what to export: your selection, all bots, BEASTS, Rising, Eggs, everything not resting,
+  your Hall of Fame or your Library. The JSON spells out every bot's rules in plain English, explains each setting
+  and includes the formula for each strategy, so another app or an AI can rebuild it. Optional plain-text summary.
+
+Smoother
+- **Motion: Full / Light / Off** right on the Bot Farm tab.
+- Fixed eggs flickering now and then (redrawn cards briefly covered the animation).
+- Clicking a dragon is snappier: only the highlight moves; charts redraw once, a moment later.
+- Settings > Basics now includes the trailing stop and minimum hold, with clearer wording.
+
+Faster and bigger farms
+- **5-second and 10-second decision speeds** (Settings > Timing), for a livelier farm.
+- **Farm size up to 200 bots**, adjustable right on the Bot Farm tab, and **+ Add eggs** to hatch new random bots
+  whenever you like.
+- Much faster: bots read price history through zero-copy views, so loading history, replays, backtests and the Bot
+  Lab take a fraction of the time and memory, even with lots of bots.
+- The farm shows its goal plainly: make money after fees, and more than just holding. That is what every bot is
+  scored on.
+
+Longer holds
+- Bot paces now go up to 60x your bar length (e.g. one decision an hour at 1-minute bars). Starter bots include slow
+  copies, and 2,000 bars of history are loaded so slow bots can start right away.
+- New trait the bots can evolve: **minimum hold** (keeps a position for a while before its strategy may sell; its
+  stops still work).
+- New account setting **Minimum hold** (Settings > Orders): minutes before a strategy signal may sell a coin.
+
 ## 1.8.2
 - Fix: clicking column headings to sort a list could pop up "pick a strategy first". Double-clicks on headings or empty space are ignored now.
 - Themed dragons replace the animal characters (fire, ice, lightning, space, and skeletons for resting bots).

@@ -32,10 +32,37 @@ def migrate_home():
         pass
     return False
 WARM = 30  # bars skipped at the start of a backtest so indicators have data
-TIMEFRAMES = (1, 2, 3, 5, 10, 15)  # how many app bars a bot waits between decisions (x the Bar length setting)
-BAR_CHOICES = (0.25, 0.5, 1, 5, 15, 60)  # decision speed in minutes: 15 s, 30 s, 1, 5, 15, 60 min
+TIMEFRAMES = (1, 2, 3, 5, 10, 15, 30, 60)  # how many app bars a bot waits between decisions (x the Bar length setting)
+BAR_CHOICES = (5 / 60, 10 / 60, 0.25, 0.5, 1, 5, 15, 60)  # decision speed in minutes: 5 s, 10 s, 15 s, 30 s, 1-60 min
 CANDLE_GRANS = (60, 300, 900, 3600, 21600, 86400)  # what Coinbase's candle endpoint offers (seconds)
 LOOKBACK = 300  # most bars any strategy looks back; longer history is trimmed for speed
+
+
+class View:
+    """A read-only window onto the first `end` items of a list, without copying it. Bots read price history
+    through these, which keeps replays and backtests fast even with hundreds of bots and long histories."""
+    __slots__ = ("seq", "end")
+
+    def __init__(self, seq, end):
+        if isinstance(seq, View):
+            end, seq = min(end, seq.end), seq.seq
+        self.seq, self.end = seq, max(0, min(end, len(seq)))
+
+    def __len__(self):
+        return self.end
+
+    def __getitem__(self, k):
+        if isinstance(k, slice):
+            a, b, s = k.indices(self.end)
+            return self.seq[a:b:s]
+        if k < 0:
+            k += self.end
+        if not 0 <= k < self.end:
+            raise IndexError("view index out of range")
+        return self.seq[k]
+
+    def __iter__(self):
+        return iter(self.seq[:self.end])
 
 
 def candle_gran(bar_minutes):
@@ -49,7 +76,8 @@ def fmt_bar(minutes):
     """'15 sec', '1 min', '1 hr' ..."""
     m = float(minutes)
     if m < 1:
-        return f"{round(m * 60):g} sec"
+        s = round(m * 60, 1)
+        return f"{s:g} sec"
     if m >= 60 and m % 60 == 0:
         return f"{m / 60:g} hr"
     return f"{m:g} min"
@@ -75,13 +103,14 @@ def tail_extra(p, x, tf=1, keep=LOOKBACK):
         return dict(h=x["h"][-keep:], l=x["l"][-keep:], v=x["v"][-keep:])
     last = len(p) - 1
     start = last - tf * min(keep - 1, last // tf)
-    H, Lo, V = x["h"], x["l"], x["v"]
+    a0 = max(0, start - tf + 1)
+    H, Lo, V = x["h"][a0:last + 1], x["l"][a0:last + 1], x["v"][a0:last + 1]  # one copy each, then plain lists
     h, lo, v = [], [], []
     for j in range(start, last + 1, tf):
-        a = max(0, j - tf + 1)
-        h.append(max(H[a:j + 1]))
-        lo.append(min(Lo[a:j + 1]))
-        v.append(sum(V[a:j + 1]))
+        a, b = max(0, j - tf + 1) - a0, j + 1 - a0
+        h.append(max(H[a:b]))
+        lo.append(min(Lo[a:b]))
+        v.append(sum(V[a:b]))
     return dict(h=h, l=lo, v=v)
 
 
@@ -375,6 +404,87 @@ def sig_atr(p, n, a, x=None):
         return "sell"
 
 
+def sig_supertrend(p, n, a, x=None):
+    """Supertrend: a trailing band m x ATR away from the price that flips sides when the trend turns."""
+    k, m = int(a["n"]), a["m"]
+    if not x or len(p) < k * 3:
+        return None
+    h, lo = x["h"], x["l"]
+    L = len(p)
+    tr = [max(h[i] - lo[i], abs(h[i] - p[i - 1]), abs(lo[i] - p[i - 1])) for i in range(L - k * 3 + 1, L)]
+    up, prev_up, start = None, None, L - k * 2
+    for i in range(start, L):
+        atr = sum(tr[i - start:i - start + k]) / k
+        mid = (h[i] + lo[i]) / 2
+        upper, lower = mid + m * atr, mid - m * atr
+        if up is None:
+            up = p[i] > mid
+            band = lower if up else upper
+            continue
+        prev_up = up
+        if up:
+            band = max(band, lower) if prev_up else lower
+            if p[i] < band:
+                up, band = False, upper
+        else:
+            band = min(band, upper)
+            if p[i] > band:
+                up, band = True, lower
+    if prev_up is None:
+        return None
+    if up and not prev_up:
+        return "buy"
+    if prev_up and not up:
+        return "sell"
+
+
+def sig_ichimoku(p, n, a, x=None):
+    """Ichimoku-style cross: the fast midline ((highest high + lowest low) / 2 over a short window) crossing the
+    slow midline over a long window, only buying with the price above the slow line."""
+    f, s = int(a["fast"]), int(a["slow"])
+    if not x or f >= s or len(p) < s + 2:
+        return None
+    h, lo = x["h"], x["l"]
+
+    def mid(k, off):
+        hh, ll = h[len(h) - k - off:len(h) - off], lo[len(lo) - k - off:len(lo) - off]
+        return (max(hh) + min(ll)) / 2
+    f0, s0, f1, s1 = mid(f, 1), mid(s, 1), mid(f, 0), mid(s, 0)
+    if f0 <= s0 and f1 > s1 and p[-1] > s1:
+        return "buy"
+    if f0 >= s0 and f1 < s1:
+        return "sell"
+
+
+def sig_roc(p, n, a):
+    """Rate of change: % change over a lookback, crossing its own short average (momentum turning)."""
+    k, sm = int(a["n"]), int(a["smooth"])
+    if len(p) < k + sm + 2:
+        return None
+    roc = [(p[i] / p[i - k] - 1) * 100 for i in range(len(p) - sm - 1, len(p))]
+    s0, s1 = sum(roc[:-1]) / sm, sum(roc[1:]) / sm
+    if roc[-2] <= s0 and roc[-1] > s1 and roc[-1] > 0:
+        return "buy"
+    if roc[-2] >= s0 and roc[-1] < s1 and roc[-1] < 0:
+        return "sell"
+
+
+def sig_ribbon(p, n, a):
+    """Moving-average ribbon: three averages stacked in order (fast > mid > slow) means a healthy uptrend: buy
+    when they line up, sell when the fast one drops below the middle one."""
+    f, m, s = int(a["fast"]), int(a["mid"]), int(a["slow"])
+    if not f < m < s or len(p) < s * 3:
+        return None
+    seg = p[-(s * 3):]
+    ef, em, es = _ema(seg, f), _ema(seg, m), _ema(seg, s)
+    now = ef[-1] > em[-1] > es[-1]
+    before = ef[-2] > em[-2] > es[-2]
+    if now and not before:
+        return "buy"
+    if ef[-1] < em[-1] and ef[-2] >= em[-2]:
+        return "sell"
+
+
 def sig_trend_dip(p, n, a):
     """Buys short dips (low RSI) only while the price is above its long average (an uptrend).
     Sells on a pop (high RSI) or when the uptrend breaks."""
@@ -407,6 +517,13 @@ STRATS = {
                           bounds={"fast": (2, 20), "slow": (5, 60), "min_gap": (0.0, 0.5)}),
     "Stochastic": dict(fn=sig_stoch, params={"n": 14, "lo": 20, "hi": 80},
                        bounds={"n": (5, 40), "lo": (5, 35), "hi": (65, 95)}),
+    "Supertrend": dict(fn=sig_supertrend, params={"n": 10, "m": 3.0}, hlv=True, keep=120,
+                       bounds={"n": (5, 30), "m": (1.0, 5.0)}),
+    "Ichimoku cross": dict(fn=sig_ichimoku, params={"fast": 9, "slow": 26}, hlv=True, keep=120,
+                           bounds={"fast": (4, 20), "slow": (15, 60)}),
+    "Rate of change": dict(fn=sig_roc, params={"n": 12, "smooth": 4}, bounds={"n": (3, 50), "smooth": (2, 12)}),
+    "MA ribbon": dict(fn=sig_ribbon, params={"fast": 5, "mid": 13, "slow": 34},
+                      bounds={"fast": (2, 15), "mid": (8, 40), "slow": (20, 100)}),
     "Trend + dip": dict(fn=sig_trend_dip, params={"trend": 60, "period": 7, "lo": 30, "hi": 70},
                         bounds={"trend": (20, 150), "period": (3, 20), "lo": (15, 40), "hi": (60, 85)}),
     "Volume breakout": dict(fn=sig_volbreak, params={"n": 20, "vmult": 1.8}, hlv=True, keep=80,
@@ -430,6 +547,8 @@ def fix_params(name, p):
             p["fast"], p["slow"] = d["fast"], d["slow"]
     if "lo" in p and "hi" in p and p["lo"] >= p["hi"] - 10:
         p["lo"], p["hi"] = d["lo"], d["hi"]
+    if "mid" in p and not (p["fast"] < p["mid"] < p["slow"]):
+        p["fast"], p["mid"], p["slow"] = d["fast"], d["mid"], d["slow"]
     return p
 WILDCARD_STRATS = [n for n in STRATS if n != "Dollar-cost averaging"]  # DCA never sells
 
@@ -450,7 +569,7 @@ DEFAULT_SETTINGS = {
     "winner_boost": 2.5,         # biggest trade-size multiplier a top winner can earn
     "add_every": 3,              # decisions between add-on buys while a winner is holding
     "slow_every": 6,             # decisions between trades that only shaky strategies want
-    "max_bots": 30,              # most strategies competing at once (14 to 50)
+    "max_bots": 30,              # most strategies competing at once (14 to 200)
     "retire_hours": 12.0,        # replace a strategy that has not been winning for this long (0 = never)
     "fail_drop": 3.0,            # % drop from a strategy's recent peak that stops it at once (0 = off)
     "beat_hold": True,           # a strategy only counts as Winning if it also beats just holding
@@ -464,9 +583,14 @@ DEFAULT_SETTINGS = {
     "auto_hof": False,           # ...and also put straight into the Hall of Fame (off: you choose who goes in)
     "animations": "Full",        # Full, Light (slower, lighter) or Off
     "characters": "Themed dragons",  # or "Classic dragons" (coloured by status)
+    "egg_colors": "By dragon type",  # or "Purple"
     "team_locked": True,         # trading with your team: keep exactly those bots (False = they may breed new ones)
     # Orders and costs
     "bot_stops": True,           # Wildcard: the account's safety stop / lock-in-profit follow what the winning bots learned
+    "prove_live": True,          # a bot can only be Winning after it also made money on prices it hadn't seen yet
+    "risk_adjusted": True,       # rank winners by gain per unit of downside swing, not raw gain
+    "long_holds": True,          # include slow, longer-holding bots from the start
+    "min_hold_min": 0.0,         # account: minutes to hold before a strategy signal may sell (stops still sell)
     "fee_aware": True,           # don't sell for a profit smaller than the round-trip fees (losses and stops still sell)
     "max_trades_hour": 30,       # brake: most signal trades the account may make in an hour (0 = no limit)
     "trail_stop": 0.0,           # % trailing stop: sell if a coin falls this far from its high since buying (0 = off)
@@ -603,7 +727,9 @@ def tournament_opts(settings):
                 beat_hold=bool(settings.get("beat_hold", True)),
                 crossbreed=bool(settings.get("crossbreed", True)),
                 regime_aware=bool(settings.get("regime_aware", True)),
-                slip=slip, fee_aware=bool(settings.get("fee_aware", True)))
+                slip=slip, fee_aware=bool(settings.get("fee_aware", True)),
+                prove_live=bool(settings.get("prove_live", True)), risk_adjusted=bool(settings.get("risk_adjusted", True)),
+                long_holds=bool(settings.get("long_holds", True)))
 
 
 RISK_BOUNDS = {"sl": (0.5, 15.0), "tp": (0.5, 30.0)}  # a bot's own stop-loss / take-profit, % (0 = none)
@@ -630,6 +756,7 @@ def risk_text(r):
 TRAITS = {
     "trail":   dict(lo=0.5, hi=12.0, kind=float, text=lambda v: f"trailing stop {v:g}%"),
     "maxhold": dict(lo=3, hi=200, kind=int, text=lambda v: f"sells after {v} decisions"),
+    "minhold": dict(lo=2, hi=300, kind=int, text=lambda v: f"holds at least {v} decisions"),
     "cool":    dict(lo=1, hi=30, kind=int, text=lambda v: f"waits {v} decisions after selling"),
     "trend":   dict(lo=20, hi=250, kind=int, text=lambda v: f"buys only above its {v}-bar average"),
     "minvol":  dict(lo=0.02, hi=1.5, kind=float, text=lambda v: f"skips markets moving under {v:g}% a bar"),
@@ -640,7 +767,7 @@ TRAITS = {
     "moods":   dict(lo=1, hi=14, kind=int, text=lambda v: "trades only when " + " / ".join(
         m for i, m in enumerate(MOODS) if v & (1 << i))),
 }
-TRAIT_NAMES = {"trail": "Trailing stop", "maxhold": "Max hold", "cool": "Cooldown", "trend": "Trend filter",
+TRAIT_NAMES = {"trail": "Trailing stop", "maxhold": "Max hold", "minhold": "Min hold", "cool": "Cooldown", "trend": "Trend filter",
                "minvol": "Min volatility", "rsicap": "Overbought guard", "confirm": "Confirmation",
                "entries": "Max entries", "exit": "Stops-only exit", "moods": "Mood gate"}
 
@@ -715,6 +842,8 @@ def bot_step(v, closes, n, coins, extra=None):
                         s = None
             elif s == "sell" and tr.get("exit") and (v.risk["sl"] or v.risk["tp"] or tr.get("trail") or tr.get("maxhold")):
                 s = None  # this bot only leaves through its own exits
+            elif s == "sell" and tr.get("minhold") and n - v.since.get(c, n) < tr["minhold"] * v.tf:
+                s = None  # this bot holds for a while before its strategy may sell (its stops still work)
             elif s == "sell" and v.fee_guard and sim.pos.get(c, 0) > 0:
                 gain = last[c] / (sim.cost[c] / sim.pos[c]) - 1
                 if 0 <= gain < v.fee_guard:
@@ -758,6 +887,9 @@ class Variant:
         self.mood_n = {}
         self.inducted = False
         self.origin = ""
+        self.royal = False       # descends from a bot you saved (Library / Hall of Fame / team): hatches from a royal egg
+        self.live_n = 0          # decisions made on prices that came in after the bot was created
+        self.live_eq0 = None     # its equity when it started trading live (after any replay)
         self.log = deque(maxlen=300)  # (decision number, coin, side, price) of this bot's own trades, for charts
 
     @property
@@ -802,7 +934,9 @@ class Tournament:
         self.family_cap = max(5, -(-self.cap // 4))
         self.retire_steps = max(0, int(retire_steps))  # decisions a bot may go without winning before it is replaced
         self.o = dict(trade_more=True, winner_boost=2.5, add_every=3, slow_every=6, fail_drop=3.0,
-                      beat_hold=True, crossbreed=True, regime_aware=True, slip=0.0, fee_aware=True)
+                      beat_hold=True, crossbreed=True, regime_aware=True, slip=0.0, fee_aware=True,
+                      prove_live=True, risk_adjusted=True, long_holds=True)
+        self.replaying = False
         self.o.update(opts or {})
         self.slowed, self.cool, self.add_cool, self.kind = [], {}, {}, {}
         self.rng = rng or random.Random()
@@ -823,7 +957,7 @@ class Tournament:
             self.vars.append(self._new(name, p))
         for name in WILDCARD_STRATS:  # a slower-paced copy of each, so different speeds compete from the start
             p = dict((params or {}).get(name) or STRATS[name]["params"])
-            self.vars.append(self._new(name, p, tf=3))
+            self.vars.append(self._new(name, p, tf=10 if self.o.get("long_holds", True) else 3))
         while len(self.vars) < min(self.cap, 24):  # a bigger, more varied field from the start
             name = self.rng.choice(WILDCARD_STRATS)
             self.vars.append(self._new(name, self._rand_params(name), tf=self.rng.choice(TIMEFRAMES),
@@ -832,9 +966,13 @@ class Tournament:
         for v in self.vars:
             self._register(v, [], "starter")
 
+    def window_for(self, tf):
+        """How many bars a bot is judged over: slow bots get a longer window so they make enough decisions in it."""
+        return self.W * min(max(1, clamp_tf(tf) // 2), 10)
+
     def _new(self, name, params, tf=1, risk=None, traits=None):
         v = Variant(name, params, Sim(self.start_cash, self.fee, self.pct, slip=self.o.get("slip", 0.0)),
-                    self.W + 1, tf, risk, traits)
+                    self.window_for(tf) + 1, tf, risk, traits)
         v.fee_guard = 2 * (self.fee + self.o.get("slip", 0.0)) if self.o.get("fee_aware", True) else 0.0
         return v
 
@@ -868,6 +1006,8 @@ class Tournament:
         """Gives a bot its id and family-tree entry."""
         self.serial += 1
         v.uid, v.parents, v.origin = self.serial, [p.uid for p in parents], origin
+        v.royal = origin in ("hall of fame", "library", "team", "collection", "saved", "bred from your bots") or \
+            any(getattr(p, "royal", False) for p in parents)
         v.gen = 1 + max((p.gen for p in parents), default=-1) if parents else 0
         self.lineage[v.uid] = dict(uid=v.uid, label=v.label, name=v.name, tf=v.tf, parents=list(v.parents),
                                    gen=v.gen, origin=origin, born=self.n, died=None, why="", ret=None, inducted=False)
@@ -925,6 +1065,10 @@ class Tournament:
             if self.recording:
                 self.shadow.append(dict(t, name=v.name, params=dict(v.params), tf=v.tf, uid=v.uid))
         e = v.sim.equity(last)
+        if not self.replaying:
+            if v.live_eq0 is None:
+                v.live_eq0 = prev_eq if prev_eq else v.sim.start
+            v.live_n += 1
         v.eq.append(e)
         v.age += 1
         v.peak = max(v.peak, e)
@@ -933,10 +1077,19 @@ class Tournament:
         if mood and mood != "unknown" and prev_eq:
             v.mood_gain[mood] = v.mood_gain.get(mood, 0.0) + (e / prev_eq - 1)
             v.mood_n[mood] = v.mood_n.get(mood, 0) + 1
-        while v.sim.tbars and v.sim.tbars[0] <= n - self.W:
+        while v.sim.tbars and v.sim.tbars[0] <= n - (v.eq.maxlen - 1):
             v.sim.tbars.popleft()
 
+    def hold_over(self, k):
+        """What just holding the coins (equal weight) returned over the last k decisions, or None."""
+        hc = self.hold_curve
+        return hc[-1] / hc[-1 - k] - 1 if len(hc) > k else None
+
     def _market(self, closes):
+        if not hasattr(self, "hold_curve"):
+            self.hold_curve = deque([1.0], maxlen=self.W * 10 + 2)
+        if all(len(closes[c]) >= 2 and closes[c][-2] for c in self.coins):
+            self.hold_curve.append(self.hold_curve[-1] * sum(closes[c][-1] / closes[c][-2] for c in self.coins) / len(self.coins))
         self.last_px = {c: closes[c][-1] for c in self.coins}
         L = min(len(closes[c]) for c in self.coins)
         self.hold_ret = (sum(closes[c][-1] / closes[c][-1 - self.W] for c in self.coins) / len(self.coins) - 1
@@ -971,21 +1124,40 @@ class Tournament:
     def warmup(self, closes, start=WARM, progress=None, extra=None):
         L = min(len(closes[c]) for c in self.coins)
         for i in range(start, L):
-            self.step({c: closes[c][:i + 1] for c in self.coins}, slice_extra(extra, i + 1))
+            self.step({c: View(closes[c], i + 1) for c in self.coins}, slice_extra(extra, i + 1))
             if progress and (i - start) % 50 == 0:
                 progress(i - start, L - start)
 
     def score(self, v):
-        if len(v.eq) < self.W + 1 or len(v.sim.tbars) < self.min_trades or v.eq[0] <= 0:
+        need = self.min_trades if v.tf < 10 else 1  # slow, long-holding bots trade rarely by design
+        if len(v.eq) < v.eq.maxlen or len(v.sim.tbars) < need or v.eq[0] <= 0:
             return None
         return v.eq[-1] / v.eq[0] - 1
 
     def consistency(self, v):
         """Share of the 4 recent sub-periods in which the variant made money (0..1)."""
-        eq, size = list(v.eq), self.W // 4
-        if len(eq) < self.W + 1 or size < 1:
+        eq = list(v.eq)
+        size = (len(eq) - 1) // 4
+        if len(eq) < v.eq.maxlen or size < 1:
             return 0.0
         return sum(1 for k in range(4) if eq[(k + 1) * size] > eq[k * size]) / 4
+
+    @property
+    def prove_n(self):
+        """Decisions on fresh prices a bot needs before it may be followed as a winner."""
+        return max(10, self.W // 4)
+
+    def sortino(self, v):
+        """Average gain per decision divided by the typical size of its losing decisions (higher = steadier)."""
+        eq = list(v.eq)
+        rets = [eq[i] / eq[i - 1] - 1 for i in range(1, len(eq)) if eq[i - 1] > 0]
+        if len(rets) < 10:
+            return 0.0
+        mean = sum(rets) / len(rets)
+        down = (sum(min(r, 0) ** 2 for r in rets) / len(rets)) ** 0.5
+        if down <= 1e-12:
+            return 5.0 if mean > 0 else 0.0
+        return max(0.0, mean / down * (len(rets) ** 0.5) / 3)
 
     def drawdown(self, v):
         """How far the variant's equity sits below its recent peak (0..1)."""
@@ -1026,22 +1198,27 @@ class Tournament:
                                    edge=None, behind=False)
                 continue
             cons = self.consistency(v)
-            edge = None if self.hold_ret is None else sc - self.hold_ret
+            hold = self.hold_over(len(v.eq) - 1) if hasattr(self, "hold_curve") else self.hold_ret
+            edge = None if hold is None else sc - hold
             behind = bool(o["beat_hold"] and edge is not None and edge <= 0)
             failing = o["fail_drop"] > 0 and self.drawdown(v) * 100 > o["fail_drop"]
             base = edge if (o["beat_hold"] and edge is not None and edge > 0) else sc
+            proving = bool(o.get("prove_live", True)) and (
+                v.live_n < max(10, (v.eq.maxlen - 1) // 4) or (v.eq and v.live_eq0 and v.eq[-1] < v.live_eq0))
             if failing or sc <= 0 or cons < 0.25:
                 status, w = "benched", 0.0
-            elif cons >= 0.5 and not behind:
+            elif cons >= 0.5 and not behind and not proving:
                 status, w = "active", base * cons ** 2
             else:
                 status, w = "slowed", sc * cons ** 2
+            if w > 0 and o.get("risk_adjusted", True):
+                w *= 0.5 + min(self.sortino(v), 5.0) / 2  # steady gains count for more than bumpy ones
             if w > 0 and o["regime_aware"]:
                 fit = self.mood_fit(v)
                 if fit is not None:
                     w *= 1.25 if fit > 0 else 0.8
             info[id(v)] = dict(score=sc, cons=cons, weight=w, stake=0.0, status=status, failing=failing,
-                               edge=edge, behind=behind)
+                               edge=edge, behind=behind, proving=proving and status == "slowed" and not behind)
         ranked = sorted((v for v in self.vars if info[id(v)]["status"] == "active"),
                         key=lambda v: -info[id(v)]["weight"])
         self.active = ranked[:self.max_active]
@@ -1128,14 +1305,15 @@ class Tournament:
         return self._board_rows
 
     def _board(self):
-        blank = dict(score=None, cons=None, stake=0.0, status="warming up", failing=False, edge=None, behind=False)
+        blank = dict(score=None, cons=None, stake=0.0, status="warming up", failing=False, edge=None, behind=False, proving=False)
         order = {"active": 0, "slowed": 1, "standby": 2, "benched": 3, "warming up": 4}
         rows = [(v, self.info.get(id(v), blank)) for v in self.vars]
         rows.sort(key=lambda x: (order[x[1]["status"]], -(x[1]["score"] or 0)))
         return [dict(name=v.name, params=dict(v.params), label=v.label, score=d["score"], cons=d["cons"],
                      stake=d["stake"], status=d["status"], trades=len(v.sim.tbars), strikes=v.strikes, tf=v.tf,
                      failing=d.get("failing", False), driving=d["status"] == "active", v=v, size=v.size_mult,
-                     edge=d.get("edge"), behind=d.get("behind", False), life=self.life(v), origin=v.origin,
+                     edge=d.get("edge"), behind=d.get("behind", False), proving=d.get("proving", False),
+                     life=self.life(v), origin=v.origin,
                      risk=dict(v.risk), traits=dict(v.traits), uid=v.uid, parents=list(v.parents), gen=v.gen)
                 for v, d in rows]
 
@@ -1154,17 +1332,19 @@ class Tournament:
 
     def replay(self, v, closes):
         L = min(len(closes[c]) for c in self.coins)
-        m = min(self.W + 1, L - WARM)
+        m = min(v.eq.maxlen, L - WARM)
         rec, self.recording = self.recording, False  # replayed history is not a new trade
+        self.replaying = True
         try:
             x = self.xfull if self.xfull and all(len((self.xfull.get(c) or {}).get("h", ())) == len(closes[c])
                                                  for c in self.coins) else None
             for j in range(m):
                 i = L - m + j
-                self._run(v, {c: closes[c][:i + 1] for c in self.coins}, self.n - (m - 1 - j),
+                self._run(v, {c: View(closes[c], i + 1) for c in self.coins}, self.n - (m - 1 - j),
                           extra=slice_extra(x, i + 1) if x else {})
         finally:
             self.recording = rec
+            self.replaying = False
 
     def evolve(self, closes):
         for v in self.vars:  # strikes: checks spent benched (slowed counts half, standby none)
@@ -1212,7 +1392,12 @@ class Tournament:
 
     def _spawn(self, closes):
         if self.active:
-            parent = self.rng.choices(self.active, weights=[self.info[id(v)]["weight"] for v in self.active])[0]
+            # fitness sharing: a family's weight is shared among its members, so one lucky family can't take over
+            fam_n = {}
+            for x in self.vars:
+                fam_n[x.name] = fam_n.get(x.name, 0) + 1
+            parent = self.rng.choices(self.active, weights=[self.info[id(v)]["weight"] / fam_n[v.name]
+                                                            for v in self.active])[0]
         else:
             r = self.ranking()
             if not r:
@@ -1246,7 +1431,8 @@ class Tournament:
             self._register(child, [parent, mate], "bred")
             note = f"Bred {child.label} from two winners"
         else:
-            child = self._new(parent.name, self.mutate(parent.name, parent.params), self.mutate_tf(parent.tf),
+            scale = 0.35 if not self.active else 0.15 if len(self.active) >= 3 else 0.25  # bolder when nothing works
+            child = self._new(parent.name, self.mutate(parent.name, parent.params, scale), self.mutate_tf(parent.tf),
                               self.mutate_risk(parent.risk), self.mutate_traits(parent.traits))
             self._register(child, [parent], "tweaked")
             note = f"Spawned {child.label} (tweaked from {parent.label})"
@@ -1288,6 +1474,25 @@ class Tournament:
             if p["fast"] == p["slow"]:
                 p["slow"] += 5
         return fix_params(name, p)
+
+    def breed_pair(self, a, b, closes=None):
+        """A child of two given bots (same strategy family: mixes settings; different families: takes one
+        parent's strategy and mixes the shared habits). Starts as an egg, like every new bot."""
+        pa, pb = (a, b) if self.rng.random() < 0.5 else (b, a)
+        params = self.crossover(pa.name, pa.params, pb.params) if pa.name == pb.name else self.mutate(pa.name, pa.params, 0.1)
+        risk = {k: self.rng.choice((pa.risk[k], pb.risk[k])) for k in RISK_BOUNDS}
+        traits = {k: self.rng.choice((pa.traits, pb.traits))[k] for k in TRAITS
+                  if k in self.rng.choice((pa.traits, pb.traits))}
+        child = self._new(pa.name, params, self.rng.choice((pa.tf, pb.tf)), self.mutate_risk(risk), self.mutate_traits(traits))
+        self._register(child, [pa, pb], "bred from your bots")
+        if closes:
+            self.replay(child, closes)
+        self.vars.append(child)
+        if len(self.vars) > self.cap:
+            self.cap = len(self.vars)
+        self.events.append(f"Bred {child.label} from two of your bots")
+        self._rate()
+        return child
 
     def spawn_random(self, closes=None):
         """A brand new strategy with random settings. Makes room by dropping the weakest duplicate."""
@@ -1356,7 +1561,7 @@ def simulate(closes, sigfn, start_cash, fee, pct, stop=0.0, take=0.0, warm=WARM,
     eq, trades = [start_cash], 0
     high = {}
     for i in range(n):
-        pre = {c: closes[c][:i + 1] for c in coins}
+        pre = {c: View(closes[c], i + 1) for c in coins}
         sigs = sigfn(i, pre, slice_extra(extra, i + 1) if extra else None)
         if i < warm:
             continue
@@ -1413,18 +1618,18 @@ def replay_bot(v, closes, extra, start, start_cash, fee, pct, slip=0.0):
     L = min(len(x) for x in closes.values())
     eq, trades = [start_cash], 0
     for i in range(start, L):
-        pre = {c: closes[c][max(0, i + 1 - 4600):i + 1] for c in coins}
-        ex = {c: {k: d[k][max(0, i + 1 - 4600):i + 1] for k in d} for c, d in extra.items()} if extra else None
+        pre = {c: View(closes[c], i + 1) for c in coins}
+        ex = slice_extra(extra, i + 1)
         trades += len(bot_step(b, pre, i, coins, ex))
         eq.append(b.sim.equity({c: closes[c][i] for c in coins}))
     return eq, trades
 
 
 def slice_extra(extra, i):
-    """The extra data (highs/lows/volumes) cut to the first i bars."""
+    """The extra data (highs/lows/volumes) cut to the first i bars (as views, nothing is copied)."""
     if not extra:
         return None
-    return {c: {k: v[:i] for k, v in d.items()} for c, d in extra.items() if d}
+    return {c: {k: View(v, i) for k, v in d.items()} for c, d in extra.items() if d}
 
 
 def run_backtest(closes, names, settings, start_cash=1000.0, seed=1, extra=None):
@@ -1705,6 +1910,66 @@ BOT_FORMAT_VERSION = 1
 MAX_BOT_FILE = 1024 * 1024  # bytes; a bot file is tiny, anything bigger is not one
 
 
+STRAT_DOCS = {  # plain-English rules for every strategy, for people and other programs reading a bot file
+    "SMA crossover": ("Simple moving averages of the close over `fast` and `slow` bars.",
+                      "Buy when the fast average crosses above the slow one; sell when it crosses below."),
+    "EMA crossover": ("Exponential moving averages over `fast` and `slow` bars.",
+                      "Buy when the fast EMA crosses above the slow EMA by at least `min_gap` %; sell on the opposite cross."),
+    "MACD": ("MACD line = EMA(`fast`) - EMA(`slow`); signal line = EMA(`signal`) of the MACD line.",
+             "Buy when MACD crosses above its signal line; sell when it crosses below."),
+    "Momentum": ("Change in % over the last `n` bars.", "Buy when it is above +`thr` %; sell when below -`thr` %."),
+    "RSI": ("Relative Strength Index over `period` bars (0-100).", "Buy when RSI < `lo`; sell when RSI > `hi`."),
+    "Stochastic": ("Where the close sits in its `n`-bar high-low range of closes (0-100).",
+                   "Buy when it rises back above `lo`; sell when it falls back below `hi`."),
+    "Bollinger bands": ("`n`-bar average +/- `k` standard deviations.", "Buy below the lower band; sell above the upper band."),
+    "Mean reversion": ("% distance of the close from its `n`-bar average.", "Buy when below -`thr` %; sell when above +`thr` %."),
+    "VWAP snap-back": ("Volume-weighted average price over `n` bars (typical price = (high+low+close)/3).",
+                       "Buy when the close is `thr` % below VWAP; sell when `thr` % above."),
+    "Breakout": ("Highest and lowest close of the previous `n` bars.", "Buy above the high; sell below the low."),
+    "Volume breakout": ("Highest high / lowest low of the previous `n` bars, and average volume.",
+                        "Buy above the high when volume >= `vmult` x average; sell below the low."),
+    "ATR channel": ("EMA(`n`) of the close +/- `m` x ATR(`n`) (average true range from highs and lows).",
+                    "Buy above the upper line; sell below the lower line."),
+    "Supertrend": ("Band at (high+low)/2 -/+ `m` x ATR(`n`) that trails the price and flips with the trend.",
+                   "Buy when the trend flips up; sell when it flips down."),
+    "Ichimoku cross": ("Midlines (highest high + lowest low)/2 over `fast` and `slow` bars.",
+                       "Buy when the fast midline crosses above the slow one with the close above it; sell on the opposite cross."),
+    "Rate of change": ("ROC = % change over `n` bars, and its `smooth`-bar average.",
+                       "Buy when ROC crosses above its average while positive; sell when it crosses below while negative."),
+    "MA ribbon": ("EMAs over `fast`, `mid` and `slow` bars.",
+                  "Buy when they line up fast > mid > slow; sell when the fast EMA drops below the mid EMA."),
+    "Trend + dip": ("SMA over `trend` bars and RSI over `period` bars.",
+                    "Buy when the close is above the SMA and RSI < `lo`; sell when RSI > `hi` or the close drops below the SMA."),
+    "Dollar-cost averaging": ("A counter of decisions.", "Buy every `every` decisions; never sells by itself."),
+}
+
+
+def describe_bot(b, bar_minutes=None):
+    """Plain-English rules for one bot-file entry: what it reads, when it buys and sells, its pace, exits and habits."""
+    calc, rule = STRAT_DOCS.get(b["name"], ("", ""))
+    for k, v in b.get("params", {}).items():
+        calc, rule = calc.replace(f"`{k}`", f"{v:g}"), rule.replace(f"`{k}`", f"{v:g}")
+    pace = (f"every {fmt_bar(b.get('tf', 1) * bar_minutes)}" if bar_minutes
+            else f"every {b.get('tf', 1)} bar(s) of your chosen bar length")
+    exits = risk_text(b.get("risk"))
+    habits = traits_text(b.get("traits"))
+    return (f"{b['name']}: {calc} {rule} It decides {pace}, on candles of that length."
+            + (f" Own exits: {exits}." if exits else "") + (f" Habits: {habits}." if habits else "")
+            + " Each buy spends a fixed share of the starting money times its trade size; a sell closes the whole position.")
+
+
+SCHEMA_NOTE = (
+    "CBBF bot file. Each item in `bots` is one trading bot. `name` is the strategy family (see `rules` for what it does), "
+    "`params` its numbers, `tf` its pace in bars (multiply by `lifetime.bar_minutes` for minutes), `risk.sl` / `risk.tp` "
+    "its own stop-loss / take-profit in % (0 = none), `traits` extra habits (trail = trailing stop %, minhold / maxhold = "
+    "decisions, cool = decisions to wait after selling, trend = only buy above that many-bar average, minvol = minimum "
+    "average move % per bar, rsicap = no buying above that RSI, confirm = signals in a row needed, entries = most buys "
+    "per position, exit = 1 sells only through its own exits, moods = bitmask of allowed markets: 1 trending up, "
+    "2 trending down, 4 choppy, 8 quiet), `size` its trade-size multiplier. `stats` and `lifetime` are its results, "
+    "after fees. Signals use bar closes (some families also highs, lows and volume). Results were simulated with fees "
+    "and spread; past results do not predict future ones.")
+
+
 def export_bots(rows, app_version="", note=""):
     """rows: tournament.board() entries to share. Returns plain data (strategy name, settings,
     trade size, and how it was doing) so someone else can load it and see how it behaves on
@@ -1731,8 +1996,13 @@ def export_bots(rows, app_version="", note=""):
         if lf:
             b["lifetime"] = lifetime_record(lf, r.get("bar_minutes"))
         bots.append(b)
+    for b in bots:
+        b["rules"] = describe_bot(b, (b.get("lifetime") or {}).get("bar_minutes"))
     return dict(format=BOT_FORMAT, version=BOT_FORMAT_VERSION, app_version=app_version,
-                exported_at=datetime.now(timezone.utc).isoformat(timespec="seconds"), bots=bots)
+                exported_at=datetime.now(timezone.utc).isoformat(timespec="seconds"), how_to_read=SCHEMA_NOTE,
+                strategies={n: dict(calculation=c, rules=r, settings=list(STRATS[n]["params"]))
+                            for n, (c, r) in STRAT_DOCS.items() if n in {b["name"] for b in bots}},
+                bots=bots)
 
 
 def lifetime_record(lf, bar_minutes=None):
