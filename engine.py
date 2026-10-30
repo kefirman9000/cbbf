@@ -463,6 +463,7 @@ DEFAULT_SETTINGS = {
     "auto_catch": True,          # long-term winners are saved to your Bot Library automatically
     "auto_hof": False,           # ...and also put straight into the Hall of Fame (off: you choose who goes in)
     "animations": "Full",        # Full, Light (slower, lighter) or Off
+    "characters": "Themed dragons",  # or "Classic dragons" (coloured by status)
     "team_locked": True,         # trading with your team: keep exactly those bots (False = they may breed new ones)
     # Orders and costs
     "bot_stops": True,           # Wildcard: the account's safety stop / lock-in-profit follow what the winning bots learned
