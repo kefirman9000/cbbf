@@ -1,147 +1,120 @@
 <p align="center"><img src="docs/banner.png" alt="CBBF Bot Farm" width="100%"></p>
 
-# CBBF — Bot Farm
-
-Hatch a farm of little dragon bots and let nature take its course. They grow up, compete, mate, pass their
-genes to the next generation and slowly evolve into BEASTS. The best ones you keep forever.
+<p align="center"><b>Hatch a farm of little dragons. Let them compete, breed and evolve. Keep the legends.</b></p>
 
 <p align="center"><img src="docs/screenshots/main-farm.png" alt="The farm" width="100%"></p>
 
 ## Getting started
-- **Windows:** download the latest release zip (or Code > Download ZIP), extract the whole folder, double-click **Run CBBF.bat**
+- **Windows:** download the latest release zip, extract the whole folder, double-click **Run CBBF.bat**
 - **Mac / Linux:** `python3 main.py` (Python 3.8 or newer with Tkinter)
 
-New versions show up inside the app as an **Update** button. Nothing installs until you say yes, and
+New versions appear inside the app as an **Update** button. Nothing installs until you say yes, and
 **Tools > Undo last update** always takes you back.
 
 ---
 
 ## From egg to legend
-Every dragon climbs the same ladder, and the farm sorts them into four dens:
+Every dragon climbs the same ladder, and the farm sorts them into four dens, each with its own colour:
 
 | Den | Who lives there |
 |---|---|
 | **Eggs** | Newborns still hatching and learning the ropes |
-| **Rising** | Young dragons that have started to prove themselves |
+| **Rising** | Young dragons starting to prove themselves |
 | **BEASTS** | The dominant ones, winning again and again |
 | **Hall of Fame** | Your hand-picked champions. Only you decide who gets in |
 
-<p align="center"><img src="docs/screenshots/farm-eggs.png" alt="Eggs" width="100%"></p>
-<p align="center"><img src="docs/screenshots/farm-rising.png" alt="Rising" width="100%"></p>
+Eggs crack open when they hatch and new BEASTS let out a roar. Every dragon has **XP, health and power**, and earns
+**badges** along the way (First 10%, Crash survivor, Sharpshooter, Marathon, Dynasty, Twin-proven...).
+A pulse strip above the farm shows births, retirements, the current season and the dragon of the hour.
 
-Each dragon has **XP, health and power**. Health drops when it stumbles and recovers when it does well.
-Power only grows from real, lasting wins, so a dragon with a full power bar has truly earned it. Working
-dragons flap and look around, resting ones curl up and snooze, and the elemental look (fire, ice,
-lightning, space, skeleton) tells you its family at a glance.
+<p align="center"><img src="docs/screenshots/farm-eggs.png" alt="Eggs" width="100%"></p>
 
 ## Breeding
-This is the heart of the farm.
-
-- **Eggs from winners.** The strongest dragons lay eggs: copies of themselves with small mutations.
-- **Crossbreeding.** Two parents produce a child that mixes genes from both. Drag your favourites from the
-  Library or Hall of Fame onto the farm and pair them yourself with **Breed pair**.
-- **Royal eggs.** Children of your hand-picked bloodlines hatch from **gold eggs**, so you can follow your line.
-- **Silver eggs.** Every so often the farm drops in a famous, time-tested (or infamous) breed to see whether it
-  can hold its own against the youngsters.
-- **Colored eggs.** Optional egg colors, so a full nest isn't all the same.
-- **Fresh blood.** Brand-new random dragons keep the gene pool from going stale.
-- **Islands.** The farm can split into separate islands that breed apart and only swap a champion now and then.
-- **Elders and seasons.** Great dragons that leave pass their wisdom to future eggs, and every season has a champion
-  that wakes up when its season returns.
-- **Natural selection.** Dragons that keep failing rest, then retire to make room for the next generation.
-- **Adaptive evolution.** When the farm gets stuck, mutations get bolder; when it's thriving, they get careful.
-
-<p align="center"><img src="docs/screenshots/family-tree.png" alt="Family tree" width="85%"></p>
-
-**Family tree:** see every dragon's ancestry, which bloodlines thrived and which died out.
+- **Eggs from winners**: the strongest dragons lay eggs, copies of themselves with small mutations.
+- **Crossbreeding**: two parents produce a child that mixes both sets of genes. Pair your favourites yourself.
+- **Royal, silver and coloured eggs**: royal eggs carry your bloodlines, silver eggs are famous breeds from history.
+- **Islands**: the farm splits into islands that breed apart and only swap a champion now and then, so the
+  gene pool stays varied.
+- **Elders**: great dragons that leave pass their wisdom on to future eggs.
+- **Seasons**: every season has a champion, and it wakes up again when its season returns.
+- **Mutation memory**: the farm notices which kinds of change make winners, and makes more of them.
+- **Natural selection**: dragons that keep failing rest, then retire to make room.
 
 <p align="center"><img src="docs/screenshots/bloodlines.png" alt="Bloodlines" width="90%"></p>
 
-## What's in a dragon's genes
+## A dragon's genes
 Every gene is inherited, mutated and crossbred, and every dragon carries a different mix:
 
-- **A main instinct.** More than twenty breeds, from patient trend riders to dip pouncers and breakout jumpers.
-- **Positive studies.** Zero to four extra signals that vote *for* acting. Some dragons trust one instinct,
-  others wait until several agree.
-- **Negative studies.** Zero to three signals that vote *against*. A dragon can learn when to hold back.
-- **Exit studies.** Their own reasons to let go.
-- **Never-rules.** Hard "I will never do this" habits, each tested in hindsight: if a never-rule keeps
-  costing the dragon, it fades out of the bloodline. If it keeps saving it, it spreads.
-- **How many votes it needs.** Cautious dragons need many studies to agree; bold ones act on one.
-- **Pace.** From every few seconds to every few hours.
-- **Traits.** Patience, cooldowns, how long to hold, its own safety and target, sizing by confidence, and more.
+- **A main instinct**: more than twenty breeds, from patient trend riders to pouncers and breakout jumpers
+- **Positive studies**: extra signals that vote *for* acting. **Negative studies**: signals that vote *against*
+- **A bigger-picture study** that has to agree first, and an optional **follow-the-leader** study
+- **Never-rules**: things it refuses to do, each one graded in hindsight; useful rules spread, costly ones fade
+- **Pace**, **patience**, **exits** that adapt to calm or wild times, **confidence** that scales how boldly it acts
+- **Memory**: what it's bad at, which seasons suit it, and every lesson from its tests
 
-Each layer is graded on its own, so the farm learns which studies and rules actually help, and the children
-inherit what worked.
+Each layer is graded on its own, and children inherit the evidence.
 
-<p align="center"><img src="docs/screenshots/bot-card.png" alt="A dragon's card and rule stack" width="75%"></p>
+<p align="center"><img src="docs/screenshots/bot-card.png" alt="A dragon's card" width="75%"></p>
 
-Double-click any dragon to see its card: its whole **rule stack**, health and power, family, and history.
-
-## Design your own egg
-Write a dragon from scratch: choose its instinct and numbers, its positive and negative studies, its exits
-and its habits. It hatches as a royal egg, competes like everyone else, and its children carry your design.
-
-<p align="center"><img src="docs/screenshots/designer.png" alt="Design an egg" width="65%"></p>
-
-## Put them to the test
-Send any dragon through a trial on a stretch of history: how it did in every part of it, how it copes with bad luck
-and higher costs, and where it shines or struggles. Then **save the lesson to its memory**, so its children inherit
-it, or teach the whole farm. Champions can be re-tested every night, and the ones losing their edge go **rusty**.
-
-<p align="center"><img src="docs/screenshots/backtest.png" alt="Trial" width="80%"></p>
-
-**See and edit what they learned:** open any dragon's rules, with the evidence behind each one, change what you like,
-and hatch your edit as its child.
+## See and edit what they learned
+Open any dragon's rules with the evidence behind each one, change whatever you like, and hatch your edit as its
+child. Or design an egg from scratch.
 
 <p align="center"><img src="docs/screenshots/edit-rules.png" alt="Edit rules" width="75%"></p>
 
-## Bot Lab
-Raise a fresh farm on one stretch of history, freeze the best dragons, then send them into a later stretch
-they have never seen. Only the ones that still win there **pass**. Run several rounds to tell real talent from luck.
+## Learning from the past
+- **Free roam**: switch it on and the farm goes back in time by itself. It chooses its own stretches of the past
+  and its own pace, lets its dragons test themselves, sends small practice farms through, and saves every lesson.
+  A live screen shows where in the past it is right now, what it has covered, and what it has found.
+- **Training camp**: send a whole farm through days or months of history, several times over, then give the best a
+  final exam on a stretch they never saw. Graduates can join your farm or your Library.
+- **Trials**: put any single dragon through a stretch of history, with a check of every part of it, a bad-luck
+  test and a tougher-conditions test. Save the lesson to its memory, or teach the whole farm.
+- **Bot Lab**: train on one stretch, test on the next.
 
-<p align="center"><img src="docs/screenshots/bot-lab.png" alt="Bot Lab" width="85%"></p>
-
-## Collect them all
-Press **Catch!** on any dragon to keep it in your **Library**.
-
-- Every caught dragon gets a name, like Silent Bison or Turbo Wolf.
-- Rarity from **Common** to **Legendary**, earned by what it has really done. The occasional one is **shiny**.
-- Catch it again as it keeps proving itself and it levels up.
-- Promote favourites to the **Hall of Fame**, build a **team of up to 6**, and run the farm with only them.
-- Right-click anything for quick actions.
-- **Export** the whole farm, a den, or just your picks to a readable file that people, other apps or an AI can
-  understand, and import other people's dragons to see if they survive on your farm.
-
-<p align="center"><img src="docs/screenshots/collection.png" alt="The Library" width="90%"></p>
-<p align="center"><img src="docs/screenshots/farm-hall-of-fame.png" alt="Hall of Fame" width="100%"></p>
-
-## The farm never forgets
-Close the app and come back later: the farm picks up exactly where it left off, with every dragon, egg,
-family line and lesson intact.
+<p align="center"><img src="docs/screenshots/free-roam.png" alt="Free roam" width="90%"></p>
+<p align="center"><img src="docs/screenshots/training.png" alt="Training camp" width="80%"></p>
+<p align="center"><img src="docs/screenshots/backtest.png" alt="A trial" width="80%"></p>
 
 ## Choose what they learn
-A **Learning** page lets you switch each kind of learning on or off: how dragons are judged, how they breed, which
-rules they can grow, and what they remember.
+The **Learning** page switches each kind of learning on or off, grouped into how dragons are judged, how they
+breed, which rules they can grow, what they remember, and free roam.
 
-<p align="center"><img src="docs/screenshots/settings-learning.png" alt="Learning" width="85%"></p>
+<p align="center"><img src="docs/screenshots/settings-learning.png" alt="Learning settings" width="85%"></p>
+
+## Collect them all
+Press **Catch!** on any dragon to keep it in your **Library**, or drag it straight onto the Library or
+Hall of Fame tab.
+
+- Every caught dragon gets a name, a rarity from **Common** to **Legendary**, and the occasional one is **shiny**
+- Champions are re-checked every night; the ones losing their edge turn **rusty**
+- Build a **team of up to 6**, compare two dragons side by side, export the farm or your favourites to a
+  readable file, and import other people's dragons to see if they survive
+- **Undo** is always one click away
+
+<p align="center"><img src="docs/screenshots/collection.png" alt="The Library" width="90%"></p>
+<p align="center"><img src="docs/screenshots/compare.png" alt="Compare" width="70%"></p>
+
+## The farm never forgets
+Close the app and come back later: the farm picks up exactly where it left off. Watch a **farm replay** of how the
+dens grew, and get a **weekly report** of what it learned.
+
+<p align="center"><img src="docs/screenshots/replay.png" alt="Farm replay" width="80%"></p>
 
 ## Make it yours
-- Dragons, simple cards or a plain list
-- Full, light or no animation, so even hundreds of dragons stay smooth
-- Dark and light themes, custom sounds (each one can be switched off), keyboard shortcuts
-- Farm size up to 200, and **+ Add eggs** whenever you want more
+- Dragons, simple cards or a plain list; full, light or no animation; a compact layout
+- Dark and light themes, custom sounds, keyboard shortcuts, a short guided tour
+- Farm presets (Calm, Balanced, Wild), settings profiles, one-click backup and restore
+- Farm size up to 200, learning spread over several processor cores, and it goes quiet when minimised
 
 ## More screens
 <p align="center"><img src="docs/screenshots/chart-split-candles.png" width="100%"></p>
-<p align="center"><img src="docs/screenshots/chart-entries-exits.png" width="100%"></p>
 <p align="center"><img src="docs/screenshots/portfolio.png" width="100%"></p>
 <p align="center"><img src="docs/screenshots/watchlist.png" width="100%"></p>
 <p align="center"><img src="docs/screenshots/main-light.png" width="100%"></p>
 
 ## Your data
-Everything stays on your computer in `~/.cbbf/` (Windows: `C:\Users\<you>\.cbbf`): settings, saved farms,
-Library, Hall of Fame and logs. **File > Open data folder** opens it.
+Everything stays on your computer in `~/.cbbf/` (Windows: `C:\Users\<you>\.cbbf`). **File > Open data folder** opens it.
 
 ---
 
