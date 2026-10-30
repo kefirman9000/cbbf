@@ -157,7 +157,7 @@ SETTING_GROUPS = [
         ("bar_minutes", "How often strategies decide (15 sec is the fastest)", "bar"),
         ("refresh", "Check prices every N seconds (1 or more)", int),
         ("animations", "Animations (Light uses less computer power)", "anim"),
-        ("characters", "Characters: mixed by strategy (dragons, cats, bunnies, owls, turtles) or dragons only", "chars"),
+        ("characters", "Dragons: themed by strategy (fire, ice, lightning, space; resting bots are skeletons) or classic (coloured by status)", "chars"),
     ]),
     ("Alerts", "Get a message on your phone when something happens. Leave blank to turn off.", [
         ("alert_discord", "Discord webhook link (Server settings > Integrations > Webhooks)", str),
@@ -382,7 +382,7 @@ def draw_egg(c, x, y, size, color, progress=0.0, phase=0, tags=()):
 
 
 def draw_dragon(c, x, y, size, color, awake=True, phase=0, mood="plain", fire=False, flash=False, gold=False, tags=(),
-                crown=False):
+                crown=False, pal=None):
     """A small dragon on a Tk canvas, inside a size x size box at (x, y). Awake dragons flap their wings
     and look around; sleeping ones curl up with their eyes shut. fire = a little puff of flame."""
     k = size / 26.0
@@ -392,15 +392,19 @@ def draw_dragon(c, x, y, size, color, awake=True, phase=0, mood="plain", fire=Fa
 
     def P(*pts):
         return [v * k + (x if i % 2 == 0 else y) for i, v in enumerate(pts)]
-    belly = "#fde68a" if gold else "#f5f5f4"
-    edge = "white" if flash else ""
+    pal = pal or {}
+    belly = "#fde68a" if gold else pal.get("belly", "#f5f5f4")
+    edge = "white" if flash else pal.get("outline", "")
+    wing = pal.get("wing", color)
+    horn = pal.get("horn", belly)
+    eye = pal.get("eye", "#111827")
     flap = (math.sin(phase / 1.6) * 5) if awake else 0
     # tail
     mk('line', *P(6, 20, 1, 22, -1, 17, 1, 14), fill=color, width=max(1, 2 * k), smooth=True)
     mk('polygon', *P(1, 14, -2, 12, 2, 11), fill=color, outline="")
     # far wing (flaps)
     if awake:
-        mk('polygon', *P(9, 12, 3, 2 - flap, 8, 5 - flap / 2, 14, 10), fill=color, outline=edge, stipple="gray75")
+        mk('polygon', *P(9, 12, 3, 2 - flap, 8, 5 - flap / 2, 14, 10), fill=wing, outline=edge, stipple="gray75")
     else:
         mk('polygon', *P(8, 13, 6, 9, 14, 11), fill=color, outline="")
     # body and belly
@@ -415,19 +419,19 @@ def draw_dragon(c, x, y, size, color, awake=True, phase=0, mood="plain", fire=Fa
     mk('polygon', *P(15, 14, 18, 8 + hy, 21, 9 + hy, 19, 16), fill=color, outline="")
     mk('oval', *P(16 + look, 3 + hy, 26 + look, 11 + hy), fill=color, outline=edge)
     # horns
-    mk('line', *P(18 + look, 4 + hy, 17 + look, 0 + hy), fill=belly, width=max(1, 1.5 * k))
-    mk('line', *P(21 + look, 3 + hy, 21 + look, -1 + hy), fill=belly, width=max(1, 1.5 * k))
+    mk('line', *P(18 + look, 4 + hy, 17 + look, 0 + hy), fill=horn, width=max(1, 1.5 * k))
+    mk('line', *P(21 + look, 3 + hy, 21 + look, -1 + hy), fill=horn, width=max(1, 1.5 * k))
     # eye
     if awake:
         mk('oval', *P(21 + look, 5 + hy, 23.5 + look, 7.5 + hy), fill="white", outline="")
-        mk('oval', *P(22 + look, 5.6 + hy, 23.3 + look, 7 + hy), fill="#111827", outline="")
+        mk('oval', *P(22 + look, 5.6 + hy, 23.3 + look, 7 + hy), fill=eye, outline="")
     else:
         mk('line', *P(20.5, 6.5 + hy, 23.5, 6.5 + hy), fill="#111827", width=max(1, 1.2 * k))
     if mood == "happy" and awake:
         mk('line', *P(23 + look, 9 + hy, 25 + look, 8.5 + hy), fill="#111827", width=1)
     # near wing
     if awake:
-        mk('polygon', *P(10, 13, 6, 3 + flap, 12, 6 + flap / 2, 16, 12), fill=color, outline="#111827", width=1)
+        mk('polygon', *P(10, 13, 6, 3 + flap, 12, 6 + flap / 2, 16, 12), fill=wing, outline=pal.get("outline", "#111827"), width=1)
     if crown:
         mk('polygon', *P(17 + look, 2 + hy, 17.5 + look, -3 + hy, 19.5 + look, -0.5 + hy, 21.5 + look, -4 + hy,
                          23.5 + look, -0.5 + hy, 25 + look, -3 + hy, 25 + look, 2 + hy), fill="#facc15", outline="#a16207")
@@ -438,165 +442,76 @@ def draw_dragon(c, x, y, size, color, awake=True, phase=0, mood="plain", fire=Fa
 
 
 
-CREATURES = {  # which character each strategy family is drawn as
-    "SMA crossover": "dragon", "EMA crossover": "dragon", "MACD": "dragon", "Momentum": "dragon",
-    "RSI": "cat", "Stochastic": "cat", "Bollinger bands": "cat", "Mean reversion": "cat", "VWAP snap-back": "cat",
-    "Breakout": "bunny", "Volume breakout": "bunny", "ATR channel": "bunny",
-    "Trend + dip": "owl", "Dollar-cost averaging": "turtle",
+THEMES = {  # themed dragons: palette per type
+    "fire": dict(body="#dc2626", belly="#fbbf24", horn="#111827", wing="#7f1d1d", eye="#fde047"),
+    "ice": dict(body="#7dd3fc", belly="#f0f9ff", horn="#e0f2fe", wing="#0ea5e9", eye="#0c4a6e"),
+    "lightning": dict(body="#facc15", belly="#fef9c3", horn="#1e3a8a", wing="#2563eb", eye="#1e3a8a"),
+    "space": dict(body="#3730a3", belly="#a78bfa", horn="#e9d5ff", wing="#1e1b4b", eye="#f0abfc"),
+    "skeleton": dict(body="#1f2937", belly="#1f2937", horn="#e7e5e4", wing="#374151", eye="#4ade80", outline="#e7e5e4"),
 }
-CREATURE_NAMES = {"dragon": "Dragon (trend follower)", "cat": "Cat (pounces on dips)", "bunny": "Bunny (jumps on breakouts)",
-                  "owl": "Owl (waits for dips in an uptrend)", "turtle": "Turtle (slow and steady)"}
-CHARACTER_MODE = {"mode": "Mixed"}  # "Mixed" (by strategy) or "Dragons only"; set from the settings
+FAMILY_THEME = {  # strategy family -> dragon type
+    "SMA crossover": "fire", "EMA crossover": "fire", "MACD": "fire", "Momentum": "fire",
+    "RSI": "ice", "Stochastic": "ice", "Bollinger bands": "ice", "Mean reversion": "ice", "VWAP snap-back": "ice",
+    "Breakout": "lightning", "Volume breakout": "lightning", "ATR channel": "lightning",
+    "Trend + dip": "space", "Dollar-cost averaging": "space",
+}
+THEME_NAMES = {"fire": "Fire dragon (trend follower)", "ice": "Ice dragon (buys dips)",
+               "lightning": "Lightning dragon (breakouts)", "space": "Space dragon (dips in an uptrend)",
+               "skeleton": "Skeleton dragon (resting: not winning right now)"}
+CHARACTER_MODE = {"mode": "Themed dragons"}  # or "Classic dragons" (coloured by status)
 
 
-def draw_creature(c, strat, x, y, size, color, **kw):
-    """Draws the character for a strategy family (or a dragon in 'Dragons only' mode)."""
-    kind = "dragon" if CHARACTER_MODE["mode"] != "Mixed" else CREATURES.get(strat, "dragon")
-    {"cat": draw_cat, "bunny": draw_bunny, "owl": draw_owl, "turtle": draw_turtle}.get(kind, draw_dragon)(
-        c, x, y, size, color, **kw)
+def theme_for(strat, status=None):
+    if CHARACTER_MODE["mode"] != "Themed dragons":
+        return None
+    if status == "benched":
+        return "skeleton"
+    return FAMILY_THEME.get(strat, "fire")
 
 
-def _kit(c, x, y, size, tags):
+def draw_creature(c, strat, x, y, size, color, status=None, **kw):
+    """The bot's character. Themed mode: the dragon type comes from the strategy family (resting bots are
+    skeletons) and its status colour glows on the ground under it. Classic mode: a dragon in the status colour."""
+    th = theme_for(strat, status)
+    tags = kw.get("tags", ())
     k = size / 26.0
+    if th is None:
+        return draw_dragon(c, x, y, size, color, **kw)
+    if color:
+        c.create_oval(x + 1 * k, y + 24 * k, x + 24 * k, y + 29 * k, fill=color, outline="", stipple="gray50", tags=tags)
+    pal = THEMES[th]
+    awake, phase = kw.get("awake", True), kw.get("phase", 0)
+    draw_dragon(c, x, y, size, pal["body"], pal=pal, **kw)
 
     def P(*pts):
         return [v * k + (x if i % 2 == 0 else y) for i, v in enumerate(pts)]
-
-    def mk(kind, *a, **kw):
-        return getattr(c, "create_" + kind)(*a, tags=tags, **kw)
-    return k, P, mk
-
-
-def _eyes(mk, P, k, awake, ex, ey, gap, look=0):
-    if awake:
-        for dx in (0, gap):
-            mk("oval", *P(ex + dx + look - 1.6, ey - 1.6, ex + dx + look + 1.6, ey + 1.6), fill="#111827", outline="")
-            mk("oval", *P(ex + dx + look - 0.6, ey - 1.2, ex + dx + look + 0.2, ey - 0.4), fill="white", outline="")
-    else:
-        for dx in (0, gap):
-            mk("arc", *P(ex + dx - 2, ey - 2, ex + dx + 2, ey + 2), start=180, extent=180, style="arc",
-               outline="#111827", width=max(1, 1.2 * k))
-
-
-def _extras(mk, P, k, crown, fire, flash, phase, hx, hy):
-    if crown:
-        mk("polygon", *P(hx - 4, hy, hx - 3.5, hy - 5, hx - 1.5, hy - 2.5, hx, hy - 6, hx + 1.5, hy - 2.5, hx + 3.5, hy - 5,
-                         hx + 4, hy), fill="#facc15", outline="#a16207")
-    if fire:  # non-dragons get sparkles instead of fire
-        f = phase % 4
-        for sx, sy in ((hx + 8 + f, hy + 2), (hx + 6 - f, hy - 4), (hx + 11, hy - 1 - f)):
-            mk("text", *P(sx, sy), text="✦", fill="#fde047", font=("", max(6, int(6 * k)), "bold"))
-
-
-def draw_cat(c, x, y, size, color, awake=True, phase=0, mood="plain", fire=False, flash=False, gold=False, tags=(),
-             crown=False):
-    """A round little cat. Awake: tail swishes and ears twitch. Asleep: curled up."""
-    k, P, mk = _kit(c, x, y, size, tags)
-    edge = "white" if flash else ""
-    belly = "#fde68a" if gold else "#f5f5f4"
-    sw = math.sin(phase / 1.5) * 4 if awake else 0
-    if awake:
-        mk("line", *P(5, 20, 0, 16 + sw, 2, 9 + sw), fill=color, width=max(1, 2.5 * k), smooth=True)
-        mk("oval", *P(4, 12, 22, 26), fill=color, outline=edge)
-        mk("oval", *P(9, 17, 17, 25), fill=belly, outline="")
-        tw = 1 if (phase % 9) == 0 else 0
-        mk("polygon", *P(7, 6, 8 - tw, -1, 12, 4), fill=color, outline="")
-        mk("polygon", *P(15, 4, 19 + tw, -1, 20, 6), fill=color, outline="")
-        mk("oval", *P(6, 2, 21, 15), fill=color, outline=edge)
-        _eyes(mk, P, k, True, 10.5, 8, 6, math.sin(phase / 5.0) * 0.8)
-        mk("polygon", *P(13, 10.5, 14.5, 10.5, 13.75, 11.5), fill="#f472b6", outline="")
-        if mood == "happy":
-            mk("arc", *P(11, 10, 16.5, 13.5), start=200, extent=140, style="arc", outline="#111827", width=1)
-        for s in (-1, 1):
-            mk("line", *P(13.75 + s * 2, 11, 13.75 + s * 7, 10 + s * 0.3), fill="#f5f5f4", width=1)
-        _extras(mk, P, k, crown, fire, flash, phase, 13.5, 2)
-    else:
-        mk("oval", *P(2, 12, 24, 26), fill=color, outline="")
-        mk("arc", *P(0, 13, 24, 27), start=200, extent=120, style="arc", outline=color, width=max(1, 3 * k))
-        mk("polygon", *P(14, 13, 15, 8, 18, 12), fill=color, outline="")
-        mk("polygon", *P(19, 12, 22, 8, 23, 14), fill=color, outline="")
-        _eyes(mk, P, k, False, 16, 17, 4)
-        _extras(mk, P, k, crown, False, flash, phase, 18, 9)
-
-
-def draw_bunny(c, x, y, size, color, awake=True, phase=0, mood="plain", fire=False, flash=False, gold=False, tags=(),
-               crown=False):
-    """A bouncy bunny. Awake: hops (the whole bunny bobs higher) and ears wiggle."""
-    k, P, mk = _kit(c, x, y, size, tags)
-    edge = "white" if flash else ""
-    belly = "#fde68a" if gold else "#f5f5f4"
-    hop = -abs(math.sin(phase / 1.8)) * 3 if awake else 2
-    ear = math.sin(phase / 2.0) * 1.5 if awake else 3
-
-    def Q(*pts):
-        return P(*[v + (hop if i % 2 else 0) for i, v in enumerate(pts)])
-    mk("oval", *Q(3, 13, 21, 26), fill=color, outline=edge)
-    mk("oval", *Q(1, 17, 6, 22), fill=belly, outline="")  # tail
-    mk("oval", *Q(9, 17, 17, 25), fill=belly, outline="")
-    mk("oval", *Q(9 - ear, -4 + abs(ear), 13 - ear, 9), fill=color, outline="")
-    mk("oval", *Q(15 + ear, -4 + abs(ear), 19 + ear, 9), fill=color, outline="")
-    mk("oval", *Q(10, -2 + abs(ear), 12, 7), fill="#fbcfe8", outline="")
-    mk("oval", *Q(16, -2 + abs(ear), 18, 7), fill="#fbcfe8", outline="")
-    mk("oval", *Q(7, 4, 22, 17), fill=color, outline=edge)
-    if awake:
-        mk("oval", *Q(10.5, 8, 13.5, 11), fill="#111827", outline="")
-        mk("oval", *Q(16, 8, 19, 11), fill="#111827", outline="")
-        mk("oval", *Q(14, 12, 15.5, 13), fill="#f472b6", outline="")
-        if mood == "happy":
-            mk("arc", *Q(12, 11.5, 17.5, 15), start=200, extent=140, style="arc", outline="#111827", width=1)
-    else:
-        for ex in (12, 17.5):
-            mk("arc", *Q(ex - 2, 8, ex + 2, 12), start=180, extent=180, style="arc", outline="#111827", width=1)
-    _extras(mk, P, k, crown, fire, flash, phase, 14.5, 3 + hop)
-
-
-def draw_owl(c, x, y, size, color, awake=True, phase=0, mood="plain", fire=False, flash=False, gold=False, tags=(),
-             crown=False):
-    """A wise owl. Awake: big eyes and slow blinks, wings flutter a little."""
-    k, P, mk = _kit(c, x, y, size, tags)
-    edge = "white" if flash else ""
-    belly = "#fde68a" if gold else "#f5f5f4"
-    fl = math.sin(phase / 2.0) * 2 if awake else 0
-    mk("polygon", *P(5, 6, 7, 0, 10, 5), fill=color, outline="")
-    mk("polygon", *P(16, 5, 19, 0, 21, 6), fill=color, outline="")
-    mk("oval", *P(4, 3, 22, 26), fill=color, outline=edge)
-    mk("oval", *P(8, 13, 18, 25), fill=belly, outline="")
-    for i in range(3):
-        mk("arc", *P(10, 15 + i * 3, 16, 18 + i * 3), start=200, extent=140, style="arc", outline=color, width=1)
-    mk("polygon", *P(4, 11, 1 - fl, 18, 5, 21), fill=color, outline="")
-    mk("polygon", *P(22, 11, 25 + fl, 18, 21, 21), fill=color, outline="")
-    blink = awake and phase % 17 == 0
-    for ex in (9.5, 16.5):
-        mk("oval", *P(ex - 3.5, 5.5, ex + 3.5, 12.5), fill="#fef3c7", outline="")
-        if awake and not blink:
-            mk("oval", *P(ex - 1.6, 7.4, ex + 1.6, 10.6), fill="#111827", outline="")
-        else:
-            mk("line", *P(ex - 2.5, 9, ex + 2.5, 9), fill="#111827", width=max(1, 1.2 * k))
-    mk("polygon", *P(12, 11, 14, 11, 13, 14), fill="#f59e0b", outline="")
-    mk("line", *P(10, 26, 10, 27.5), fill="#f59e0b", width=max(1, 1.5 * k))
-    mk("line", *P(16, 26, 16, 27.5), fill="#f59e0b", width=max(1, 1.5 * k))
-    _extras(mk, P, k, crown, fire, flash, phase, 13, 2)
-
-
-def draw_turtle(c, x, y, size, color, awake=True, phase=0, mood="plain", fire=False, flash=False, gold=False, tags=(),
-                crown=False):
-    """A steady turtle. Awake: head pokes out and little legs paddle. Asleep: tucked into its shell."""
-    k, P, mk = _kit(c, x, y, size, tags)
-    edge = "white" if flash else ""
-    shell = "#fde68a" if gold else color
-    step = math.sin(phase / 1.5) * 1.2 if awake else 0
-    for lx, d in ((6, step), (17, -step)):
-        mk("oval", *P(lx + d, 20, lx + 4 + d, 25), fill="#86efac", outline="")
-    if awake:
-        mk("oval", *P(19, 11, 27, 18), fill="#86efac", outline="")
-        mk("oval", *P(23, 13, 25, 15), fill="#111827", outline="")
-        if mood == "happy":
-            mk("arc", *P(22, 14, 26.5, 17), start=200, extent=140, style="arc", outline="#111827", width=1)
-    mk("arc", *P(2, 8, 24, 30), start=0, extent=180, style="pieslice", fill=shell, outline=edge or "#14532d")
-    for px_, py_ in ((8, 13), (13, 11), (18, 13)):
-        mk("oval", *P(px_ - 2.2, py_ - 1.8, px_ + 2.2, py_ + 1.8), fill="", outline="#14532d")
-    mk("line", *P(2, 19, 24, 19), fill="#14532d", width=1)
-    _extras(mk, P, k, crown, fire, flash, phase, 13, 7)
+    if th == "fire":  # devil tail tip and rising embers
+        c.create_polygon(*P(-3, 12, 0, 15, 2, 11), fill="#111827", outline="", tags=tags)
+        if awake:
+            for n in range(3):
+                t = (phase + n * 4) % 12
+                c.create_oval(*P(6 + n * 6, 10 - t, 7.5 + n * 6, 11.5 - t), fill="#f97316" if t < 8 else "#fde047",
+                              outline="", tags=tags)
+    elif th == "ice":  # drifting snowflakes
+        for n in range(2 if awake else 1):
+            t = (phase + n * 7) % 14
+            c.create_text(*P(3 + n * 15, -2 + t), text="\u2744", fill="#e0f2fe", font=("", max(6, int(6 * k))), tags=tags)
+    elif th == "lightning":  # a crackle of lightning now and then
+        if awake and phase % 6 < 2:
+            c.create_line(*P(4, -4, 1, 2, 5, 2, 2, 8), fill="#fde047", width=max(1, 1.5 * k), tags=tags)
+        if awake and phase % 6 == 3:
+            c.create_line(*P(27, -2, 24, 3, 28, 3, 25, 9), fill="#93c5fd", width=max(1, 1.5 * k), tags=tags)
+    elif th == "space":  # twinkling stars and a tiny orbiting moon
+        for n, (sx, sy) in enumerate(((2, 2), (25, 18), (3, 24))):
+            if (phase + n * 3) % 8 < 5:
+                c.create_text(*P(sx, sy), text="\u2726", fill="#f0abfc", font=("", max(5, int(5 * k))), tags=tags)
+        if awake:
+            a = phase / 4.0
+            c.create_oval(*P(13 + 13 * math.cos(a) - 1.5, 15 + 5 * math.sin(a) - 1.5,
+                             13 + 13 * math.cos(a) + 1.5, 15 + 5 * math.sin(a) + 1.5), fill="#e9d5ff", outline="", tags=tags)
+    elif th == "skeleton":  # ribs
+        for n in range(3):
+            c.create_line(*P(10, 16 + n * 2.5, 18, 16 + n * 2.5), fill="#e7e5e4", width=1, tags=tags)
 
 
 class Tip:
@@ -658,7 +573,7 @@ class App:
         apply_theme(root, bool(self.cfg.get("dark", True)))
         self.dark_var = tk.BooleanVar(value=DARK)
         self.settings = E.merge_settings(self.cfg.get("settings"))
-        CHARACTER_MODE["mode"] = self.settings.get("characters", "Mixed")
+        CHARACTER_MODE["mode"] = self.settings.get("characters", "Themed dragons")
         if not self.cfg.get("live_feel_v1"):  # one-time move to the faster defaults (1-minute bars, 2-second prices)
             self.settings["bar_minutes"], self.settings["refresh"] = 1, 2
             self.cfg["settings"], self.cfg["live_feel_v1"] = self.settings, True
@@ -920,6 +835,10 @@ class App:
         self.btn = ttk.Button(left, text="Start the bot", style="Accent.TButton", command=self.toggle)
         self.btn.pack(fill="x", pady=(2, 4))
         ttk.Button(left, text="Sell everything now", style="Plain.TButton", command=self.sell_all).pack(fill="x")
+        trow = tk.Frame(left, bg=BG)
+        trow.pack(fill="x", pady=(4, 0))
+        ttk.Button(trow, text="Buy...", style="Accent.TButton", command=lambda: self.trade_dialog("buy")).pack(side="left", expand=True, fill="x")
+        ttk.Button(trow, text="Sell...", style="Plain.TButton", command=lambda: self.trade_dialog("sell")).pack(side="left", expand=True, fill="x", padx=(4, 0))
         tk.Label(left, text=f"v{self.version}", bg=BG, fg=MUTED, font=("", 8)).pack(anchor="w", pady=(6, 0))
 
         # --- right side: stat tiles, chart, tabs
@@ -964,15 +883,17 @@ class App:
         self.split = split
         nb = self.nb = ttk.Notebook(nbf)
         nb.pack(fill="both", expand=True, pady=(8, 0))
-        t0, t1, t2, t3, t4, t5 = (ttk.Frame(nb) for _ in range(6))
+        t0, t1, t2, t3, t4, t5, t6 = (ttk.Frame(nb) for _ in range(7))
         nb.add(t0, text="  \u25c6 Bot Farm  ")
         nb.add(t1, text="  Portfolio  ")
+        nb.add(t6, text="  Watchlist  ")
         nb.add(t4, text="  Live prices  ")
         nb.add(t5, text="  Trades  ")
         nb.add(t2, text="  Strategy scoreboard  ")
         nb.add(t3, text="  What the bot did  ")
         self.build_grid_tab(t0)
         self.build_portfolio(t1)
+        self.build_watchlist(t6)
         tk.Label(t2, bg=CARD, fg=MUTED, justify="left", anchor="w", padx=8, pady=4, wraplength=700,
                  text="The bot tests every strategy with pretend trades. Winning = copied with bigger trades. "
                       "Shaky = copied slowly with small trades. Stopped = ignored.").pack(fill="x", side="top")
@@ -1013,7 +934,7 @@ class App:
                                     (230, 70, 80, 70, 65, 70, 55, 170, 55),
                                     ("Strategy", "Recent gain", "vs holding", "Wins lately", "Win rate", "Lifetime",
                                      "Size", "What the bot does", "Trades"))
-        self.board.bind("<Double-1>", lambda e: self.bot_detail())
+        self.board.bind("<Double-1>", lambda e: self.bot_detail(quiet=True) if self.on_row(self.board, e) else None)
         for btn in ("<Button-3>", "<Button-2>"):
             self.board.bind(btn, lambda e: (lambda iid: self.bot_menu(e, next((v for v in self.tourn.vars if str(id(v)) == iid), None))
                                             if iid and self.tourn else None)(self.board.identify_row(e.y)))
@@ -1628,7 +1549,7 @@ class App:
         bp.pack(side="left")
         Tip(bp, "Ticks the busiest coins that are actually moving today (stablecoins skipped).")
         ttk.Button(b, text="Close", command=w.destroy).pack(side="right")
-        t.bind("<Double-1>", lambda e: add_sel())
+        t.bind("<Double-1>", lambda e: add_sel() if t.identify_region(e.x, e.y) in ("cell", "tree") else None)
 
     def ui_running(self, on):
         self.root.after(50, self.grid_refresh)
@@ -2849,6 +2770,8 @@ class App:
             self.show_backtest(*data)
         elif kind == "call":  # run a small UI update that a background thread asked for
             data()
+        elif kind == "watch":
+            self.on_watch(*data)
         elif kind == "net":
             self.on_net(*data)
         elif kind == "vols":
@@ -3731,7 +3654,8 @@ class App:
                                                 (80, 140, 190, 140, 70, 75, 65, 55, 110),
                                                 ("Section", "Name", "Strategy", "Status", "Recent", "vs holding", "Win rate",
                                                  "Trades", "Saved"))
-                self.grid_list.bind("<Double-1>", lambda e: self.bot_detail(self._list_variant()))
+                self.grid_list.bind("<Double-1>", lambda e: self.bot_detail(self._list_variant(), quiet=True)
+                                    if self.on_row(self.grid_list, e) else None)
                 self.grid_list.bind("<<TreeviewSelect>>", lambda e: self._list_select())
                 for btn in ("<Button-3>", "<Button-2>"):
                     self.grid_list.bind(btn, lambda e: (self.grid_list.selection_set(self.grid_list.identify_row(e.y))
@@ -4033,10 +3957,10 @@ class App:
             bob = 2 * math.sin(ph / 2.4) if working else 0
             if t == "beast":
                 fire = working and (just or ph % 30 < 4)
-                draw_creature(c, strat, x0 + 12, y0 + 22 + bob, 64 if big else 50, "#dc2626" if awake else "#6b7280", awake=working,
+                draw_creature(c, strat, x0 + 12, y0 + 22 + bob, 64 if big else 50, "#dc2626" if awake else "#6b7280", status=st, awake=working,
                             phase=ph, mood="happy", fire=fire, flash=just and ph % 2 == 0, crown=True, tags="anim")
             else:
-                draw_creature(c, strat, x0 + 14, y0 + 22 + bob, 50, col if awake else "#6b7280", awake=working, phase=ph,
+                draw_creature(c, strat, x0 + 14, y0 + 22 + bob, 50, col if awake else "#6b7280", status=st, awake=working, phase=ph,
                             mood="happy" if st == "active" else "plain", fire=just and v.log[-1][2] == "buy",
                             flash=just and ph % 2 == 0, tags="anim")
             if not working:
@@ -4078,6 +4002,227 @@ class App:
                 self.board.selection_set(iid)
         self.grid_refresh()
         self.draw_chart()
+
+    # ---------------- watchlist ----------------
+    def build_watchlist(self, parent):
+        bar = tk.Frame(parent, bg=CARD)
+        bar.pack(fill="x", padx=6, pady=6)
+        self.watch_entry = tk.StringVar()
+        e = ttk.Entry(bar, textvariable=self.watch_entry, width=10)
+        e.pack(side="left")
+        e.bind("<Return>", lambda ev: self.watch_add())
+        ttk.Button(bar, text="Add", style="Accent.TButton", command=self.watch_add).pack(side="left", padx=(4, 0))
+        ttk.Button(bar, text="Browse coins...", style="Plain.TButton", command=self.open_coin_browser).pack(side="left", padx=4)
+        for txt, cmd, tip in (("Buy...", lambda: self.trade_dialog("buy", self._watch_sel()), "Buy the selected coin by hand."),
+                              ("Sell...", lambda: self.trade_dialog("sell", self._watch_sel()), "Sell the selected coin by hand."),
+                              ("Price alert...", self.watch_alert, "Get notified when the selected coin goes above or below a price."),
+                              ("Let the bots trade it", self.watch_to_bots, "Ticks the coin in COINS so the bots trade it next session."),
+                              ("Remove", self.watch_remove, "Take the selected coins off the watchlist.")):
+            b = ttk.Button(bar, text=txt, style="Plain.TButton", command=cmd)
+            b.pack(side="left", padx=(6 if txt == "Buy..." else 2, 0))
+            Tip(b, tip)
+        self.watch_note = tk.Label(bar, text="", bg=CARD, fg=MUTED, font=("", 8))
+        self.watch_note.pack(side="right")
+        self.watch_tree = self.make_tree(parent, ("coin", "price", "chg", "d24", "vol", "own", "alert", "bots"),
+                                         (70, 120, 110, 90, 130, 120, 150, 90),
+                                         ("Coin", "Price", "Since added", "24h", "24h volume ($)", "You own", "Alert", "Bots trade it"))
+        self.watch_tree.configure(selectmode="extended")
+        self.watch_tree.bind("<Double-1>", lambda ev: self.show_on_chart(self._watch_sel())
+                             if self.on_row(self.watch_tree, ev) and self._watch_sel() else None)
+        for btn in ("<Button-3>", "<Button-2>"):
+            self.watch_tree.bind(btn, self._watch_menu)
+        self.watch_stats = {}
+        self.watch_base = dict(self.cfg.get("watch_base") or {})
+        self.refresh_watchlist()
+        self.root.after(1500, self.start_watch_feed)
+
+    def watchlist(self):
+        w = self.cfg.get("watchlist")
+        if not isinstance(w, list):
+            w = self.cfg["watchlist"] = ["BTC", "ETH", "SOL"]
+        return [c for c in w if E.valid_coin(c)]
+
+    def _watch_sel(self):
+        sel = self.watch_tree.selection() if hasattr(self, "watch_tree") else ()
+        return sel[0] if sel else None
+
+    def watch_add(self, coin=None):
+        c = (coin or self.watch_entry.get()).strip().upper()
+        if not E.valid_coin(c):
+            return messagebox.showinfo("Watchlist", "Type a coin's ticker, like BTC or SOL (or use Browse coins).")
+        w = self.watchlist()
+        if c not in w:
+            w.append(c)
+            self.cfg["watchlist"] = w
+            E.save_json(CONFIG_PATH, self.cfg)
+            self.write(f"Watching {c}.")
+        self.watch_entry.set("")
+        self.refresh_watchlist()
+
+    def watch_remove(self):
+        sel = list(self.watch_tree.selection())
+        if not sel:
+            return messagebox.showinfo("Watchlist", "Select coins on the watchlist first.")
+        self.cfg["watchlist"] = [c for c in self.watchlist() if c not in sel]
+        alerts = self.cfg.get("watch_alerts") or {}
+        for c in sel:
+            alerts.pop(c, None)
+        self.cfg["watch_alerts"] = alerts
+        E.save_json(CONFIG_PATH, self.cfg)
+        self.refresh_watchlist()
+
+    def watch_to_bots(self):
+        sel = list(self.watch_tree.selection())
+        if not sel:
+            return messagebox.showinfo("Watchlist", "Select a coin first.")
+        self.add_coins(sel)
+        self.write(f"Ticked {', '.join(sel)} for the bots." + (" They join when you start a new session." if self.session else ""))
+        self.refresh_watchlist()
+
+    def watch_alert(self):
+        c = self._watch_sel()
+        if not c:
+            return messagebox.showinfo("Price alert", "Select a coin on the watchlist first.")
+        px = self.last.get(c)
+        cur = (self.cfg.get("watch_alerts") or {}).get(c, {})
+        above = simpledialog.askstring("Price alert", f"{c} is at {fmt_px(px)}.\n\nAlert me when it goes ABOVE this price "
+                                                      "(leave empty for none):", initialvalue=str(cur.get("above", "")))
+        if above is None:
+            return
+        below = simpledialog.askstring("Price alert", f"Alert me when {c} goes BELOW this price (leave empty for none):",
+                                       initialvalue=str(cur.get("below", "")))
+        if below is None:
+            return
+        try:
+            a = {k: float(v.replace(",", "").replace("$", "")) for k, v in (("above", above), ("below", below)) if v.strip()}
+        except ValueError:
+            return messagebox.showerror("Price alert", "Type plain numbers, like 70000.")
+        alerts = self.cfg.get("watch_alerts") or {}
+        if a:
+            alerts[c] = a
+        else:
+            alerts.pop(c, None)
+        self.cfg["watch_alerts"] = alerts
+        E.save_json(CONFIG_PATH, self.cfg)
+        self.refresh_watchlist()
+
+    def _watch_menu(self, ev):
+        iid = self.watch_tree.identify_row(ev.y)
+        if not iid:
+            return
+        self.watch_tree.selection_set(iid)
+        m = self._menu()
+        m.add_command(label=iid, state="disabled")
+        m.add_separator()
+        m.add_command(label="Show on chart", command=lambda: self.show_on_chart(iid))
+        m.add_command(label="Buy...", command=lambda: self.trade_dialog("buy", iid))
+        m.add_command(label="Sell...", command=lambda: self.trade_dialog("sell", iid))
+        m.add_command(label="Price alert...", command=self.watch_alert)
+        m.add_command(label="Let the bots trade it", command=self.watch_to_bots)
+        m.add_separator()
+        m.add_command(label="Remove from watchlist", command=self.watch_remove)
+        try:
+            m.tk_popup(ev.x_root, ev.y_root)
+        finally:
+            m.grab_release()
+
+    def start_watch_feed(self):
+        """A light background price check for the watchlist and anything you own, so prices (and your balances)
+        stay live even while the bot is stopped. One request for all coins every few seconds."""
+        if getattr(self, "_watch_thread", None) and self._watch_thread.is_alive():
+            return
+        self.sync_thread_values()
+
+        def loop():
+            last_stats = 0.0
+            while True:
+                try:
+                    # plain values only: Tk must never be touched from this thread
+                    coins = list(dict.fromkeys(list(self._watch_coins) + [c for c, q in list(self.pos.items()) if q > 0]))
+                    if self.running:  # the main feed already covers the session coins
+                        coins = [c for c in coins if c not in self.session_coins]
+                    prices = E.spot_many(coins, self._quote_now) if coins else {}
+                    stats = None
+                    if time.time() - last_stats > 300 and self._watch_coins:
+                        last_stats = time.time()
+                        try:
+                            stats = {d["coin"]: d for d in E.list_products(self._quote_now)}
+                        except Exception:
+                            stats = None
+                    if prices or stats:
+                        self.q.put(("watch", (prices, stats)))
+                except Exception:
+                    pass
+                time.sleep(20 if self._iconic else 5)
+        self._watch_thread = threading.Thread(target=loop, daemon=True)
+        self._watch_thread.start()
+
+    def sync_thread_values(self):
+        """Copies what background threads need into plain attributes (they must not call Tk)."""
+        self._watch_coins = tuple(self.watchlist())
+        self._quote_now = self.cur_quote()
+        try:
+            self._iconic = self.root.state() == "iconic"
+        except tk.TclError:
+            self._iconic = False
+
+    def on_watch(self, prices, stats):
+        ts = time.time()
+        for c, px in prices.items():
+            self.last[c] = px
+            self.tick_px.setdefault(c, deque(maxlen=8000)).append((ts, px))
+            if c not in self.watch_base:
+                self.watch_base[c] = px
+                self.cfg["watch_base"] = self.watch_base
+        if stats:
+            self.watch_stats = stats
+        alerts = self.cfg.get("watch_alerts") or {}
+        for c, a in list(alerts.items()):
+            px = self.last.get(c)
+            if not px:
+                continue
+            for k, hit in (("above", lambda lim: px >= lim), ("below", lambda lim: px <= lim)):
+                if k in a and hit(a[k]):
+                    msg = f"{c} is {'above' if k == 'above' else 'below'} {fmt_px(a[k])}: now {fmt_px(px)}"
+                    self.write("♪ Price alert: " + msg, "good" if k == "above" else "warn")
+                    self.notify("CBBF price alert", msg, sound="notify")
+                    self.alert("trades", "Price alert: " + msg)
+                    a.pop(k)
+            if not a:
+                alerts.pop(c, None)
+        self.cfg["watch_alerts"] = alerts
+        self.refresh_watchlist()
+        if not self.running and self.session:
+            self.refresh_view()  # keep Total value live while the bot is stopped
+
+    def refresh_watchlist(self):
+        if not hasattr(self, "watch_tree"):
+            return
+        t = self.watch_tree
+        sel = t.selection()
+        t.delete(*t.get_children())
+        alerts = self.cfg.get("watch_alerts") or {}
+        ticked = {c for c, v in self.coin_vars.items() if v.get()}
+        for c in self.watchlist():
+            px = self.last.get(c)
+            st = self.watch_stats.get(c, {})
+            base = self.watch_base.get(c)
+            q = self.pos.get(c, 0)
+            a = alerts.get(c, {})
+            at = " / ".join(f"{'>' if k == 'above' else '<'} {fmt_px(v)}" for k, v in a.items())
+            d24 = st.get("change_24h")
+            t.insert("", "end", iid=c, tags=(("up",) if (d24 or 0) > 0 else ("down",) if d24 else ()), values=(
+                c, fmt_px(px), "-" if not (px and base) else f"{(px / base - 1) * 100:+.2f}%",
+                "-" if d24 is None else f"{d24:+.2f}%",
+                "-" if not st.get("volume_usd") else f"{st['volume_usd']:,.0f}",
+                "-" if q <= 0 else f"{q:,.6f}".rstrip("0").rstrip(".") + (f" (${q * px:,.0f})" if px else ""),
+                at or "-", "yes" if c in (self.session_coins if self.session else ticked) else ""))
+        t.tag_configure("up", foreground=GREEN)
+        t.tag_configure("down", foreground=RED)
+        keep = [i for i in sel if t.exists(i)]
+        if keep:
+            t.selection_set(keep)
+        self.watch_note.config(text=f"{len(self.watchlist())} coins  |  prices every 5 s, even while the bot is stopped")
 
     # ---------------- portfolio tab ----------------
     def build_portfolio(self, parent):
@@ -4298,9 +4443,18 @@ class App:
     # ---------------- buying and selling by hand ----------------
     def trade_dialog(self, side, coin=None):
         if not self.session:
-            return messagebox.showinfo("Trade", "Press 'Start the bot' first to open a session (Practice or Live). "
-                                                "You can stop the bot right away and still trade by hand.")
-        coins = list(dict.fromkeys(list(self.session_coins) + [c for c, q in self.pos.items() if q > 0]))
+            live = self.mode_var.get() == "live"
+            if not messagebox.askyesno("Trade by hand", f"Open a {'LIVE' if live else 'Practice'} session to trade by hand? "
+                                                        "The bot stays off until you press Start."):
+                return
+            ticked = [c for c, v in self.coin_vars.items() if v.get()] or ["BTC"]
+            if coin and coin not in ticked:
+                ticked.append(coin)
+            if not self.begin_session(ticked):
+                return
+            self.update_status()
+        coins = list(dict.fromkeys(list(self.session_coins) + self.watchlist() + [c for c, q in self.pos.items() if q > 0]
+                                   + ([coin] if coin else [])))
         if side == "sell":
             coins = [c for c in coins if self.pos.get(c, 0) > 0]
             if not coins:
@@ -4442,7 +4596,7 @@ class App:
         self.farm.bind("<Motion>", self._farm_motion)
         self.farm.bind("<Leave>", lambda e: setattr(self, "farm_hover", None))
         self.farm.bind("<Button-1>", self._farm_click)
-        self.farm.bind("<Double-1>", lambda e: (self._farm_click(e), self.bot_detail()))
+        self.farm.bind("<Double-1>", lambda e: (self._farm_click(e), self.bot_detail(quiet=True)) if self._farm_at(e.x, e.y) else None)
         for btn in ("<Button-3>", "<Button-2>"):
             self.farm.bind(btn, lambda e: self.bot_menu(e, self._farm_at(e.x, e.y)))
         # (animated by the shared clock in animate_all)
@@ -4467,6 +4621,7 @@ class App:
         nothing is drawn while the window is minimised, and Settings > Animations can slow it or switch it off."""
         mode = self.settings.get("animations", "Full")
         delay = {"Full": 160, "Light": 480}.get(mode, 1000)
+        self.sync_thread_values()
         try:
             if mode != "Off" and self.root.state() != "iconic":
                 self.farm_phase = getattr(self, "farm_phase", 0) + 1
@@ -4514,7 +4669,7 @@ class App:
             bob = round(2 * math.sin(ph / 2.2)) if working else 0
             y = y0 + bob
             mood = "happy" if st == "active" else "plain"
-            draw_creature(c, v.name, x0, y, size, col, awake=working, phase=ph, mood=mood,
+            draw_creature(c, v.name, x0, y, size, col, status=st, awake=working, phase=ph, mood=mood,
                         fire=just_traded and v.log[-1][2] == "buy", flash=just_traded and ph % 2 == 0)
             if not working:
                 k = ph % 18
@@ -4986,10 +5141,17 @@ class App:
             self.col_refresh()
 
     # ---------------- bot detail card ----------------
-    def bot_detail(self, v=None):
+    @staticmethod
+    def on_row(tree, e):
+        """True when a double-click landed on a row (not on a column heading, which sorts, or empty space)."""
+        return tree.identify_region(e.x, e.y) in ("cell", "tree") and bool(tree.identify_row(e.y))
+
+    def bot_detail(self, v=None, quiet=False):
         v = v or self.selected_variant()
         if not v or not self.tourn:
-            return messagebox.showinfo("Strategy", "Click a strategy on the scoreboard first.")
+            if quiet:
+                return None
+            return messagebox.showinfo("Bot details", "Click a bot on the farm or the scoreboard first.")
         w = tk.Toplevel(self.root)
         w.title(STRAT_LABELS.get(v.name, v.name))
         w.geometry("760x620")
@@ -5551,8 +5713,8 @@ class App:
                     ttk.Combobox(f, textvariable=var, values=list(BAR_LABELS.values()), state="readonly", width=12).grid(
                         row=r, column=1, padx=(10, 0), sticky="w")
                 elif typ == "chars":
-                    var = tk.StringVar(value=cur if cur in ("Mixed", "Dragons only") else "Mixed")
-                    ttk.Combobox(f, textvariable=var, values=["Mixed", "Dragons only"], state="readonly", width=12).grid(
+                    var = tk.StringVar(value=cur if cur in ("Themed dragons", "Classic dragons") else "Themed dragons")
+                    ttk.Combobox(f, textvariable=var, values=["Themed dragons", "Classic dragons"], state="readonly", width=15).grid(
                         row=r, column=1, padx=(10, 0), sticky="w")
                 elif typ == "anim":
                     var = tk.StringVar(value=cur if cur in ("Full", "Light", "Off") else "Full")
@@ -5677,7 +5839,7 @@ class App:
             self.settings["notify_trades"], self.settings["chime"] = ntr.get(), snd.get()
             self.settings["chime_volume"] = int(vol.get())
             self.settings["sounds_off"] = [k for k, v in snd_vars.items() if not v.get()]
-            CHARACTER_MODE["mode"] = self.settings.get("characters", "Mixed")
+            CHARACTER_MODE["mode"] = self.settings.get("characters", "Themed dragons")
             self.grid_refresh()
             self.apply_awake()
             self.auto_coin_var.set(int(self.settings.get("auto_coins", 0)) > 0)

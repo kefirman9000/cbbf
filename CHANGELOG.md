@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.8.2
+- Fix: clicking column headings to sort a list could pop up "pick a strategy first". Double-clicks on headings or empty space are ignored now.
+- Themed dragons replace the animal characters (fire, ice, lightning, space, and skeletons for resting bots).
+- **Watchlist** tab: add any coin (type it or Browse coins). Shows live price, change since you added it, 24h change
+  and volume, how much you own, and price alerts ("tell me when it goes above / below ..."). Right-click or the
+  buttons to buy, sell, chart it, or let the bots trade it.
+- **Prices stay live while the bot is stopped**: a light background check (one request for all your watched and owned
+  coins every 5 seconds) keeps Total value and the watchlist up to date.
+- **Buy... / Sell...** buttons in the side panel. With no session open, they offer to open one (the bot stays off),
+  so you can trade by hand any time. Any watched coin can be bought.
+
 ## 1.8.1
 - **Chart dashboard**: show 1, 2, 3, 4 (2x2) or 6 (3x2) charts at once ("Charts" menu above them). Each chart has its
   own picker for what it shows and its own Line / Area / Candles style, and remembers it:
@@ -15,9 +26,9 @@
   cover the round-trip fees. Losses, stops and Sell everything still sell. Bots were already scored after fees and
   spread; this stops them churning out tiny "wins" that are really losses.
 - **Fees paid** on the Portfolio tab and on every bot's card.
-- **New characters, by strategy family**: dragons (trend followers), cats (pounce on dips), bunnies (jump on
-  breakouts), owls (dips in an uptrend) and turtles (slow and steady). Settings > Timing > Characters switches back
-  to dragons only.
+- **Themed dragons** by strategy family: fire/devil dragons (trend followers), ice dragons (dip buyers), lightning
+  dragons (breakouts), space dragons (dips in an uptrend), and resting bots turn into **skeleton dragons**. Their status
+  glows on the ground under them. Settings > Timing switches to classic dragons coloured by status.
 - **Candle timeframe** picker for the charts (Auto, 5 s up to 4 hr) and a 1-week range.
 - A line under the money tiles now shows how many practice trades the bots made versus your account's own trades,
   so it's clear why Cash left / Total value only change when the account itself trades.
