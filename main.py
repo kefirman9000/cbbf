@@ -145,6 +145,8 @@ SETTING_GROUPS = [
         ("limit_fallback", "Limit orders: if nothing fills in time, use a market order instead", bool),
         ("trail_stop", "Trailing stop: sell if a coin falls this % from its high since buying (0 = off)", float),
         ("max_trades_hour", "Brake: at most this many strategy trades per hour (0 = no limit). Safety stops always run", int),
+        ("fee_aware", "Fee-aware: bots and the account don't sell for a profit too small to cover the round-trip fees "
+                      "(losses, stops and Sell everything still sell)", bool),
         ("bot_stops", "Wildcard: let the winning bots set the Safety stop and Lock-in-profit levels they learned "
                       "(your Basics numbers are used when they don't)", bool),
         ("fee_pct", "Market order fee used in Practice mode (%)", float),
@@ -154,7 +156,8 @@ SETTING_GROUPS = [
     ("Timing", "How often the bot looks at prices.", [
         ("bar_minutes", "How often strategies decide (15 sec is the fastest)", "bar"),
         ("refresh", "Check prices every N seconds (1 or more)", int),
-        ("animations", "Dragon animations (Light uses less computer power)", "anim"),
+        ("animations", "Animations (Light uses less computer power)", "anim"),
+        ("characters", "Characters: mixed by strategy (dragons, cats, bunnies, owls, turtles) or dragons only", "chars"),
     ]),
     ("Alerts", "Get a message on your phone when something happens. Leave blank to turn off.", [
         ("alert_discord", "Discord webhook link (Server settings > Integrations > Webhooks)", str),
@@ -434,6 +437,168 @@ def draw_dragon(c, x, y, size, color, awake=True, phase=0, mood="plain", fire=Fa
                          fill="#f97316", outline="#fde047")
 
 
+
+CREATURES = {  # which character each strategy family is drawn as
+    "SMA crossover": "dragon", "EMA crossover": "dragon", "MACD": "dragon", "Momentum": "dragon",
+    "RSI": "cat", "Stochastic": "cat", "Bollinger bands": "cat", "Mean reversion": "cat", "VWAP snap-back": "cat",
+    "Breakout": "bunny", "Volume breakout": "bunny", "ATR channel": "bunny",
+    "Trend + dip": "owl", "Dollar-cost averaging": "turtle",
+}
+CREATURE_NAMES = {"dragon": "Dragon (trend follower)", "cat": "Cat (pounces on dips)", "bunny": "Bunny (jumps on breakouts)",
+                  "owl": "Owl (waits for dips in an uptrend)", "turtle": "Turtle (slow and steady)"}
+CHARACTER_MODE = {"mode": "Mixed"}  # "Mixed" (by strategy) or "Dragons only"; set from the settings
+
+
+def draw_creature(c, strat, x, y, size, color, **kw):
+    """Draws the character for a strategy family (or a dragon in 'Dragons only' mode)."""
+    kind = "dragon" if CHARACTER_MODE["mode"] != "Mixed" else CREATURES.get(strat, "dragon")
+    {"cat": draw_cat, "bunny": draw_bunny, "owl": draw_owl, "turtle": draw_turtle}.get(kind, draw_dragon)(
+        c, x, y, size, color, **kw)
+
+
+def _kit(c, x, y, size, tags):
+    k = size / 26.0
+
+    def P(*pts):
+        return [v * k + (x if i % 2 == 0 else y) for i, v in enumerate(pts)]
+
+    def mk(kind, *a, **kw):
+        return getattr(c, "create_" + kind)(*a, tags=tags, **kw)
+    return k, P, mk
+
+
+def _eyes(mk, P, k, awake, ex, ey, gap, look=0):
+    if awake:
+        for dx in (0, gap):
+            mk("oval", *P(ex + dx + look - 1.6, ey - 1.6, ex + dx + look + 1.6, ey + 1.6), fill="#111827", outline="")
+            mk("oval", *P(ex + dx + look - 0.6, ey - 1.2, ex + dx + look + 0.2, ey - 0.4), fill="white", outline="")
+    else:
+        for dx in (0, gap):
+            mk("arc", *P(ex + dx - 2, ey - 2, ex + dx + 2, ey + 2), start=180, extent=180, style="arc",
+               outline="#111827", width=max(1, 1.2 * k))
+
+
+def _extras(mk, P, k, crown, fire, flash, phase, hx, hy):
+    if crown:
+        mk("polygon", *P(hx - 4, hy, hx - 3.5, hy - 5, hx - 1.5, hy - 2.5, hx, hy - 6, hx + 1.5, hy - 2.5, hx + 3.5, hy - 5,
+                         hx + 4, hy), fill="#facc15", outline="#a16207")
+    if fire:  # non-dragons get sparkles instead of fire
+        f = phase % 4
+        for sx, sy in ((hx + 8 + f, hy + 2), (hx + 6 - f, hy - 4), (hx + 11, hy - 1 - f)):
+            mk("text", *P(sx, sy), text="✦", fill="#fde047", font=("", max(6, int(6 * k)), "bold"))
+
+
+def draw_cat(c, x, y, size, color, awake=True, phase=0, mood="plain", fire=False, flash=False, gold=False, tags=(),
+             crown=False):
+    """A round little cat. Awake: tail swishes and ears twitch. Asleep: curled up."""
+    k, P, mk = _kit(c, x, y, size, tags)
+    edge = "white" if flash else ""
+    belly = "#fde68a" if gold else "#f5f5f4"
+    sw = math.sin(phase / 1.5) * 4 if awake else 0
+    if awake:
+        mk("line", *P(5, 20, 0, 16 + sw, 2, 9 + sw), fill=color, width=max(1, 2.5 * k), smooth=True)
+        mk("oval", *P(4, 12, 22, 26), fill=color, outline=edge)
+        mk("oval", *P(9, 17, 17, 25), fill=belly, outline="")
+        tw = 1 if (phase % 9) == 0 else 0
+        mk("polygon", *P(7, 6, 8 - tw, -1, 12, 4), fill=color, outline="")
+        mk("polygon", *P(15, 4, 19 + tw, -1, 20, 6), fill=color, outline="")
+        mk("oval", *P(6, 2, 21, 15), fill=color, outline=edge)
+        _eyes(mk, P, k, True, 10.5, 8, 6, math.sin(phase / 5.0) * 0.8)
+        mk("polygon", *P(13, 10.5, 14.5, 10.5, 13.75, 11.5), fill="#f472b6", outline="")
+        if mood == "happy":
+            mk("arc", *P(11, 10, 16.5, 13.5), start=200, extent=140, style="arc", outline="#111827", width=1)
+        for s in (-1, 1):
+            mk("line", *P(13.75 + s * 2, 11, 13.75 + s * 7, 10 + s * 0.3), fill="#f5f5f4", width=1)
+        _extras(mk, P, k, crown, fire, flash, phase, 13.5, 2)
+    else:
+        mk("oval", *P(2, 12, 24, 26), fill=color, outline="")
+        mk("arc", *P(0, 13, 24, 27), start=200, extent=120, style="arc", outline=color, width=max(1, 3 * k))
+        mk("polygon", *P(14, 13, 15, 8, 18, 12), fill=color, outline="")
+        mk("polygon", *P(19, 12, 22, 8, 23, 14), fill=color, outline="")
+        _eyes(mk, P, k, False, 16, 17, 4)
+        _extras(mk, P, k, crown, False, flash, phase, 18, 9)
+
+
+def draw_bunny(c, x, y, size, color, awake=True, phase=0, mood="plain", fire=False, flash=False, gold=False, tags=(),
+               crown=False):
+    """A bouncy bunny. Awake: hops (the whole bunny bobs higher) and ears wiggle."""
+    k, P, mk = _kit(c, x, y, size, tags)
+    edge = "white" if flash else ""
+    belly = "#fde68a" if gold else "#f5f5f4"
+    hop = -abs(math.sin(phase / 1.8)) * 3 if awake else 2
+    ear = math.sin(phase / 2.0) * 1.5 if awake else 3
+
+    def Q(*pts):
+        return P(*[v + (hop if i % 2 else 0) for i, v in enumerate(pts)])
+    mk("oval", *Q(3, 13, 21, 26), fill=color, outline=edge)
+    mk("oval", *Q(1, 17, 6, 22), fill=belly, outline="")  # tail
+    mk("oval", *Q(9, 17, 17, 25), fill=belly, outline="")
+    mk("oval", *Q(9 - ear, -4 + abs(ear), 13 - ear, 9), fill=color, outline="")
+    mk("oval", *Q(15 + ear, -4 + abs(ear), 19 + ear, 9), fill=color, outline="")
+    mk("oval", *Q(10, -2 + abs(ear), 12, 7), fill="#fbcfe8", outline="")
+    mk("oval", *Q(16, -2 + abs(ear), 18, 7), fill="#fbcfe8", outline="")
+    mk("oval", *Q(7, 4, 22, 17), fill=color, outline=edge)
+    if awake:
+        mk("oval", *Q(10.5, 8, 13.5, 11), fill="#111827", outline="")
+        mk("oval", *Q(16, 8, 19, 11), fill="#111827", outline="")
+        mk("oval", *Q(14, 12, 15.5, 13), fill="#f472b6", outline="")
+        if mood == "happy":
+            mk("arc", *Q(12, 11.5, 17.5, 15), start=200, extent=140, style="arc", outline="#111827", width=1)
+    else:
+        for ex in (12, 17.5):
+            mk("arc", *Q(ex - 2, 8, ex + 2, 12), start=180, extent=180, style="arc", outline="#111827", width=1)
+    _extras(mk, P, k, crown, fire, flash, phase, 14.5, 3 + hop)
+
+
+def draw_owl(c, x, y, size, color, awake=True, phase=0, mood="plain", fire=False, flash=False, gold=False, tags=(),
+             crown=False):
+    """A wise owl. Awake: big eyes and slow blinks, wings flutter a little."""
+    k, P, mk = _kit(c, x, y, size, tags)
+    edge = "white" if flash else ""
+    belly = "#fde68a" if gold else "#f5f5f4"
+    fl = math.sin(phase / 2.0) * 2 if awake else 0
+    mk("polygon", *P(5, 6, 7, 0, 10, 5), fill=color, outline="")
+    mk("polygon", *P(16, 5, 19, 0, 21, 6), fill=color, outline="")
+    mk("oval", *P(4, 3, 22, 26), fill=color, outline=edge)
+    mk("oval", *P(8, 13, 18, 25), fill=belly, outline="")
+    for i in range(3):
+        mk("arc", *P(10, 15 + i * 3, 16, 18 + i * 3), start=200, extent=140, style="arc", outline=color, width=1)
+    mk("polygon", *P(4, 11, 1 - fl, 18, 5, 21), fill=color, outline="")
+    mk("polygon", *P(22, 11, 25 + fl, 18, 21, 21), fill=color, outline="")
+    blink = awake and phase % 17 == 0
+    for ex in (9.5, 16.5):
+        mk("oval", *P(ex - 3.5, 5.5, ex + 3.5, 12.5), fill="#fef3c7", outline="")
+        if awake and not blink:
+            mk("oval", *P(ex - 1.6, 7.4, ex + 1.6, 10.6), fill="#111827", outline="")
+        else:
+            mk("line", *P(ex - 2.5, 9, ex + 2.5, 9), fill="#111827", width=max(1, 1.2 * k))
+    mk("polygon", *P(12, 11, 14, 11, 13, 14), fill="#f59e0b", outline="")
+    mk("line", *P(10, 26, 10, 27.5), fill="#f59e0b", width=max(1, 1.5 * k))
+    mk("line", *P(16, 26, 16, 27.5), fill="#f59e0b", width=max(1, 1.5 * k))
+    _extras(mk, P, k, crown, fire, flash, phase, 13, 2)
+
+
+def draw_turtle(c, x, y, size, color, awake=True, phase=0, mood="plain", fire=False, flash=False, gold=False, tags=(),
+                crown=False):
+    """A steady turtle. Awake: head pokes out and little legs paddle. Asleep: tucked into its shell."""
+    k, P, mk = _kit(c, x, y, size, tags)
+    edge = "white" if flash else ""
+    shell = "#fde68a" if gold else color
+    step = math.sin(phase / 1.5) * 1.2 if awake else 0
+    for lx, d in ((6, step), (17, -step)):
+        mk("oval", *P(lx + d, 20, lx + 4 + d, 25), fill="#86efac", outline="")
+    if awake:
+        mk("oval", *P(19, 11, 27, 18), fill="#86efac", outline="")
+        mk("oval", *P(23, 13, 25, 15), fill="#111827", outline="")
+        if mood == "happy":
+            mk("arc", *P(22, 14, 26.5, 17), start=200, extent=140, style="arc", outline="#111827", width=1)
+    mk("arc", *P(2, 8, 24, 30), start=0, extent=180, style="pieslice", fill=shell, outline=edge or "#14532d")
+    for px_, py_ in ((8, 13), (13, 11), (18, 13)):
+        mk("oval", *P(px_ - 2.2, py_ - 1.8, px_ + 2.2, py_ + 1.8), fill="", outline="#14532d")
+    mk("line", *P(2, 19, 24, 19), fill="#14532d", width=1)
+    _extras(mk, P, k, crown, fire, flash, phase, 13, 7)
+
+
 class Tip:
     """Small hover tooltip."""
 
@@ -493,6 +658,7 @@ class App:
         apply_theme(root, bool(self.cfg.get("dark", True)))
         self.dark_var = tk.BooleanVar(value=DARK)
         self.settings = E.merge_settings(self.cfg.get("settings"))
+        CHARACTER_MODE["mode"] = self.settings.get("characters", "Mixed")
         if not self.cfg.get("live_feel_v1"):  # one-time move to the faster defaults (1-minute bars, 2-second prices)
             self.settings["bar_minutes"], self.settings["refresh"] = 1, 2
             self.cfg["settings"], self.cfg["live_feel_v1"] = self.settings, True
@@ -547,6 +713,7 @@ class App:
         self.trade_marks = []     # (chart point number, side) for the buy/sell markers
         self.curve_n = 0          # chart points added so far this session
         self.inducted = set()     # Hall of Fame keys added this session
+        self.fees_paid = 0.0      # fees paid by the account this session
         self.hx = {}              # coin -> {'h','l','v'} lined up with self.hist (highs, lows, volumes per bar)
         self.bar_hl = {}          # coin -> [high, low] of the ticks inside the bar being built
         self.cur_vol = {}         # coin -> latest volume per bar from Coinbase candles
@@ -559,7 +726,8 @@ class App:
         E.save_json(E.state_path(self.live), dict(
             start_cash=self.start_cash, cash=self.cash, pos=self.pos, cost=self.cost,
             trades=self.trades[-5000:], shadow=self.shadow_trades[-1000:], curve=self.curve[-1500:], bench_units=self.bench_units,
-            coins=self.session_coins, bar_n=self.bar_n, bar=self.session_bar, quote=self.quote, high=self.high))
+            coins=self.session_coins, bar_n=self.bar_n, bar=self.session_bar, quote=self.quote, high=self.high,
+            fees_paid=self.fees_paid))
 
     def load_state(self, s):
         self.start_cash, self.cash = s["start_cash"], s["cash"]
@@ -570,6 +738,7 @@ class App:
         self.bar_n, self.session_bar = s["bar_n"], s.get("bar", 5)
         self.quote = s.get("quote", "USD")
         self.high = {c: float(v) for c, v in (s.get("high") or {}).items() if isinstance(v, (int, float))}
+        self.fees_paid = float(s.get("fees_paid", 0) or 0)
 
     def on_close(self):
         if self.running and not messagebox.askyesno(
@@ -773,22 +942,23 @@ class App:
                       "day": "How much your total value has changed since today began."}[key])
         self.verdict_lbl = tk.Label(right, text="", bg=BG, fg=MUTED, anchor="w", font=("", 10, "bold"))
         self.verdict_lbl.pack(fill="x", pady=(6, 0))
+        self.activity_lbl = tk.Label(right, text="", bg=BG, fg=MUTED, anchor="w", font=("", 8))
+        self.activity_lbl.pack(fill="x")
+        Tip(self.activity_lbl, "The bots trade with pretend money inside the farm to find out what works; those trades "
+                               "never change your balance. Your account (the tiles above) only trades when it copies "
+                               "the winners, so it trades less often than the bots.")
 
         split = tk.PanedWindow(right, orient="vertical", bg=BG, sashwidth=6, bd=0, sashrelief="flat")
         split.pack(fill="both", expand=True, pady=(8, 0))
         f, c = self.card(split, None)
         self.build_chart_controls(c)
-        charts = tk.Frame(c, bg=CARD)
-        charts.pack(fill="both", expand=True)
-        self.chart = tk.Canvas(charts, height=190, bg=CARD, highlightthickness=0)
-        self.chart2 = tk.Canvas(charts, height=190, bg=CARD, highlightthickness=0)
-        self.chart.pack(side="left", fill="both", expand=True)
-        for cv in (self.chart, self.chart2):
-            cv.bind("<Configure>", lambda e: self.draw_chart())
-            cv.bind("<Motion>", lambda e, cv=cv: self.chart_hover(e, cv))
-            cv.bind("<Leave>", lambda e: (self.hover.clear(), self.draw_chart()))
-        self.apply_split()
-        split.add(f, minsize=150, height=int(self.cfg.get("chart_h", 250)), stretch="never")
+        self.charts_frame = tk.Frame(c, bg=CARD)
+        self.charts_frame.pack(fill="both", expand=True)
+        self.chart_card = f
+        self.panels = []
+        self.build_panels()
+        split.add(f, minsize=150, stretch="never",
+                  height={1: 250, 2: 250, 3: 260, 4: 400, 6: 420}[self.LAYOUTS[self.chart_layout.get()][0] * self.LAYOUTS[self.chart_layout.get()][1]])
         nbf = tk.Frame(split, bg=BG)
         split.add(nbf, minsize=180, stretch="always")
         self.split = split
@@ -1706,35 +1876,47 @@ class App:
     # ---------------- chart / views ----------------
     # ---------------- chart ----------------
     CHART_RANGES = (("30 ticks", -30), ("2 min", 120), ("5 min", 300), ("15 min", 900), ("1 hr", 3600),
-                    ("4 hr", 14400), ("1 day", 86400), ("All", 0))
+                    ("4 hr", 14400), ("1 day", 86400), ("1 wk", 604800), ("All", 0))
+    CANDLE_CHOICES = {"Auto": 0, "5 s": 5, "15 s": 15, "1 min": 60, "5 min": 300, "15 min": 900, "1 hr": 3600, "4 hr": 14400}
     CHART_TYPES = ("Line", "Area", "Candles")
     CANDLE_SECS = (5, 10, 15, 30, 60, 120, 300, 900, 1800, 3600, 7200, 14400)
+
+    LAYOUTS = {"1 chart": (1, 1), "2 charts": (1, 2), "3 charts": (1, 3), "4 charts (2x2)": (2, 2), "6 charts (3x2)": (2, 3)}
+    PANEL_VIEWS = ("Account value", "Profit / loss %", "Drawdown", "Cash vs invested", "Selected bot")
+    PANEL_TIPS = {"Account value": "Your account's value (blue) next to what just holding would be worth (grey).",
+                  "Profit / loss %": "Profit or loss since the start, in %, for the account and for just holding.",
+                  "Drawdown": "How far the account is below its best point so far. Closer to 0 is better.",
+                  "Cash vs invested": "How much is in cash and how much is in coins over time.",
+                  "Selected bot": "The equity of the bot selected on the farm or scoreboard (or the best one)."}
 
     def build_chart_controls(self, parent):
         bar = tk.Frame(parent, bg=CARD)
         bar.pack(fill="x", pady=(0, 4))
-        self.chart_view = tk.StringVar(value="Account value")
-        self.view_box = ttk.Combobox(bar, textvariable=self.chart_view, width=14, state="readonly",
-                                     values=["Account value"])
-        self.view_box.pack(side="left")
-        self.view_box.bind("<<ComboboxSelected>>", lambda e: self.draw_chart())
-        Tip(self.view_box, "What the chart shows: your account's value, or one coin's price with buy/sell markers. "
-                           "With Split on, the account stays on the left and this picks the coin on the right.")
-        self.chart_type = tk.StringVar(value=self.cfg.get("chart_type", "Line"))
-        tb = ttk.Combobox(bar, textvariable=self.chart_type, values=self.CHART_TYPES, width=8, state="readonly")
-        tb.pack(side="left", padx=(6, 0))
-        tb.bind("<<ComboboxSelected>>", lambda e: (self.cfg.__setitem__("chart_type", self.chart_type.get()), self.draw_chart()))
-        Tip(tb, "Line, Area (filled) or Candles. Candles are for coin prices; each candle's size follows the time range.")
+        tk.Label(bar, text="Charts", bg=CARD, fg=MUTED, font=("", 8, "bold")).pack(side="left")
+        self.chart_layout = tk.StringVar(value=self.cfg.get("chart_layout", "2 charts"))
+        if self.chart_layout.get() not in self.LAYOUTS:
+            self.chart_layout.set("2 charts")
+        lb = ttk.Combobox(bar, textvariable=self.chart_layout, values=list(self.LAYOUTS), state="readonly", width=14)
+        lb.pack(side="left", padx=(4, 0))
+        lb.bind("<<ComboboxSelected>>", lambda e: self.build_panels())
+        Tip(lb, "How many charts to show at once. Pick what each one shows with the menu at its top-left. "
+                "Drag the divider under the charts to make them taller.")
+        tk.Label(bar, text="Candles", bg=CARD, fg=MUTED, font=("", 8, "bold")).pack(side="left", padx=(10, 0))
+        self.candle_sel = tk.StringVar(value=self.cfg.get("candle_sel", "Auto"))
+        cs = ttk.Combobox(bar, textvariable=self.candle_sel, values=list(self.CANDLE_CHOICES), state="readonly", width=6)
+        cs.pack(side="left", padx=(4, 0))
+        cs.bind("<<ComboboxSelected>>", lambda e: (self.cfg.__setitem__("candle_sel", self.candle_sel.get()), self.draw_chart()))
+        Tip(cs, "Candle timeframe: how much time each candle covers on Candles charts. Auto picks one to suit the range.")
+        tk.Label(bar, text="Range", bg=CARD, fg=MUTED, font=("", 8, "bold")).pack(side="left", padx=(10, 0))
         self.chart_range = tk.StringVar(value=self.cfg.get("chart_range", "All"))
         self.range_btns = {}
         rb = tk.Frame(bar, bg=CARD)
-        rb.pack(side="left", padx=8)
+        rb.pack(side="left", padx=(2, 8))
         for label, _ in self.CHART_RANGES:
             b = tk.Label(rb, text=label, bg=CARD, fg=MUTED, padx=5, pady=1, cursor="hand2", font=("", 8))
             b.pack(side="left")
             b.bind("<Button-1>", lambda e, l=label: self.set_range(l))
             self.range_btns[label] = b
-        self.chart_split = tk.BooleanVar(value=bool(self.cfg.get("chart_split", False)))
         self.chart_pct = tk.BooleanVar(value=bool(self.cfg.get("chart_pct", False)))
         self.chart_hold = tk.BooleanVar(value=bool(self.cfg.get("chart_hold", True)))
         self.chart_marks = tk.BooleanVar(value=bool(self.cfg.get("chart_marks", True)))
@@ -1742,27 +1924,86 @@ class App:
         self.chart_grid = tk.BooleanVar(value=bool(self.cfg.get("chart_grid", True)))
         for var, txt, tip in ((self.chart_grid, "Grid", "Background grid lines."),
                               (self.chart_bot, "Bot trades",
-                               "On a coin chart: the buys (hollow up arrows) and sells (hollow down arrows) of the "
-                               "bot selected in the farm or scoreboard, or the best one if none is selected."),
+                               "On coin charts: the buys (hollow up arrows) and sells (hollow down arrows) of the "
+                               "bot selected on the farm or scoreboard, or the best one if none is selected."),
                               (self.chart_marks, "My trades", "Filled arrows where your account bought and sold."),
-                              (self.chart_hold, "Holding", "The grey line on the account chart: what just holding would be worth."),
-                              (self.chart_pct, "%", "Show change in % instead of dollars."),
-                              (self.chart_split, "Split", "Two charts side by side: your account and a coin.")):
+                              (self.chart_hold, "Holding", "The grey 'just holding' line on account charts."),
+                              (self.chart_pct, "%", "Show change in % instead of dollars or prices.")):
             cb = ttk.Checkbutton(bar, text=txt, variable=var, style="Card.TCheckbutton", command=self.chart_opts_changed)
             cb.pack(side="right", padx=(5, 0))
             Tip(cb, tip)
         self.hover = {}
         self.paint_range_btns()
 
-    def apply_split(self):
-        if self.chart_split.get():
-            self.chart2.pack(side="left", fill="both", expand=True, padx=(8, 0))
-            if self.chart_view.get() == "Account value":
-                coins = self.session_coins or [c for c, v in self.coin_vars.items() if v.get()]
-                if coins:
-                    self.chart_view.set(coins[0])
-        else:
-            self.chart2.pack_forget()
+    def default_panels(self):
+        coins = list(self.session_coins or [c for c, v in self.coin_vars.items() if v.get()]) or ["BTC"]
+        views = ["Account value", coins[0], "Profit / loss %", coins[1] if len(coins) > 1 else "Drawdown",
+                 "Cash vs invested", "Selected bot"]
+        return [dict(view=v, type="Line") for v in views]
+
+    def build_panels(self):
+        """(Re)builds the chart grid for the chosen layout. Each panel picks what it shows and its chart type."""
+        lay = self.chart_layout.get()
+        self.cfg["chart_layout"] = lay
+        rows, cols = self.LAYOUTS[lay]
+        saved = self.cfg.get("chart_panels") or []
+        specs = (saved + self.default_panels()[len(saved):])[:6] if isinstance(saved, list) else self.default_panels()
+        for p in self.panels:
+            p["frame"].destroy()
+        self.panels = []
+        fr = self.charts_frame
+        for r in range(2):
+            fr.rowconfigure(r, weight=1 if r < rows else 0)
+        for cidx in range(3):
+            fr.columnconfigure(cidx, weight=1 if cidx < cols else 0)
+        for k in range(rows * cols):
+            spec = specs[k] if k < len(specs) and isinstance(specs[k], dict) else self.default_panels()[k]
+            pf = tk.Frame(fr, bg=CARD, highlightthickness=1 if rows * cols > 1 else 0, highlightbackground=LINE)
+            pf.grid(row=k // cols, column=k % cols, sticky="nsew", padx=2, pady=2)
+            head = tk.Frame(pf, bg=CARD)
+            head.pack(fill="x")
+            view = tk.StringVar(value=spec.get("view", "Account value"))
+            kind = tk.StringVar(value=spec.get("type", "Line") if spec.get("type") in self.CHART_TYPES else "Line")
+            vb = ttk.Combobox(head, textvariable=view, width=15, state="readonly")
+            vb.pack(side="left")
+            tb = ttk.Combobox(head, textvariable=kind, values=self.CHART_TYPES, width=7, state="readonly")
+            tb.pack(side="left", padx=(4, 0))
+            cv = tk.Canvas(pf, height=120, bg=CARD, highlightthickness=0)
+            cv.pack(fill="both", expand=True)
+            cv.bind("<Configure>", lambda e: self.draw_chart())
+            cv.bind("<Motion>", lambda e, cv=cv: self.chart_hover(e, cv))
+            cv.bind("<Leave>", lambda e: (self.hover.clear(), self.draw_chart()))
+            for box in (vb, tb):
+                box.bind("<<ComboboxSelected>>", lambda e: self.panels_changed())
+            self.panels.append(dict(frame=pf, view=view, type=kind, canvas=cv, box=vb))
+        self.chart = self.panels[0]["canvas"]
+        self.chart_view, self.chart_type = self.panels[0]["view"], self.panels[0]["type"]
+        if hasattr(self, "split") and hasattr(self, "chart_card"):
+            want = {1: 250, 2: 250, 3: 260, 4: 400, 6: 420}[rows * cols]
+            try:
+                self.split.paneconfigure(self.chart_card, height=max(want, int(self.cfg.get("chart_h", 0) or 0) if rows * cols < 4 else want))
+            except tk.TclError:
+                pass
+        self.update_view_choices()
+        self.draw_chart()
+
+    def panels_changed(self):
+        specs = [dict(view=p["view"].get(), type=p["type"].get()) for p in self.panels]
+        old = self.cfg.get("chart_panels") or []
+        self.cfg["chart_panels"] = specs + old[len(specs):6] if isinstance(old, list) else specs
+        try:
+            E.save_json(CONFIG_PATH, self.cfg)
+        except OSError:
+            pass
+        self.draw_chart()
+
+    def show_on_chart(self, view):
+        """Puts a coin (or view) on a chart: one that already shows it, else the second chart (or the only one)."""
+        if any(p["view"].get() == view for p in self.panels):
+            return self.draw_chart()
+        p = self.panels[1] if len(self.panels) > 1 else self.panels[0]
+        p["view"].set(view)
+        self.panels_changed()
 
     def set_range(self, label):
         self.chart_range.set(label)
@@ -1777,18 +2018,18 @@ class App:
 
     def chart_opts_changed(self):
         for k, v in (("chart_pct", self.chart_pct), ("chart_hold", self.chart_hold), ("chart_marks", self.chart_marks),
-                     ("chart_bot", self.chart_bot), ("chart_grid", self.chart_grid), ("chart_split", self.chart_split)):
+                     ("chart_bot", self.chart_bot), ("chart_grid", self.chart_grid)):
             self.cfg[k] = bool(v.get())
-        self.apply_split()
         self.draw_chart()
 
     def update_view_choices(self):
         coins = list(self.session_coins or [c for c, v in self.coin_vars.items() if v.get()])
-        vals = coins if self.chart_split.get() else ["Account value"] + coins
-        if list(self.view_box.cget("values")) != vals:
-            self.view_box.config(values=vals)
-        if self.chart_view.get() not in vals:
-            self.chart_view.set(vals[0] if vals else "Account value")
+        vals = list(self.PANEL_VIEWS) + coins
+        for p in self.panels:
+            if list(p["box"].cget("values")) != vals:
+                p["box"].config(values=vals)
+            if p["view"].get() not in vals:
+                p["view"].set(coins[0] if coins and p is not self.panels[0] else "Account value")
 
     @staticmethod
     def _ts(iso):
@@ -1816,12 +2057,41 @@ class App:
         return dict(self.CHART_RANGES).get(self.chart_range.get(), 0)
 
     def chart_data(self, view):
-        """-> (series [(name, [(t, y)], color, width)], markers [(t, y, side, filled, label)], is_money, coin or None)"""
+        """-> (series [(name, [(t, y)], color, width)], markers [(t, y, side, filled, label)], unit, coin or None)
+        unit: '$' money, '%' already a percentage, 'px' a coin price."""
         series, marks = [], []
+        pts = self.curve
+        if pts and len(pts[0]) < 3:
+            step, now = max(1, int(self.settings["refresh"])), time.time()
+            pts = [(p[0], p[1], now - (len(pts) - 1 - i) * step) for i, p in enumerate(pts)]
+        if view == "Profit / loss %":
+            sc = self.start_cash or 1
+            series.append(("account", [(p[2], (p[0] / sc - 1) * 100) for p in pts], ACCENT, 2))
+            if self.chart_hold.get():
+                series.insert(0, ("holding", [(p[2], (p[1] / sc - 1) * 100) for p in pts], "#9ca3af", 1))
+            return series, marks, "%", None
+        if view == "Drawdown":
+            peak, dd = 0.0, []
+            for p in pts:
+                peak = max(peak, p[0])
+                dd.append((p[2], (p[0] / peak - 1) * 100 if peak else 0.0))
+            series.append(("below best", dd, RED, 2))
+            return series, marks, "%", None
+        if view == "Cash vs invested":
+            al = list(getattr(self, "alloc_hist", ()))
+            series.append(("cash", [(t, ca) for t, ca, _ in al], "#9ca3af", 1))
+            series.append(("in coins", [(t, inv) for t, _, inv in al], ACCENT, 2))
+            return series, marks, "$", None
+        if view == "Selected bot":
+            v = self.chart_bot_variant()
+            if v and v.eq and self.tourn:
+                n0 = self.tourn.n - (len(v.eq) - 1)
+                series.append((E.bot_nickname(v.key()), [(self.bar_time(n0 + i), e) for i, e in enumerate(v.eq)], "#a855f7", 2))
+                for n, coin, side, px in v.log:
+                    if n >= n0:
+                        marks.append((self.bar_time(n), v.eq[n - n0], side, False, coin))
+            return series, marks, "$", None
         if view == "Account value" or view not in (self.session_coins or []):
-            if view != "Account value" and view in self.coin_vars:  # not running yet: show its history if any
-                pass
-            pts = self.curve
             if pts and len(pts[0]) < 3:  # older saved sessions have no times: space them by the refresh rate
                 step, now = max(1, int(self.settings["refresh"])), time.time()
                 pts = [(p[0], p[1], now - (len(pts) - 1 - i) * step) for i, p in enumerate(pts)]
@@ -1837,7 +2107,7 @@ class App:
                         continue
                     i = min(bisect.bisect_left(ts_list, t), len(pts) - 1)
                     marks.append((t, pts[i][0], tr.get("side"), True, tr.get("coin", "")))
-            return series, marks, True, None
+            return series, marks, "$", None
         c = view
         ticks = list(self.tick_px.get(c, ()))
         rng = self._range_seconds()
@@ -1862,29 +2132,30 @@ class App:
                     t = self.bar_time(n)
                     if t is not None:
                         marks.append((t, px, side, False, ""))
-        return series, marks, False, c
+        return series, marks, "px", c
 
     def draw_chart(self):
         try:
             self.update_view_choices()
         except Exception:
             pass
-        if self.chart_split.get():
-            self.draw_one(self.chart, "Account value")
-            self.draw_one(self.chart2, self.chart_view.get())
-        else:
-            self.draw_one(self.chart, self.chart_view.get())
+        for p in getattr(self, "panels", []):
+            self.draw_one(p["canvas"], p["view"].get(), p["type"].get())
 
-    def draw_one(self, c, view):
+    def draw_one(self, c, view, kind_pick="Line"):
         c.delete("all")
         w, h = c.winfo_width(), c.winfo_height()
         try:
-            series, marks, money, coin = self.chart_data(view)
+            series, marks, unit, coin = self.chart_data(view)
         except Exception:
-            series, marks, money, coin = [], [], True, None
+            series, marks, unit, coin = [], [], "$", None
+        money = unit == "$"
         main = series[-1][1] if series else []
         if len(main) < 2 or w < 80:
-            c.create_text(w // 2, h // 2, text="The chart fills in once prices start coming in", fill=MUTED)
+            tip = self.PANEL_TIPS.get(view, "")
+            c.create_text(w // 2, h // 2, width=max(120, w - 30), justify="center", fill=MUTED,
+                          text=("The chart fills in once prices start coming in." if view != "Selected bot"
+                                else "Select a bot on the farm or scoreboard.") + ("\n" + tip if tip and h > 90 else ""))
             return
         rng = self._range_seconds()
         t1 = main[-1][0]
@@ -1896,8 +2167,8 @@ class App:
             t0 = main[0][0]
         if t1 <= t0:
             t0 = t1 - 1
-        pct = self.chart_pct.get()
-        kind = self.chart_type.get() if coin else ("Area" if self.chart_type.get() == "Area" else "Line")
+        pct = self.chart_pct.get() and unit != "%"
+        kind = kind_pick if coin else ("Area" if kind_pick == "Area" else "Line")
         vis = []
         for name, pts, color, width in series:
             seg = [(t, y) for t, y in pts if t >= t0]
@@ -1915,8 +2186,8 @@ class App:
         candles = []
         if kind == "Candles" and main_seg:
             span = max(t1 - t0, 1)
-            step = min(self.CANDLE_SECS, key=lambda s: abs(s - span / 70))
-            step = max(step, self.session_bar * 60 if len(main_seg) and (main_seg[-1][0] - main_seg[0][0]) / max(len(main_seg), 1) >= self.session_bar * 50 else 0)
+            step = self.CANDLE_CHOICES.get(self.candle_sel.get(), 0) or min(self.CANDLE_SECS, key=lambda s: abs(s - span / 70))
+            step = max(step, self.session_bar * 60 if not self.CANDLE_CHOICES.get(self.candle_sel.get(), 0) and len(main_seg) and (main_seg[-1][0] - main_seg[0][0]) / max(len(main_seg), 1) >= self.session_bar * 50 else 0)
             cur = None
             for t, y in main_seg:
                 b = int(t // step) * step
@@ -1950,7 +2221,7 @@ class App:
         lo, hi = min(ys), max(ys)
         pad = (hi - lo) * 0.08 or (abs(hi) * 0.001 + 0.01)
         lo, hi = lo - pad, hi + pad
-        left, right, top, bot = 64, 10, 18, 18
+        left, right, top, bot = (64, 10, 18, 18) if w > 380 else (52, 6, 16, 16)
 
         def X(t):
             return left + (t - t0) / (t1 - t0) * (w - left - right)
@@ -1959,7 +2230,7 @@ class App:
             return h - bot - (v - lo) / (hi - lo) * (h - top - bot)
 
         def fmt(v):
-            if pct:
+            if pct or unit == "%":
                 return f"{v:+.2f}%"
             a = abs(v)
             return f"{v:,.0f}" if a >= 1000 else f"{v:,.2f}" if a >= 1 else f"{v:,.5f}"
@@ -2020,7 +2291,7 @@ class App:
                 if seg:
                     p = min(seg, key=lambda q: abs(q[0] - t))
                     v = val(name, p[1])
-                    lines.append(f"{name}: {fmt(v) if pct else ('$' if money or coin else '') + fmt(v)}")
+                    lines.append(f"{name}: {fmt(v) if (pct or unit == '%') else '$' + fmt(v)}")
                     c.create_oval(X(p[0]) - 3, Y(v) - 3, X(p[0]) + 3, Y(v) + 3, outline=col, width=2)
             near = [m for m in vm if abs(X(m[0]) - hx) < 6]
             for m in near[:3]:
@@ -2104,6 +2375,13 @@ class App:
         else:
             self.verdict_lbl.config(text=f"The bot is behind just holding by ${-gap:,.2f}. That's common, "
                                          f"check the Backtest in the Tools menu.", fg=RED)
+        if self.session:
+            last = self.trades[-1] if self.trades else None
+            lt = (f" (last: {last['side'].upper()} {last['coin']} at {str(last.get('time', ''))[11:16]})" if last else "")
+            self.activity_lbl.config(text=f"Bots made {len(self.shadow_trades)} practice trades inside the farm (they don't "
+                                          f"change your balance). Your account made {len(self.trades)} trades{lt}.")
+        else:
+            self.activity_lbl.config(text="")
         self.refresh_prices()
         self.draw_chart()
         self.headline_lbl.config(text=self.headline())
@@ -2614,6 +2892,9 @@ class App:
             self.on_bar(prices)
         self.curve.append((self.equity(), self.bench_equity(), ts))
         del self.curve[:-8000]
+        if not hasattr(self, "alloc_hist"):
+            self.alloc_hist = deque(maxlen=8000)
+        self.alloc_hist.append((ts, self.cash, self.equity() - self.cash))
         self.check_daily()
         self.refresh_view()
 
@@ -2665,6 +2946,11 @@ class App:
                     who = [n for n, v in zip(self.active, votes) if v == sig]
             if sig and not self.brake_ok():
                 sig = None
+            if sig == "sell" and self.settings.get("fee_aware", True) and self.pos.get(c, 0) > 0:
+                fee, slip = E.cost_model(self.settings)
+                gain = prices[c] / (self.cost[c] / self.pos[c]) - 1
+                if 0 <= gain < 2 * (fee + slip):
+                    sig = None  # the profit wouldn't cover the fees: keep holding
             if sig:
                 counts = {}
                 for n in who:
@@ -2834,6 +3120,7 @@ class App:
         fee, slip = E.cost_model(self.settings)
         px = px * (1 + slip)  # Practice: market buys fill a little above the quoted price
         qty = spend * (1 - fee) / px
+        self.fees_paid += spend * fee
         self.cash -= spend
         self.pos[c] = self.pos.get(c, 0) + qty
         self.cost[c] = self.cost.get(c, 0) + spend
@@ -2850,6 +3137,7 @@ class App:
         fee, slip = E.cost_model(self.settings)
         px = px * (1 - slip)  # Practice: market sells fill a little below the quoted price
         proceeds = qty * px * (1 - fee)
+        self.fees_paid += qty * px * fee
         pl = proceeds - self.cost.get(c, 0)
         self.cash += proceeds
         self.pos[c], self.cost[c] = 0, 0
@@ -3190,6 +3478,7 @@ class App:
         threading.Thread(target=work, daemon=True).start()
 
     def on_fill(self, side, c, qty, amount, reserved, reason):
+        self.fees_paid += amount * float(self.settings.get("fee_pct", 0.6)) / 100  # estimate; Coinbase shows the exact fee
         self.pending.discard(c)
         self.fails = 0
         px = amount / qty if qty else 0
@@ -3625,7 +3914,7 @@ class App:
             y = g + (i // per) * (ch + g)
             if kind == "hof":
                 self._hof_card(c, x, y, cw, ch, data, extra)
-                self.grid_cards.append((x, y, x + cw, y + ch, extra["v"] if extra else None, "hof", "hof"))
+                self.grid_cards.append((x, y, x + cw, y + ch, extra["v"] if extra else None, "hof", "hof", data["name"]))
                 continue
             r, t = data, extra
             v, lf = r["v"], r["life"]
@@ -3683,7 +3972,7 @@ class App:
             if t == "beast":
                 chips.insert(0, (f"{r['stake']:.1f}x size", gold))
             self._chips(c, x + 10, y + ch - 17, x + cw - 8, chips)
-            self.grid_cards.append((x, y, x + cw, y + ch, v, r["status"], t))
+            self.grid_cards.append((x, y, x + cw, y + ch, v, r["status"], t, v.name))
         nrows = (len(items) + per - 1) // per
         c.configure(scrollregion=(0, 0, W, nrows * (ch + g) + g))
 
@@ -3727,11 +4016,11 @@ class App:
         top, bottom = c.canvasy(0), c.canvasy(c.winfo_height())
         awake = self.running and self.seeded
         big = self.grid_filter.get() == "BEASTS"
-        for i, (x0, y0, x1, y1, v, st, t) in enumerate(self.grid_cards):
+        for i, (x0, y0, x1, y1, v, st, t, strat) in enumerate(self.grid_cards):
             if y1 < top or y0 > bottom:
                 continue  # off screen: skip
             if t == "hof":
-                draw_dragon(c, x0 + 14, y0 + 22 + math.sin(ph / 3) * 1.5, 50, "#eab308", awake=True,
+                draw_creature(c, strat, x0 + 14, y0 + 22 + math.sin(ph / 3) * 1.5, 50, "#eab308", awake=True,
                             phase=ph // 3, mood="happy", gold=True, crown=True, tags="anim")
                 continue
             if t == "egg":
@@ -3744,10 +4033,10 @@ class App:
             bob = 2 * math.sin(ph / 2.4) if working else 0
             if t == "beast":
                 fire = working and (just or ph % 30 < 4)
-                draw_dragon(c, x0 + 12, y0 + 22 + bob, 64 if big else 50, "#dc2626" if awake else "#6b7280", awake=working,
+                draw_creature(c, strat, x0 + 12, y0 + 22 + bob, 64 if big else 50, "#dc2626" if awake else "#6b7280", awake=working,
                             phase=ph, mood="happy", fire=fire, flash=just and ph % 2 == 0, crown=True, tags="anim")
             else:
-                draw_dragon(c, x0 + 14, y0 + 22 + bob, 50, col if awake else "#6b7280", awake=working, phase=ph,
+                draw_creature(c, strat, x0 + 14, y0 + 22 + bob, 50, col if awake else "#6b7280", awake=working, phase=ph,
                             mood="happy" if st == "active" else "plain", fire=just and v.log[-1][2] == "buy",
                             flash=just and ph % 2 == 0, tags="anim")
             if not working:
@@ -3796,7 +4085,8 @@ class App:
         top.pack(fill="x", padx=6, pady=(6, 2))
         self.pf_stats = {}
         for i, (k, t) in enumerate((("value", "Total value"), ("invested", "In coins"), ("cash", "Cash"),
-                                    ("unreal", "Open profit / loss"), ("real", "Closed profit / loss"), ("n", "Positions"))):
+                                    ("unreal", "Open profit / loss"), ("real", "Closed profit / loss"), ("fees", "Fees paid"),
+                                    ("n", "Positions"))):
             f = tk.Frame(top, bg=CARD)
             f.grid(row=0, column=i, sticky="w", padx=(0, 22))
             tk.Label(f, text=t.upper(), bg=CARD, fg=MUTED, font=("", 7, "bold")).pack(anchor="w")
@@ -3804,8 +4094,8 @@ class App:
             l.pack(anchor="w")
             self.pf_stats[k] = l
         btns = tk.Frame(top, bg=CARD)
-        btns.grid(row=0, column=7, sticky="e")
-        top.columnconfigure(6, weight=1)
+        btns.grid(row=0, column=8, sticky="e")
+        top.columnconfigure(7, weight=1)
         ttk.Button(btns, text="Buy...", style="Accent.TButton", command=lambda: self.trade_dialog("buy")).pack(side="left")
         ttk.Button(btns, text="Sell...", style="Plain.TButton", command=lambda: self.trade_dialog("sell")).pack(side="left", padx=4)
         self.pf_alloc = tk.Canvas(parent, height=26, bg=CARD, highlightthickness=0)
@@ -3832,7 +4122,7 @@ class App:
         draw_coin_badge(badge, 4, 4, 32, c)
         name = tk.Label(r, text=c, bg=CARD, fg=TEXT, font=("", 11, "bold"), cursor="hand2")
         name.grid(row=0, column=1, sticky="w")
-        name.bind("<Button-1>", lambda e: (self.chart_view.set(c), self.draw_chart()))
+        name.bind("<Button-1>", lambda e: self.show_on_chart(c))
         sub = tk.Label(r, text="", bg=CARD, fg=MUTED, font=("", 8))
         sub.grid(row=1, column=1, sticky="w")
         cols = {}
@@ -3894,6 +4184,7 @@ class App:
         st["unreal"].config(text=f"{unreal:+,.2f}", fg=GREEN if unreal >= 0 else RED)
         st["real"].config(text=f"{real:+,.2f}", fg=GREEN if real >= 0 else RED)
         st["n"].config(text=str(len(held)))
+        st["fees"].config(text=f"${self.fees_paid:,.2f}", fg=MUTED)
         stop, take, src = self.account_stops()
         trail = float(self.settings.get("trail_stop", 0) or 0)
         self.pf_stops.config(text=(f"Safety stop: {'off' if not stop else f'-{stop * 100:.1f}%'} (set by {src[0]})   |   "
@@ -4113,6 +4404,7 @@ class App:
         fee, slip = E.cost_model(dict(self.settings, order_type="market"))
         fill = px * (1 + slip)
         qty = usd * (1 - fee) / fill
+        self.fees_paid += usd * fee
         self.cash -= usd
         self.pos[c] = self.pos.get(c, 0) + qty
         self.cost[c] = self.cost.get(c, 0) + usd
@@ -4131,6 +4423,7 @@ class App:
         fee, slip = E.cost_model(dict(self.settings, order_type="market"))
         fill = px * (1 - slip)
         proceeds = qty * fill * (1 - fee)
+        self.fees_paid += qty * fill * fee
         basis = self.cost.get(c, 0) * (qty / held)
         self.cash += proceeds
         self.pos[c] = held - qty
@@ -4221,7 +4514,7 @@ class App:
             bob = round(2 * math.sin(ph / 2.2)) if working else 0
             y = y0 + bob
             mood = "happy" if st == "active" else "plain"
-            draw_dragon(c, x0, y, size, col, awake=working, phase=ph, mood=mood,
+            draw_creature(c, v.name, x0, y, size, col, awake=working, phase=ph, mood=mood,
                         fire=just_traded and v.log[-1][2] == "buy", flash=just_traded and ph % 2 == 0)
             if not working:
                 k = ph % 18
@@ -4398,9 +4691,9 @@ class App:
         m.add_separator()
         if not many:
             m.add_command(label="Details...", command=lambda: self.bot_detail(v))
-            m.add_command(label="Show on chart", command=lambda: (self.chart_bot.set(True), self.chart_view.set(
-                next((c for n, c, _, _ in reversed(v.log)), self.session_coins[0] if self.session_coins else "Account value")),
-                self.draw_chart()))
+            m.add_command(label="Show on chart", command=lambda: (self.board.selection_set(str(id(v))) if self.board.exists(str(id(v))) else None,
+                self.chart_bot.set(True), self.show_on_chart(
+                next((c for n, c, _, _ in reversed(v.log)), self.session_coins[0] if self.session_coins else "Account value"))))
         m.add_command(label="\u25c9 Save to Library" if not in_lib or many else "\u25c9 Update in Library",
                       command=lambda: self.catch_rows([r for r in self.tourn.board() if r["v"] in chosen], "right-click"))
         if in_hof and not many:
@@ -4590,7 +4883,7 @@ class App:
             c.create_text(x + 8, y + 13, anchor="w", fill="white", font=("", 10, "bold"),
                           text=("✨ " if b.get("shiny") else "") + b.get("nickname", "?"))
             c.create_text(x + cw - 8, y + 13, anchor="e", fill="white", font=("", 9, "bold"), text=f"Lv {b.get('level', 1)}")
-            draw_dragon(c, x + 8, y + 40, 42, rc, awake=True, phase=0, mood="happy", gold=bool(b.get("shiny")))
+            draw_creature(c, b["name"], x + 8, y + 40, 42, rc, awake=True, phase=0, mood="happy", gold=bool(b.get("shiny")))
             lt = b.get("lifetime") or {}
 
             def p(key):
@@ -4711,7 +5004,7 @@ class App:
         info_lbls = {}
         for i, key in enumerate(("Status", "Recent gain", "vs holding (recent)", "Lifetime return", "Lifetime vs holding",
                                  "Win rate", "Trades", "Worst drop", "Time winning", "Best market", "Own stops",
-                                 "Family", "Traits")):
+                                 "Family", "Traits", "Fees paid")):
             ttk.Label(stats, text=key, foreground=MUTED).grid(row=i // 3, column=(i % 3) * 2, sticky="w", padx=(0, 6), pady=2)
             l = ttk.Label(stats, text="-", font=("", 10, "bold"), wraplength=230)
             l.grid(row=i // 3, column=(i % 3) * 2 + 1, sticky="w", padx=(0, 22), pady=2)
@@ -4743,7 +5036,7 @@ class App:
                     "Time winning": f"{hrs:.1f} h" if hrs >= 1 else f"{hrs * 60:.0f} min",
                     "Best market": MOOD_TEXT.get(lf["best_mood"], "not sure yet") if lf["best_mood"] else "not sure yet",
                     "Own stops": E.risk_text(v.risk) or "none", "Family": f"#{v.uid}, {fam}, generation {v.gen}",
-                    "Traits": E.traits_text(v.traits) or "none yet"}
+                    "Traits": E.traits_text(v.traits) or "none yet", "Fees paid": f"${v.sim.fees:,.2f}"}
             for k, l in info_lbls.items():
                 l.config(text=vals[k])
             cv.delete("all")
@@ -4808,7 +5101,7 @@ class App:
         ttk.Button(b, text="Size +", command=lambda: size(0.25)).pack(side="left", padx=(4, 0))
         ttk.Button(b, text="Show on main chart", command=lambda: (
             self.board.selection_set(str(id(v))) if self.board.exists(str(id(v))) else None,
-            self.chart_view.set(coin.get() or "Account value"), self.chart_bot.set(True), self.draw_chart())).pack(side="left", padx=6)
+            self.chart_bot.set(True), self.show_on_chart(coin.get() or "Account value"))).pack(side="left", padx=6)
         ttk.Button(b, text="Close", command=w.destroy).pack(side="right")
 
         def tick():
@@ -5257,6 +5550,10 @@ class App:
                     var = tk.StringVar(value=BAR_LABELS.get(float(cur), "1 min"))
                     ttk.Combobox(f, textvariable=var, values=list(BAR_LABELS.values()), state="readonly", width=12).grid(
                         row=r, column=1, padx=(10, 0), sticky="w")
+                elif typ == "chars":
+                    var = tk.StringVar(value=cur if cur in ("Mixed", "Dragons only") else "Mixed")
+                    ttk.Combobox(f, textvariable=var, values=["Mixed", "Dragons only"], state="readonly", width=12).grid(
+                        row=r, column=1, padx=(10, 0), sticky="w")
                 elif typ == "anim":
                     var = tk.StringVar(value=cur if cur in ("Full", "Light", "Off") else "Full")
                     ttk.Combobox(f, textvariable=var, values=["Full", "Light", "Off"], state="readonly", width=8).grid(
@@ -5343,7 +5640,7 @@ class App:
                         new[k] = next(b for b, l in BAR_LABELS.items() if l == v)
                     elif typ == "order":
                         new[k] = next(o for o, l in ORDER_LABELS.items() if l == v)
-                    elif typ is str or typ == "anim":
+                    elif typ is str or typ in ("anim", "chars"):
                         new[k] = v.strip()
                     else:
                         new[k] = typ(float(v)) if typ is int else float(v)
@@ -5380,6 +5677,8 @@ class App:
             self.settings["notify_trades"], self.settings["chime"] = ntr.get(), snd.get()
             self.settings["chime_volume"] = int(vol.get())
             self.settings["sounds_off"] = [k for k, v in snd_vars.items() if not v.get()]
+            CHARACTER_MODE["mode"] = self.settings.get("characters", "Mixed")
+            self.grid_refresh()
             self.apply_awake()
             self.auto_coin_var.set(int(self.settings.get("auto_coins", 0)) > 0)
             match = [n for n, p in E.STYLES.items() if all(abs(self.settings[k] - v) < 1e-9 for k, v in p.items())]

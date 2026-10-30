@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.8.1
+- **Chart dashboard**: show 1, 2, 3, 4 (2x2) or 6 (3x2) charts at once ("Charts" menu above them). Each chart has its
+  own picker for what it shows and its own Line / Area / Candles style, and remembers it:
+  - Account value (vs just holding)
+  - Profit / loss % (account and holding)
+  - Drawdown (how far below your best point)
+  - Cash vs invested
+  - Selected bot (its equity and its trades)
+  - Any coin's price, with your trades and the selected bot's entries and exits
+  Time range, %, markers and grid are shared by all charts. Clicking a coin's name in the Portfolio or "Show on chart"
+  in a bot's menu puts it on a chart.
+- **Fee-aware trading** (on by default, Settings > Orders): bots and the account won't sell for a profit too small to
+  cover the round-trip fees. Losses, stops and Sell everything still sell. Bots were already scored after fees and
+  spread; this stops them churning out tiny "wins" that are really losses.
+- **Fees paid** on the Portfolio tab and on every bot's card.
+- **New characters, by strategy family**: dragons (trend followers), cats (pounce on dips), bunnies (jump on
+  breakouts), owls (dips in an uptrend) and turtles (slow and steady). Settings > Timing > Characters switches back
+  to dragons only.
+- **Candle timeframe** picker for the charts (Auto, 5 s up to 4 hr) and a 1-week range.
+- A line under the money tiles now shows how many practice trades the bots made versus your account's own trades,
+  so it's clear why Cash left / Total value only change when the account itself trades.
+
 ## 1.8.0
 - **The Bot Farm has four sections:**
   - ◒ **Eggs**: new bots still learning. Eggs wobble and crack as they get close to hatching.
