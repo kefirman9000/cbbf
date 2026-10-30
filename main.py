@@ -162,6 +162,10 @@ SETTING_GROUPS = [
         ("coin_prefs", "Favourite coins: skip coins it keeps losing on (re-checked in hindsight)", bool),
         ("post_review", "Post-trade review: losing trades teach which never-rules to try next", bool),
         ("multicore", "Learn on several processor cores at once at the start (faster warm-up)", bool),
+        (None, "Free roam (self-study)", "head"),
+        ("free_roam", "Free roam: while idle, the farm backtests its own bots on random stretches of history and runs "
+                      "small training camps, saving every lesson", bool),
+        ("free_roam_running", "...also while the bot is running (uses a bit more computer power)", bool),
     ]),
     ("Library & Hall of Fame", "The Bot Library keeps every bot you save, plus long-term winners the farm saves for you. "
                                "The Hall of Fame holds only the bots you promote yourself (right-click a bot).", [
@@ -684,6 +688,7 @@ class App:
         root.after(400, self.auto_login)
         root.after(700, self.maybe_welcome)
         root.after(4000, self.start_tg_remote)
+        root.after(20000, self.start_free_roam)
         root.after(1500, self.maybe_setup)
         root.after(4000, self.auto_check_update)
         root.after(1200, self.restore_last_session)
@@ -736,9 +741,16 @@ class App:
         self.tick_px = {}         # coin -> deque of (time, price) for the tick chart
         self.brake_note = 0.0
 
-    def save_state(self):
+    def save_state(self, force=True):
         if not self.session:
             return
+        if not force:
+            if time.time() - getattr(self, "_saved_at", 0) < 5:
+                if not getattr(self, "_save_pending", False):
+                    self._save_pending = True
+                    self.root.after(5000, lambda: (setattr(self, "_save_pending", False), self.save_state()))
+                return
+        self._saved_at = time.time()
         E.save_json(E.state_path(self.live), dict(
             start_cash=self.start_cash, cash=self.cash, pos=self.pos, cost=self.cost,
             trades=self.trades[-10000:], shadow=self.shadow_trades[-4000:], curve=self.curve[-8000:], bench_units=self.bench_units,
@@ -1220,6 +1232,8 @@ class App:
         m.add_command(label="Hall of Fame...", command=self.open_hof, accelerator="Ctrl+H")
         m.add_command(label="Bot family tree...", command=self.open_family)
         m.add_command(label="Weekly report now...", command=self.show_report)
+        m.add_command(label="Training camp (a whole farm through history)...", command=self.open_training)
+        m.add_command(label="Free roam (the farm learns from the past by itself)...", command=self.open_roam)
         m.add_command(label="Backtest a bot...", command=lambda: self.open_backtest(None))
         m.add_command(label="Backtest the Hall of Fame...", command=self.backtest_hof)
         m.add_command(label="Compare two bots...", command=lambda: self.compare_bots())
@@ -2705,6 +2719,23 @@ class App:
         if self.in_bg():
             self._bg_dirty = True
             return
+        try:
+            on_board = self.nb.tab(self.nb.select(), "text").strip() == "Strategy scoreboard"
+        except Exception:
+            on_board = True
+        if self.tourn and not on_board:
+            # hidden: only keep its list of bots in step (it also holds the farm's selection); details fill in when opened
+            have = set(self.board.get_children())
+            want = {str(id(v)) for v in self.tourn.vars}
+            gone = have - want
+            if gone:
+                self.board.delete(*gone)
+            for iid in want - have:
+                self.board.insert("", "end", iid=iid, values=())
+            self._board_dirty = True
+            self.empty_board.place_forget()
+            self.grid_refresh()
+            return
         sel = self.board.selection()
         self.board.delete(*self.board.get_children())
         if not self.tourn:
@@ -3404,7 +3435,7 @@ class App:
                 self.pending_who.pop(c, None)
                 self.pending_detail.pop(c, None)
                 self.pending_voters.pop(c, None)
-        self.save_state()
+        self.save_state(force=False)
         if self.bar_n % 60 == 0:
             self.weekly_report()
 
@@ -3527,6 +3558,8 @@ class App:
                  f"season: {MOOD_TEXT.get(t.season, t.season) if t.season else 'settling'}"]
         if best:
             parts.append(f"best of the hour: {E.bot_nickname(best.key())} {bv * 100:+.2f}%")
+        if getattr(self, "roam_n", 0):
+            parts.append(f"free roam: {self.roam_n} self-studies")
         if self.shadow_curve and self.settings.get("shadow_live", True):
             parts.append(f"Hall of Fame shadow: {(self.shadow_curve[-1][1] / self.start_cash - 1) * 100:+.1f}%")
         return "   •   ".join(parts)
@@ -3790,11 +3823,13 @@ class App:
         w = tk.Toplevel(self.root)
         w.title("Hall of Fame backtest")
         w.geometry("900x480")
+        bb = ttk.Frame(w, padding=8)
+        bb.pack(side="bottom", fill="x")
+        lbl = ttk.Label(w, text="Testing...", padding=8)
+        lbl.pack(side="bottom", fill="x")
         t = self.make_tree(w, ("name", "strategy", "ret", "edge", "parts", "dd", "trades", "fees2x"),
                            (150, 180, 80, 90, 80, 80, 60, 90),
                            ("Bot", "Strategy", "Return", "vs holding", "Parts won", "Worst drop", "Trades", "2x fees"))
-        lbl = ttk.Label(w, text="Testing...", padding=8)
-        lbl.pack(fill="x")
         closes = {c: list(self.hist[c]) for c in self.session_coins}
         extra = {c: {k: list(x) for k, x in self.hx[c].items()} for c in self.session_coins} if self.hx else None
         fee, slip = E.cost_model(self.settings)
@@ -3831,11 +3866,613 @@ class App:
                         E.remember_backtest(live, r, self.tourn)
             self.__dict__.pop("_file_cache", None)
             self.write(f"Saved {len(res)} Hall of Fame backtests to their memories.", "good")
-        bb = ttk.Frame(w, padding=8)
-        bb.pack(fill="x")
         ttk.Button(bb, text="Save all to their memories", style="Accent.TButton", command=save_all).pack(side="left")
         ttk.Button(bb, text="Close", command=w.destroy).pack(side="right")
         threading.Thread(target=work, daemon=True).start()
+
+    # ---------------- training camp ----------------
+    TC_LENGTHS = (("1 day", 1440), ("3 days", 4320), ("1 week", 10080), ("2 weeks", 20160), ("30 days", 43200),
+                  ("60 days", 86400), ("90 days", 129600), ("180 days", 259200))
+    TC_CANDLES = (("1 min", 60), ("5 min", 300), ("15 min", 900), ("1 hr", 3600), ("6 hr", 21600))
+    TC_MAX = 6000
+
+    def open_training(self):
+        if getattr(self, "tc_win", None) is not None and self.tc_win.winfo_exists():
+            return self.tc_win.lift()
+        w = self.tc_win = tk.Toplevel(self.root)
+        w.title("Training camp")
+        w.geometry(f"1000x{min(780, self.root.winfo_screenheight() - 80)}")
+        w.configure(bg=BG)
+        f = ttk.Frame(w, padding=12)
+        f.pack(fill="x")
+        ttk.Label(f, text="Training camp", font=("", 13, "bold")).grid(row=0, column=0, columnspan=6, sticky="w")
+        ttk.Label(f, foreground=MUTED, wraplength=940, justify="left", text=(
+            "A whole farm lives through a stretch of past prices, as many times as you like: hatching, competing, breeding "
+            "and learning the whole way (between passes the bots keep their genes and lessons, with fresh money). The most "
+            "recent part is held back as a final exam: the best bots are frozen and tested on prices they never saw. "
+            "Only the ones that beat just holding in training AND in the exam pass.")).grid(row=1, column=0, columnspan=6,
+                                                                                           sticky="w", pady=(2, 10))
+        c = self.cfg
+        length = tk.StringVar(value=c.get("tc_len", "2 weeks"))
+        candle = tk.StringVar(value=c.get("tc_candle", "15 min"))
+        passes = tk.StringVar(value=str(c.get("tc_passes", 2)))
+        size = tk.StringVar(value=str(c.get("tc_size", int(self.settings.get("max_bots", 30)))))
+        exam = tk.StringVar(value=c.get("tc_exam", "25%"))
+        start = tk.StringVar(value=c.get("tc_start", "Fresh eggs"))
+        for idx, (lab, var, vals, wd) in enumerate((
+                ("History", length, [x[0] for x in self.TC_LENGTHS], 9), ("Candles", candle, [x[0] for x in self.TC_CANDLES], 7),
+                ("Passes", passes, ["1", "2", "3", "4", "5"], 3), ("Farm size", size, ["20", "30", "40", "60", "80", "120"], 4),
+                ("Final exam", exam, ["None", "15%", "25%", "35%"], 6),
+                ("Start from", start, ["Fresh eggs", "My current farm", "Hall of Fame", "Library"], 15))):
+            r0, col = (2, idx) if idx < 3 else (4, idx - 3)
+            ttk.Label(f, text=lab).grid(row=r0, column=col, sticky="w", padx=(0, 14))
+            ttk.Combobox(f, textvariable=var, values=vals, state="readonly" if lab not in ("Farm size",) else "normal",
+                         width=wd).grid(row=r0 + 1, column=col, sticky="w", padx=(0, 14))
+        coins = list(self.session_coins or [k for k, x in self.coin_vars.items() if x.get()] or ["BTC", "ETH"])
+        note = ttk.Label(f, text="", foreground=MUTED)
+        note.grid(row=6, column=0, columnspan=6, sticky="w", pady=(6, 0))
+
+        def update_note(*_):
+            mins = dict(self.TC_LENGTHS)[length.get()]
+            gran = dict(self.TC_CANDLES)[candle.get()]
+            n = mins * 60 // gran
+            cap = f" (capped to the latest {self.TC_MAX:,} candles, about {self.TC_MAX * gran / 86400:.1f} days)" if n > self.TC_MAX else ""
+            note.config(text=f"Coins: {', '.join(coins)}   |   {min(n, self.TC_MAX):,} candles per coin{cap}   |   "
+                             f"about {min(n, self.TC_MAX) * int(passes.get() or 1):,} farm decisions in total")
+        for var in (length, candle, passes):
+            var.trace_add("write", update_note)
+        update_note()
+        row = ttk.Frame(f)
+        row.grid(row=7, column=0, columnspan=6, sticky="we", pady=(10, 0))
+        go = ttk.Button(row, text="⚔ Start training", style="Accent.TButton")
+        go.pack(side="left")
+        stop_b = ttk.Button(row, text="Stop", state="disabled")
+        stop_b.pack(side="left", padx=6)
+        bar = ttk.Progressbar(row, length=360, mode="determinate")
+        bar.pack(side="left", padx=10)
+        status = ttk.Label(row, text="", foreground=MUTED)
+        status.pack(side="left")
+        bb = ttk.Frame(w, padding=10)
+        bb.pack(side="bottom", fill="x")
+        tbox = tk.Frame(w, bg=BG)
+        tbox.pack(fill="both", expand=True, padx=12)
+        tree = self.make_tree(tbox, ("name", "strategy", "pace", "train", "exam", "trades", "wr", "passed"),
+                              (150, 190, 90, 110, 110, 60, 60, 80),
+                              ("Bot", "Strategy", "Decides", "Training vs hold", "Exam vs hold", "Trades", "Win rate", "Result"))
+        tree.configure(selectmode="extended")
+        tree.tag_configure("pass", foreground=GREEN)
+        tree.tag_configure("fail", foreground=MUTED)
+        b_bring = ttk.Button(bb, text="Bring passed bots to my farm", state="disabled")
+        b_teach = ttk.Button(bb, text="Teach my farm what it learned", state="disabled")
+        b_lib = ttk.Button(bb, text="Save passed bots to the Library", state="disabled")
+        for b in (b_bring, b_teach, b_lib):
+            b.pack(side="left", padx=(0, 6))
+        Tip(b_bring, "The bots that passed join your farm (as royal eggs, keeping what they learned) and compete on live prices. "
+                     "Select rows first to bring only those.")
+        Tip(b_teach, "Gives your farm the camp's memory: its elders (nudge future eggs), its post-trade review, its mutation "
+                     "memory and its season champions (woken up when their market mood comes back).")
+        Tip(b_lib, "Saves the passed bots to your Library, with their exam result in their memory.")
+        ttk.Button(bb, text="Close", command=w.destroy).pack(side="right")
+        st = dict(stop=False, res=None)
+
+        def run():
+            mins = dict(self.TC_LENGTHS)[length.get()]
+            gran = dict(self.TC_CANDLES)[candle.get()]
+            try:
+                n_pass = min(5, max(1, int(passes.get())))
+                cap = min(200, max(14, int(float(size.get()))))
+            except ValueError:
+                return messagebox.showerror("Training camp", "Farm size must be a number (14 to 200).", parent=w)
+            ex = {"None": 0.0, "15%": 0.15, "25%": 0.25, "35%": 0.35}[exam.get()]
+            self.cfg.update(tc_len=length.get(), tc_candle=candle.get(), tc_passes=n_pass, tc_size=cap, tc_exam=exam.get(),
+                            tc_start=start.get())
+            E.save_json(CONFIG_PATH, self.cfg)
+            seeds = []
+            if start.get() == "My current farm" and self.tourn:
+                seeds = [dict(E._genes(v), size=v.size_mult) for v in self.tourn.vars]
+            elif start.get() == "Hall of Fame":
+                seeds = [dict(b) for b in self.hof()]
+            elif start.get() == "Library":
+                seeds = [dict(b) for b in self.library()]
+            count = min(self.TC_MAX, max(300, mins * 60 // gran))
+            opts = E.tournament_opts(self.settings)
+            fee, slip = E.cost_model(self.settings)
+            pct, cash, quote = self.settings["trade_pct"] / 100, self.start_cash, self.quote
+            evolve, params = int(self.settings["evolve_every"]), self.settings["params"]
+            retire = int(float(self.settings["retire_hours"]) * 3600 / gran)
+            st["stop"] = False
+            go.config(state="disabled")
+            stop_b.config(state="normal")
+            for b in (b_bring, b_teach, b_lib):
+                b.config(state="disabled")
+            tree.delete(*tree.get_children())
+            status.config(text="Loading prices...")
+            bar.config(value=0)
+
+            def prog(done, total, text):
+                self.q.put(("call", lambda: (bar.config(value=100 * done / max(1, total)),
+                                             status.config(text=f"{done:,} of {total:,} decisions: {text}"))
+                            if w.winfo_exists() else None))
+
+            def work():
+                try:
+                    data = {}
+                    for i, c_ in enumerate(coins):
+                        self.q.put(("call", lambda i=i, c_=c_: status.config(text=f"Loading {c_} ({i + 1}/{len(coins)})...")
+                                    if w.winfo_exists() else None))
+                        data[c_] = E.fetch_ohlcv(c_, gran, count, quote)
+                    L = min(len(d["c"]) for d in data.values())
+                    closes = {c_: d["c"][-L:] for c_, d in data.items()}
+                    extra = {c_: {k: d[k][-L:] for k in ("h", "l", "v")} for c_, d in data.items()}
+                    res = E.train_farm(closes, extra, opts, cap=cap, passes=n_pass, exam_frac=ex, seed_genes=seeds,
+                                       start_cash=cash, fee=fee, pct=pct, evolve=evolve, params=params,
+                                       retire_steps=retire, progress=prog, stop=lambda: st["stop"])
+                    res["gran"] = gran
+                    self.q.put(("call", lambda: show(res)))
+                except E.TrainingStopped:
+                    self.q.put(("call", lambda: finish("Stopped.")))
+                except Exception as e:
+                    self.q.put(("call", lambda e=e: (finish(""), messagebox.showerror("Training camp", f"Couldn't finish: {e}", parent=w))
+                                if w.winfo_exists() else None))
+            threading.Thread(target=work, daemon=True).start()
+
+        def finish(text):
+            if not w.winfo_exists():
+                return
+            go.config(state="normal")
+            stop_b.config(state="disabled")
+            status.config(text=text)
+
+        def show(res):
+            if not w.winfo_exists():
+                return
+            st["res"] = res
+            bar.config(value=100)
+            t = res["tourn"]
+            passed = sum(1 for r in res["results"] if r["passed"])
+            gen = max((v.gen for v in t.vars), default=0)
+            finish(f"Done: {res['passes_done']} pass(es) over {res['train_bars']:,} candles, {gen} generations, "
+                   f"{len(t.lineage)} bots lived. " + (f"Exam on the last {res['exam_bars']:,} candles: {passed} passed "
+                                                     f"(holding did {res['exam_hold'] * 100:+.1f}%)." if res["exam_bars"] else ""))
+            for i, r in enumerate(res["results"]):
+                g = r["genes"]
+                tree.insert("", "end", iid=str(i), tags=("pass" if r["passed"] else "fail",), values=(
+                    E.bot_nickname(r["v"].key()), STRAT_LABELS.get(g["name"], g["name"]), E.fmt_bar(g["tf"] * res["gran"] / 60),
+                    pct_txt(r["train_edge"]), pct_txt(r["exam_edge"]), r["trades"],
+                    "-" if r["winrate"] is None else f"{r['winrate'] * 100:.0f}%",
+                    "✓ passed" if r["passed"] else ("no exam" if r["passed"] is None else "failed")))
+            for b in (b_bring, b_teach, b_lib):
+                b.config(state="normal")
+            self.write(f"⚔ Training camp finished: {passed} of {len(res['results'])} top bots passed the exam.", "good")
+
+        def chosen():
+            res = st["res"]
+            sel = [res["results"][int(i)] for i in tree.selection()]
+            return sel or [r for r in res["results"] if r["passed"] or (r["passed"] is None and (r["train_edge"] or 0) > 0)]
+
+        def bring():
+            if not self.tourn or not self.seeded:
+                return messagebox.showinfo("Training camp", "Start your farm first (Wildcard), then bring the bots over.", parent=w)
+            picks = chosen()
+            if not picks:
+                return messagebox.showinfo("Training camp", "No bots passed. Select rows to bring some anyway.", parent=w)
+            closes = {c_: self.hist[c_] for c_ in self.session_coins}
+            n = 0
+            for r in picks:
+                g = r["genes"]
+                v = self.tourn.add_variant(g["name"], g["params"], closes, 1.0, note="From the training camp:", tf=g["tf"],
+                                           origin="training camp", risk=g["risk"], traits=g["traits"], vetoes=g["vetoes"],
+                                           layers=g["layers"])
+                if v:
+                    v.royal = True
+                    v.layer_stats = {k: list(x) for k, x in r["layer_stats"].items()}
+                    v.veto_stats = {k: list(x) for k, x in r["veto_stats"].items() if k in v.vetoes}
+                    if r["exam_edge"] is not None:
+                        v.backtests.append(dict(date=datetime.now().strftime("%Y-%m-%d %H:%M"), bars=st["res"]["exam_bars"],
+                                                ret=round(r["exam_ret"] * 100, 2), edge=round(r["exam_edge"] * 100, 2),
+                                                maxdd=None, trades=r["trades"], winrate=None, segments_passed=int(bool(r["passed"])),
+                                                segments=1, fees2x=None, mc_dd95=None))
+                    n += 1
+            self.tourn.cap = max(self.tourn.cap, len(self.tourn.vars))
+            self.flush_events()
+            self.refresh_board()
+            self.write(f"⚔ {n} bots from the training camp joined your farm. They still have to prove themselves on live prices.", "good")
+
+        def teach():
+            if not self.tourn:
+                return messagebox.showinfo("Training camp", "Start your farm first (Wildcard).", parent=w)
+            E.teach_from(self.tourn, st["res"]["tourn"])
+            self.save_farm(force=True)
+            self.write("Your farm learned from the training camp: elders, post-trade review, mutation memory and season champions.", "good")
+
+        def save_lib():
+            picks = chosen()
+            if not picks:
+                return messagebox.showinfo("Training camp", "No bots passed. Select rows to save some anyway.", parent=w)
+            t = st["res"]["tourn"]
+            ids = {id(r["v"]) for r in picks}
+            rows = [dict(r, bar_minutes=st["res"]["gran"] / 60) for r in t.board() if id(r["v"]) in ids]
+            entries = E.export_bots(rows, self.version, note="training camp graduate")["bots"]
+            by_key = {r["v"].key(): r for r in picks}
+            for e in entries:
+                r = by_key.get(E.bot_key(e))
+                if r and r["exam_edge"] is not None:
+                    e["backtests"] = [dict(date=datetime.now().strftime("%Y-%m-%d %H:%M"), bars=st["res"]["exam_bars"],
+                                           ret=round(r["exam_ret"] * 100, 2), edge=round(r["exam_edge"] * 100, 2),
+                                           trades=r["trades"], segments_passed=int(bool(r["passed"])), segments=1)]
+            self.catch_rows(entries, "training camp")
+        go.config(command=run)
+        stop_b.config(command=lambda: (st.__setitem__("stop", True), status.config(text="Stopping...")))
+        b_bring.config(command=bring)
+        b_teach.config(command=teach)
+        b_lib.config(command=save_lib)
+
+    # ---------------- free roam (self-study) ----------------
+    ROAM_CANDLES = (300, 900, 3600, 21600)  # 5 min, 15 min, 1 hr, 6 hr: the farm picks one each study
+
+    def roam_path(self):
+        return os.path.join(E.HOME_DIR, "free-roam.json")
+
+    def start_free_roam(self):
+        """Free roam: the farm goes back in time on its own. With Free roam mode ON it studies back to back; otherwise
+        (Settings > Learning) it studies quietly now and then while idle. Each study either backtests some of its own
+        bots on a random stretch of history, or runs a small practice farm there; every lesson is saved."""
+        if getattr(self, "_roam_thread", None) and self._roam_thread.is_alive():
+            return
+        saved = E.load_json(self.roam_path(), {}) or {}
+        self.roam_log = list(saved.get("log") or [])[-300:]
+        self.roam_n = int(saved.get("n", len(self.roam_log)))
+        self.roam_now = None
+
+        def loop():
+            k = 0
+            while True:
+                time.sleep(2)
+                try:
+                    s_ = self.settings
+                    t = self.tourn
+                    mode = bool(self.cfg.get("roam_on"))
+                    if t is None or not self.session_coins:
+                        continue
+                    if not mode:
+                        if not s_.get("free_roam", True) or (self.running and not s_.get("free_roam_running", False)):
+                            continue
+                    wait = 3 if mode else (900 if self.running else 120)
+                    if time.time() - getattr(self, "_roam_last", 0) < wait:
+                        continue
+                    k += 1
+                    if k % 4 == 0:
+                        self._roam_camp(t)
+                    else:
+                        self._roam_check(t)
+                    self._roam_last = time.time()
+                except E.TrainingStopped:  # the farm changed (reset, new session): just move on
+                    self.roam_now = None
+                except Exception:
+                    self.roam_now = None
+                    self.q.put(("log", (self._record_error("free roam") or "Free roam hit a problem; it will try again.", "warn")))
+                    time.sleep(30)
+        self._roam_thread = threading.Thread(target=loop, daemon=True)
+        self._roam_thread.start()
+
+    def _roam_pick(self, rng, min_bars=400):
+        """The farm chooses where to learn: a candle size, then a stretch of history it has studied least."""
+        gran = rng.choice(self.ROAM_CANDLES)
+        coins = list(self.session_coins)
+        self.roam_now = dict(kind="choosing", text="Choosing where to learn next...", gran=gran, coins=coins, t0=time.time())
+        data = {c: E.fetch_ohlcv(c, gran, 3000, self.quote) for c in coins}
+        L = min(len(d["c"]) for d in data.values())
+        span = min(L, rng.randint(min_bars, max(min_bars, min(L, 1500))))
+        now = time.time()
+        covered = [(x["start"], x["end"]) for x in self.roam_log[-120:]]
+        best, best_score = 0, None
+        for _ in range(8):  # prefer stretches it hasn't studied yet
+            a = rng.randint(0, max(0, L - span))
+            st, en = now - (L - a) * gran, now - (L - a - span) * gran
+            overlap = sum(max(0, min(en, e) - max(st, s0)) for s0, e in covered)
+            if best_score is None or overlap < best_score:
+                best, best_score = a, overlap
+        a = best
+        closes = {c: d["c"][a:a + span] for c, d in data.items()}
+        extra = {c: {x: d[x][a:a + span] for x in ("h", "l", "v")} for c, d in data.items()}
+        start, end = now - (L - a) * gran, now - (L - a - span) * gran
+        hold = sum(closes[c][-1] / closes[c][0] for c in coins) / len(coins) - 1
+        moods = [E.market_mood(closes[c])[0] for c in coins]
+        known = [m for m in moods if m != "unknown"]
+        prev = [sum(closes[c][i] / closes[c][0] for c in coins) / len(coins) for i in range(0, span, max(1, span // 300))]
+        info = dict(gran=gran, coins=coins, start=start, end=end, bars=span, hold=hold, preview=prev,
+                    mood=max(set(known), key=known.count) if known else "unknown", oldest=now - L * gran)
+        return closes, extra, info
+
+    @staticmethod
+    def _when(ts):
+        return datetime.fromtimestamp(ts).strftime("%b %d %H:%M")
+
+    def _roam_finish(self, rec):
+        self.roam_log.append(rec)
+        del self.roam_log[:-300]
+        self.roam_n = getattr(self, "roam_n", 0) + 1
+        self.roam_now = None
+        try:
+            E.save_json(self.roam_path(), dict(n=self.roam_n, log=self.roam_log))
+        except OSError:
+            pass
+
+    def _roam_check(self, t):
+        """Self-backtest: the leader and a few others test themselves on the chosen stretch."""
+        import random as _r
+        rng = _r.Random()
+        vars_ = list(t.vars)
+        if not vars_:
+            return
+        picks = list(dict.fromkeys(([t.active[0]] if t.active else []) + rng.sample(vars_, min(3, len(vars_)))))
+        closes, extra, info = self._roam_pick(rng)
+        names = [E.bot_nickname(v.key()) for v in picks]
+        self.roam_now = dict(info, kind="Self-test", text=f"{len(picks)} bots are testing themselves", bots=names, done=0,
+                             total=len(picks), t0=time.time())
+        fee, slip = E.cost_model(self.settings)
+        out = []
+        for i, v in enumerate(picks):
+            if self.tourn is not t:
+                return
+            self.roam_now.update(done=i, text=f"{names[i]} is testing itself ({i + 1} of {len(picks)})")
+            out.append((v, E.backtest_bot(v, closes, extra, self.start_cash, fee, self.settings["trade_pct"] / 100, slip)))
+
+        def apply():
+            if self.tourn is not t:
+                return
+            res = []
+            for v, r in out:
+                if v in t.vars:
+                    E.remember_backtest(v, r, t)
+                res.append((E.bot_nickname(v.key()), round(r["edge"] * 100, 2), r["trades"]))
+            good = sum(1 for x in res if x[1] > 0)
+            rec = dict(time=time.time(), kind="Self-test", start=info["start"], end=info["end"], gran=info["gran"],
+                       bars=info["bars"], hold=round(info["hold"] * 100, 2), mood=info["mood"], results=res,
+                       summary=f"{good} of {len(res)} beat holding; lessons saved to their memories")
+            self._roam_finish(rec)
+            if not self.cfg.get("roam_on"):
+                self.write(f"◇ Free roam: {len(res)} bots tested themselves on {self._when(info['start'])} to "
+                           f"{self._when(info['end'])}; {good} beat holding. Lessons saved.")
+        self.q.put(("call", apply))
+
+    def _roam_camp(self, t):
+        """A practice farm (seeded with the farm's leaders) lives through the chosen stretch; your farm learns its
+        lessons and adopts its best graduate."""
+        import random as _r
+        rng = _r.Random()
+        closes, extra, info = self._roam_pick(rng, 700)
+        seeds = [E._genes(v) for v in (t.active[:4] or t.vars[:4])]
+        self.roam_now = dict(info, kind="Practice farm", text="A practice farm is living through this stretch",
+                             bots=[E.bot_nickname(v.key()) for v in (t.active[:4] or t.vars[:4])], done=0, total=1, t0=time.time())
+        fee, slip = E.cost_model(self.settings)
+
+        def prog(done, total, text):
+            if self.roam_now:
+                self.roam_now.update(done=done, total=total, text=f"Practice farm: {text}")
+        res = E.train_farm(closes, extra, E.tournament_opts(self.settings), cap=20, passes=1, exam_frac=0.25,
+                           seed_genes=seeds, start_cash=self.start_cash, fee=fee, pct=self.settings["trade_pct"] / 100,
+                           evolve=int(self.settings["evolve_every"]), params=self.settings["params"], progress=prog,
+                           stop=lambda: self.tourn is not t)
+
+        def apply():
+            if self.tourn is not t:
+                return
+            E.teach_from(t, res["tourn"])
+            passed = [r for r in res["results"] if r["passed"]]
+            grad = ""
+            if passed and self.seeded and len(t.vars) < t.cap + 2:
+                g = passed[0]["genes"]
+                v = t.add_variant(g["name"], g["params"], {c: self.hist[c] for c in self.session_coins}, 1.0,
+                                  note="Free roam graduate:", tf=g["tf"], origin="free roam", risk=g["risk"],
+                                  traits=g["traits"], vetoes=g["vetoes"], layers=g["layers"])
+                if v:
+                    v.layer_stats = {k: list(x) for k, x in passed[0]["layer_stats"].items()}
+                    grad = E.bot_nickname(v.key())
+                    self.refresh_board()
+            gen = max((v.gen for v in res["tourn"].vars), default=0)
+            rec = dict(time=time.time(), kind="Practice farm", start=info["start"], end=info["end"], gran=info["gran"],
+                       bars=info["bars"], hold=round(info["hold"] * 100, 2), mood=info["mood"],
+                       results=[(E.bot_nickname(r["v"].key()), round((r["exam_edge"] or 0) * 100, 2), r["trades"]) for r in passed[:5]],
+                       graduate=grad, summary=f"{gen} generations, {len(passed)} passed the exam"
+                                              + (f"; {grad} joined your farm" if grad else "") + "; farm memory updated")
+            self._roam_finish(rec)
+            if not self.cfg.get("roam_on"):
+                self.write(f"◇ Free roam: a practice farm lived through {self._when(info['start'])} to "
+                           f"{self._when(info['end'])}. {rec['summary']}.")
+        self.q.put(("call", apply))
+
+    def toggle_roam(self, on=None):
+        on = (not self.cfg.get("roam_on")) if on is None else on
+        self.cfg["roam_on"] = bool(on)
+        E.save_json(CONFIG_PATH, self.cfg)
+        self._roam_last = 0
+        self.write("◇ Free roam mode ON: the farm is going back in time to learn on its own." if on else
+                   "◇ Free roam mode OFF.", "good" if on else None)
+        if hasattr(self, "roam_btn"):
+            self.roam_btn.config(text="◇ Free roam: ON" if on else "◇ Free roam")
+        self.start_free_roam()
+
+    def open_roam(self):
+        """The Free roam screen: where in the past the farm is learning right now, what it has covered, and what it found."""
+        if getattr(self, "roam_win", None) is not None and self.roam_win.winfo_exists():
+            return self.roam_win.lift()
+        self.start_free_roam()
+        w = self.roam_win = tk.Toplevel(self.root)
+        w.title("Free roam")
+        w.geometry(f"1080x{min(860, self.root.winfo_screenheight() - 80)}")
+        w.configure(bg=BG)
+        top = tk.Frame(w, bg=BG, padx=12, pady=10)
+        top.pack(fill="x")
+        tk.Label(top, text="◇ Free roam", bg=BG, fg=TEXT, font=("", 15, "bold")).pack(side="left")
+        tog = tk.Button(top, relief="flat", bd=0, padx=16, pady=5, cursor="hand2", font=("", 10, "bold"), fg="white",
+                        activeforeground="white")
+        tog.pack(side="left", padx=14)
+        state_lbl = tk.Label(top, text="", bg=BG, fg=MUTED, font=("", 9), justify="left", anchor="w")
+        state_lbl.pack(side="left", fill="x", expand=True)
+        tog.config(command=lambda: (self.toggle_roam(), paint()))
+        tk.Label(w, bg=BG, fg=MUTED, wraplength=1040, justify="left", anchor="w", padx=12, text=(
+            "The farm goes back in time on its own. For every study it picks a candle size (5 min to 6 hours) and a stretch "
+            "of the past it has studied least, then either lets a few of its bots test themselves there, or sends a small "
+            "practice farm through it. Every lesson is saved: rule evidence and weak coins to each bot's memory, the "
+            "practice farm's elders, season champions and post-trade review to your farm, and its best graduate joins "
+            "your farm. Your account never trades in Free roam.")).pack(fill="x")
+        now_f = tk.Frame(w, bg=CARD, padx=12, pady=8, highlightthickness=1, highlightbackground=LINE)
+        now_f.pack(fill="x", padx=12, pady=(8, 0))
+        now_t = tk.Label(now_f, text="", bg=CARD, fg=TEXT, font=("", 11, "bold"), anchor="w", justify="left")
+        now_t.pack(fill="x")
+        now_d = tk.Label(now_f, text="", bg=CARD, fg=MUTED, anchor="w", justify="left", wraplength=1000)
+        now_d.pack(fill="x")
+        pbar = ttk.Progressbar(now_f, mode="determinate")
+        pbar.pack(fill="x", pady=(4, 0))
+        tk.Label(w, text="WHERE IT IS LEARNING  (the last few months; shaded = already studied, bright = right now)",
+                 bg=BG, fg=ACCENT, font=("", 8, "bold"), anchor="w", padx=12).pack(fill="x", pady=(10, 0))
+        tl = tk.Canvas(w, height=74, bg=CARD, highlightthickness=0)
+        tl.pack(fill="x", padx=12)
+        tk.Label(w, text="THE STRETCH BEING STUDIED  (average of your coins; grey line = where it started)",
+                 bg=BG, fg=ACCENT, font=("", 8, "bold"), anchor="w", padx=12).pack(fill="x", pady=(8, 0))
+        pc = tk.Canvas(w, height=130, bg=CARD, highlightthickness=0)
+        pc.pack(fill="x", padx=12)
+        stats = tk.Label(w, text="", bg=BG, fg=TEXT, anchor="w", justify="left", padx=12, font=("", 9))
+        stats.pack(fill="x", pady=(8, 0))
+        learn = tk.Label(w, text="", bg=BG, fg=MUTED, anchor="w", justify="left", padx=12, wraplength=1040, font=("", 9))
+        learn.pack(fill="x", pady=(2, 0))
+        tk.Label(w, text="STUDY LOG", bg=BG, fg=ACCENT, font=("", 8, "bold"), anchor="w", padx=12).pack(fill="x", pady=(8, 0))
+        box = tk.Frame(w, bg=BG)
+        box.pack(fill="both", expand=True, padx=12, pady=(0, 10))
+        log = self.make_tree(box, ("when", "kind", "stretch", "candles", "market", "result"), (100, 95, 220, 60, 190, 380),
+                             ("When", "Study", "Stretch of the past", "Candles", "Market then", "What it learned"))
+        st = dict(n=-1)
+
+        def paint():
+            if not w.winfo_exists():
+                return
+            on = bool(self.cfg.get("roam_on"))
+            tog.config(text="ON  —  click to stop" if on else "OFF  —  click to start", bg=GREEN if on else "#4b5563",
+                       activebackground=GREEN if on else "#4b5563")
+            if not self.tourn:
+                state_lbl.config(text="Start your farm once (Wildcard) so there are bots to study with; it can be paused "
+                                      "afterwards and Free roam keeps learning.")
+            elif on:
+                state_lbl.config(text="Free roam mode: studying back to back" + (" (alongside live prices)" if self.running else
+                                                                                 " (the farm is paused, so it has the computer to itself)"))
+            else:
+                state_lbl.config(text="Off. " + ("It still studies now and then while idle (Settings > Learning)."
+                                                 if self.settings.get("free_roam", True) else "Idle studies are off too."))
+            cur = self.roam_now
+            if cur and cur.get("start"):
+                now_t.config(text=f"{cur['kind']}: {self._when(cur['start'])}  →  {self._when(cur['end'])}   "
+                                  f"({(cur['end'] - cur['start']) / 86400:.1f} days, {E.fmt_bar(cur['gran'] / 60)} candles)")
+                now_d.config(text=f"{cur.get('text', '')}.   Coins: {', '.join(cur['coins'])}.   Market then: "
+                                  f"{MOOD_TEXT.get(cur['mood'], cur['mood'])}, just holding {cur['hold'] * 100:+.1f}%."
+                                  + (f"   Bots: {', '.join(cur.get('bots', [])[:6])}" if cur.get("bots") else "")
+                                  + f"   Running for {int(time.time() - cur['t0'])} s.")
+                pbar.config(value=100 * cur.get("done", 0) / max(1, cur.get("total", 1)))
+            elif cur:
+                now_t.config(text=cur.get("text", ""))
+                now_d.config(text="")
+                pbar.config(value=0)
+            else:
+                now_t.config(text="Resting between studies" if (on or self.settings.get("free_roam", True)) and self.tourn else "Not studying")
+                now_d.config(text="")
+                pbar.config(value=0)
+            draw_timeline(cur)
+            draw_price(cur)
+            L_ = self.roam_log
+            days = covered_days()
+            res = [x for r in L_ for x in r.get("results", [])]
+            best = max(res, key=lambda x: x[1]) if res else None
+            grads = [r["graduate"] for r in L_ if r.get("graduate")]
+            stats.config(text=(f"Studies: {getattr(self, 'roam_n', 0)}   |   past covered: {days:.1f} days   |   bot self-tests: "
+                               f"{sum(len(r.get('results', [])) for r in L_ if r['kind'] == 'Self-test')}   |   practice farms: "
+                               f"{sum(1 for r in L_ if r['kind'] == 'Practice farm')}   |   graduates adopted: {len(grads)}"
+                               + (f"   |   best find: {best[0]} {best[1]:+.1f}% vs holding" if best else "")))
+            t = self.tourn
+            if t:
+                rv = sorted(((k, x) for k, x in t.review.items() if k in E.VETOES), key=lambda kv: -kv[1][0])[:3]
+                ms = sorted(((k, x) for k, x in t.mut_stats.items() if x[0] >= 5), key=lambda kv: -(kv[1][1] / kv[1][0]))[:3]
+                moods = {}
+                for r in L_[-60:]:
+                    for _, e, _ in r.get("results", []):
+                        moods.setdefault(r.get("mood"), []).append(e)
+                mtxt = ", ".join(f"{MOOD_TEXT.get(m, m)} {sum(v) / len(v):+.1f}%" for m, v in moods.items() if m and v)
+                learn.config(text=(
+                    "What the farm is learning:  "
+                    + (f"never-rules that would have stopped the most losing buys: "
+                       + ", ".join(f"{E.VETOES[k]['name']} ({x[0]})" for k, x in rv) + ".  " if rv else "")
+                    + (f"Changes that make winners most often: " + ", ".join(f"{k} ({x[1] / x[0] * 100:.0f}%)" for k, x in ms) + ".  " if ms else "")
+                    + (f"Season champions known: {', '.join(MOOD_TEXT.get(m, m) for m in t.champions)}.  " if t.champions else "")
+                    + (f"Average result by market: {mtxt}." if mtxt else "")))
+            if len(L_) != st["n"]:
+                st["n"] = len(L_)
+                log.delete(*log.get_children())
+                for r in reversed(L_[-200:]):
+                    ex = r["summary"] + (": " + ", ".join(f"{n} {e:+.1f}%" for n, e, _ in r.get("results", [])[:4]) if r.get("results") else "")
+                    log.insert("", "end", values=(datetime.fromtimestamp(r["time"]).strftime("%b %d %H:%M"), r["kind"],
+                                                  f"{self._when(r['start'])} → {self._when(r['end'])}",
+                                                  E.fmt_bar(r["gran"] / 60), f"{MOOD_TEXT.get(r['mood'], r['mood'])} ({r['hold']:+.1f}%)", ex))
+            w.after(1000, paint)
+
+        def covered_days():
+            iv = sorted((r["start"], r["end"]) for r in self.roam_log)
+            tot, cs, ce = 0.0, None, None
+            for a, b in iv:
+                if ce is None or a > ce:
+                    if ce is not None:
+                        tot += ce - cs
+                    cs, ce = a, b
+                else:
+                    ce = max(ce, b)
+            if ce is not None:
+                tot += ce - cs
+            return tot / 86400
+
+        def draw_timeline(cur):
+            tl.delete("all")
+            W, H = tl.winfo_width(), tl.winfo_height()
+            now = time.time()
+            oldest = min([r["start"] for r in self.roam_log] + ([cur["oldest"]] if cur and cur.get("oldest") else []) + [now - 30 * 86400])
+            X = lambda ts: 10 + (ts - oldest) / max(1, now - oldest) * (W - 20)
+            tl.create_rectangle(10, 26, W - 10, 46, fill=BG, outline=LINE)
+            for r in self.roam_log:
+                tl.create_rectangle(X(r["start"]), 27, max(X(r["start"]) + 2, X(r["end"])), 45, fill="#1d4ed8" if DARK else "#93c5fd",
+                                    outline="", stipple="gray50")
+            if cur and cur.get("start"):
+                x0, x1 = X(cur["start"]), max(X(cur["start"]) + 3, X(cur["end"]))
+                tl.create_rectangle(x0, 22, x1, 50, fill="#f59e0b", outline="")
+                tl.create_text((x0 + x1) / 2, 12, text="studying now", fill="#f59e0b", font=("", 8, "bold"))
+            span = now - oldest
+            step = 86400 * (1 if span < 10 * 86400 else 7 if span < 120 * 86400 else 30)
+            ts = now
+            while ts > oldest:
+                x = X(ts)
+                tl.create_line(x, 46, x, 52, fill=MUTED)
+                tl.create_text(x, 62, text="now" if ts == now else datetime.fromtimestamp(ts).strftime("%b %d"), fill=MUTED, font=("", 7))
+                ts -= step
+
+        def draw_price(cur):
+            pc.delete("all")
+            W, H = pc.winfo_width(), pc.winfo_height()
+            if not cur or not cur.get("preview"):
+                pc.create_text(W // 2, H // 2, text="The stretch appears here while the farm studies it.", fill=MUTED)
+                return
+            pv = cur["preview"]
+            lo, hi = min(pv), max(pv)
+            pad = (hi - lo) * 0.1 or 0.01
+            lo, hi = lo - pad, hi + pad
+            X = lambda i: 50 + i * (W - 60) / max(1, len(pv) - 1)
+            Y = lambda y: H - 12 - (y - lo) / (hi - lo) * (H - 24)
+            pc.create_line(50, Y(1.0), W - 10, Y(1.0), fill=LINE, dash=(3, 3))
+            pc.create_line(*[z for i, y in enumerate(pv) for z in (X(i), Y(y))], fill=GREEN if pv[-1] >= 1 else RED, width=2)
+            for y in (lo + pad, hi - pad):
+                pc.create_text(46, Y(y), text=f"{(y - 1) * 100:+.1f}%", anchor="e", fill=MUTED, font=("", 7))
+            pc.create_text(52, 8, anchor="nw", text=self._when(cur["start"]), fill=MUTED, font=("", 7))
+            pc.create_text(W - 12, 8, anchor="ne", text=self._when(cur["end"]), fill=MUTED, font=("", 7))
+            if cur.get("total") and cur.get("kind") == "Practice farm":
+                x = X(int((len(pv) - 1) * min(1.0, cur.get("done", 0) / max(1, cur["total"]) / 0.75)))
+                pc.create_line(x, 4, x, H - 4, fill="#f59e0b", width=2)
+                pc.create_text(x + 4, H - 6, anchor="sw", text="the practice farm is here", fill="#f59e0b", font=("", 7, "bold"))
+        paint()
 
     # ---------------- compare ----------------
     def compare_bots(self, a=None, b=None):
@@ -5266,37 +5903,45 @@ class App:
             self.grid_chips[key] = l
         self.catch_btn = ttk.Button(top, text="Catch!", style="Accent.TButton", command=self.catch_selected)
         self.catch_btn.pack(side="right")
-        xb = ttk.Button(top, text="\u21e9 Export", style="Plain.TButton", command=self.export_bots)
-        xb.pack(side="right", padx=(0, 6))
-        Tip(xb, "Export bots to a file: the whole farm, a den, the Hall of Fame, the Library or the ones you selected.")
-        pb = ttk.Button(top, text="Preset \u25be", style="Plain.TButton")
+        # second row: actions on the left, view controls on the right
+        tools = tk.Frame(parent, bg=BG)
+        tools.pack(fill="x", padx=6, pady=(2, 2))
+        db = ttk.Button(tools, text="\u270e Design an egg", style="Plain.TButton", command=self.open_designer)
+        eb = ttk.Button(tools, text="+ Add eggs", style="Plain.TButton", command=self.add_eggs)
+        tb = ttk.Button(tools, text="\u2694 Train", style="Plain.TButton", command=self.open_training)
+        self.roam_btn = ttk.Button(tools, text="\u25c7 Free roam: ON" if self.cfg.get("roam_on") else "\u25c7 Free roam",
+                                   style="Plain.TButton", command=self.open_roam)
+        xb = ttk.Button(tools, text="\u21e9 Export", style="Plain.TButton", command=self.export_bots)
+        pb = ttk.Button(tools, text="Preset \u25be", style="Plain.TButton")
         pb.configure(command=lambda: self.preset_menu(pb))
-        pb.pack(side="right", padx=(0, 6))
-        Tip(pb, "Farm presets: Calm (few bots, patient), Balanced (default) or Wild (big, fast-evolving farm).")
-        eb = ttk.Button(top, text="+ Add eggs", style="Plain.TButton", command=self.add_eggs)
-        eb.pack(side="right", padx=(0, 6))
-        db = ttk.Button(top, text="Design an egg...", style="Plain.TButton", command=self.open_designer)
-        db.pack(side="right", padx=(0, 6))
+        for b in (db, eb, tb, self.roam_btn, xb, pb):
+            b.pack(side="left", padx=(0, 6))
         Tip(db, "Write your own bot: strategy, numbers (like RSI buy below 28 / sell above 72), pace, exits and habits. (Ctrl+E)")
         Tip(eb, "Hatch brand-new random bots now. They learn on recent prices and have to earn their place.")
+        Tip(tb, "Training camp: run a whole farm through days or months of past prices, several times over, then test "
+                "the best on recent prices they never saw. Bring the graduates to your farm or Library.")
+        Tip(self.roam_btn, "Free roam: switch it on and the farm goes back in time by itself, choosing its own stretches "
+                           "of the past and candle sizes to learn from. Opens a screen showing where it's learning.")
+        Tip(xb, "Export bots to a file: the whole farm, a den, the Hall of Fame, the Library or the ones you selected.")
+        Tip(pb, "Farm presets: Calm (few bots, patient), Balanced (default) or Wild (big, fast-evolving farm).")
         self.farm_size = tk.StringVar(value=str(int(self.settings.get("max_bots", 30))))
-        fs = ttk.Spinbox(top, from_=14, to=200, increment=2, width=5, textvariable=self.farm_size, command=self.set_farm_size)
-        fs.pack(side="right", padx=(0, 6))
+        fs = ttk.Spinbox(tools, from_=14, to=200, increment=2, width=5, textvariable=self.farm_size, command=self.set_farm_size)
+        fs.pack(side="right")
         fs.bind("<Return>", lambda e: self.set_farm_size())
         fs.bind("<FocusOut>", lambda e: self.set_farm_size())
-        tk.Label(top, text="Farm size", bg=BG, fg=MUTED, font=("", 8)).pack(side="right", padx=(0, 4))
+        tk.Label(tools, text="Farm size", bg=BG, fg=MUTED, font=("", 8)).pack(side="right", padx=(0, 4))
         Tip(fs, "Most bots on the farm at once (14 to 200). More bots explore more ideas but use more computer power; "
                 "the farm grows toward this number as it evolves, or press '+ Add eggs'.")
         self.farm_style = tk.StringVar(value=self.cfg.get("farm_style", "Dragons"))
-        vb = ttk.Combobox(top, textvariable=self.farm_style, values=["Dragons", "Simple cards", "List"], state="readonly", width=12)
-        vb.pack(side="right", padx=(0, 8))
+        vb = ttk.Combobox(tools, textvariable=self.farm_style, values=["Dragons", "Simple cards", "List"], state="readonly", width=12)
+        vb.pack(side="right", padx=(0, 10))
         vb.bind("<<ComboboxSelected>>", lambda e: self.set_farm_style())
-        tk.Label(top, text="View", bg=BG, fg=MUTED, font=("", 8)).pack(side="right", padx=(0, 4))
+        tk.Label(tools, text="View", bg=BG, fg=MUTED, font=("", 8)).pack(side="right", padx=(0, 4))
         self.motion_var = tk.StringVar(value=self.settings.get("animations", "Full"))
-        mb = ttk.Combobox(top, textvariable=self.motion_var, values=["Full", "Light", "Off"], state="readonly", width=5)
-        mb.pack(side="right", padx=(0, 8))
+        mb = ttk.Combobox(tools, textvariable=self.motion_var, values=["Full", "Light", "Off"], state="readonly", width=5)
+        mb.pack(side="right", padx=(0, 10))
         mb.bind("<<ComboboxSelected>>", lambda e: self._set_motion())
-        tk.Label(top, text="Motion", bg=BG, fg=MUTED, font=("", 8)).pack(side="right", padx=(0, 4))
+        tk.Label(tools, text="Motion", bg=BG, fg=MUTED, font=("", 8)).pack(side="right", padx=(0, 4))
         Tip(mb, "Full: smooth animation. Light: about 2 frames a second, uses very little computer power. Off: still pictures.")
         Tip(vb, "Dragons: animated cards. Simple cards: the same cards without animation. List: a plain table.")
         srow = tk.Frame(parent, bg=BG)
@@ -5319,7 +5964,7 @@ class App:
         self.grid_area.pack(fill="both", expand=True)
         self.grid = tk.Canvas(self.grid_area, bg=BG, highlightthickness=0)
         ys = ttk.Scrollbar(self.grid_area, orient="vertical", command=self.grid.yview)
-        self.grid.configure(yscrollcommand=ys.set)
+        self.grid.configure(yscrollcommand=lambda a, b: (ys.set(a, b), self._grid_scrolled()))
         self.grid_ys = ys
         ys.pack(side="right", fill="y")
         self.grid.pack(fill="both", expand=True, padx=(6, 0), pady=(2, 4))
@@ -5469,6 +6114,15 @@ class App:
         if keep:
             t.selection_set(keep)
         resort(t)
+
+    def _grid_scrolled(self):
+        """Scrolling the farm: draw the newly visible cards once you get near the edge of what's drawn."""
+        band = getattr(self, "_grid_drawn", None)
+        if not band:
+            return
+        top, bot = self.grid.canvasy(0), self.grid.canvasy(self.grid.winfo_height())
+        if top < band[0] + 60 or bot > band[1] - 60:
+            self.soon(self.grid_refresh, 30)
 
     def _grid_set_filter(self, n):
         self.grid_filter.set(n)
@@ -5661,9 +6315,13 @@ class App:
         hofk = self.hof_keys()
         sel = set(self.board.selection())
         gold = "#f59e0b"
+        vtop, vbot = c.canvasy(0), c.canvasy(max(c.winfo_height(), 300))
+        self._grid_drawn = (vtop - (ch + g) * 2, vbot + (ch + g) * 2)  # drawn band (cards outside it are skipped)
         for i, (kind, data, extra) in enumerate(items):
             x = g + (i % per) * (cw + g)
             y = g + (i // per) * (ch + g)
+            if y + ch < self._grid_drawn[0] or y > self._grid_drawn[1]:
+                continue  # off screen: drawn when you scroll to it
             if kind == "hof":
                 self._hof_card(c, x, y, cw, ch, data, extra)
                 self.grid_cards.append((x, y, x + cw, y + ch, extra["v"] if extra else None, "hof", "hof", data["name"]))
@@ -5841,7 +6499,7 @@ class App:
         promos = getattr(self, "promos", {})
         if promos:
             for x0, y0, x1, y1, v, st, t, strat in self.grid_cards:
-                if v is None or id(v) not in promos or y1 < top or y0 > bottom:
+                if v is None or id(v) not in promos or y1 < top or y0 > bottom or t == "hof":
                     continue
                 kind, start = promos[id(v)]
                 age = ph - start
@@ -5859,8 +6517,8 @@ class App:
                     self._promo_text(c, (x0 + x1) / 2, y0 + 14 - min(age, 10) * 0.6, "HATCHED!", "#22c55e")
                 else:  # roar: fiery rings burst out of the dragon
                     for k in range(3):
-                        r_ = (age - k * 4) * 5
-                        if r_ > 0:
+                        r_ = min(40, (age - k * 4) * 3)
+                        if 0 < r_ < 40:
                             c.create_oval(cx - r_, cy - r_, cx + r_, cy + r_, outline=("#f97316", "#dc2626", "#facc15")[k],
                                           width=3, tags="anim")
                     self._promo_text(c, (x0 + x1) / 2, y0 + 14, "ROAR!", "#f97316", 11 + min(age, 6))

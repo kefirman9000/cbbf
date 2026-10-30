@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.14.0
+**Training camp, Free roam, and a snappier app**
+
+- **Training camp** (Train button on the farm, or Tools): run a whole farm through 1 day to 180 days of history
+  (6,000 candles at most), 1 to 5 times over. Start from fresh eggs, your current farm, the Hall of Fame or the
+  Library. The most recent part is held back as a final exam on prices the bots never saw. Bring the graduates to your
+  farm, teach your farm what the camp learned, or save them to the Library.
+- **Free roam mode** (Free roam button): switch it on and the farm goes back in time by itself, choosing its own
+  candle sizes (5 min to 6 hours) and the stretches of the past it has studied least. Each study either lets a few of
+  its bots test themselves there, or sends a small practice farm through it. Every lesson is saved, and the best
+  practice-farm graduates join your farm. The Free roam screen shows the stretch being studied right now on a
+  timeline of the past, how much of the past has been covered, what the farm is learning, and a log of every study.
+  With the mode off, it can still study quietly while the farm is idle (Settings > Learning > Free roam).
+- **Snappier**:
+  - The farm only draws the cards you can see, and draws the rest as you scroll. With 120 bots the farm redraws in
+    under a third of the time it used to take with 60.
+  - The scoreboard table only fills in its details when you open it.
+  - The session saves at most every few seconds while running (trades still save at once).
+  - The farm buttons are now on two rows, so nothing gets cut off.
+- Promotion animations stay inside the dragon's own card.
+- New header graphic and screenshots on the project page.
+
 ## 1.13.1
 - Fixed: "KeyError" every minute (for example 'XRP') after the bot picked its own coins and you then continued a
   saved session. The saved session now keeps its own coins (scouting only happens for a brand-new session), and if

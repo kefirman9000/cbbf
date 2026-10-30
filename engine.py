@@ -675,6 +675,8 @@ DEFAULT_SETTINGS = {
     "trade_hours": "",           # account trades only in these hours, like "9-17" or "22-6" (empty = any time; stops always run)
     "weekdays_only": False,      # ...and only Monday to Friday
     "tg_remote": False,          # control CBBF from Telegram: /status /pause /resume /report /kill
+    "free_roam": True,           # when the farm is idle, it backtests its own bots and runs small training camps by itself
+    "free_roam_running": False,  # ...also while the bot runs (uses a little more computer power and network)
     "coin_prefs": True,          # bots learn which coins they're bad at and skip them (re-checked in hindsight)
     "confidence_sizing": True,   # bots buy bigger when many of their studies agree, smaller on a close vote
     "twin_test": True,           # winners are re-run on an older stretch of prices; lucky ones count for less
@@ -2752,6 +2754,115 @@ def remember_backtest(target, r, tourn=None):
             tourn.elders.append(dict(name=gg["name"], params=dict(gg["params"]), tf=gg.get("tf", 1), edge=r["edge"]))
             del tourn.elders[:-40]
     return rec
+
+
+class TrainingStopped(Exception):
+    pass
+
+
+def _genes(v):
+    return dict(name=v.name, params=dict(v.params), tf=v.tf, risk=dict(v.risk), traits=dict(v.traits),
+                vetoes=dict(v.vetoes), layers=json.loads(json.dumps(v.layers)))
+
+
+def _fresh_money(t):
+    """Training passes: every bot keeps its genes and what it learned (rule evidence, coin and mood records),
+    but starts the next pass with fresh money and a fresh scoreboard."""
+    for v in t.vars:
+        v.sim = Sim(t.start_cash, t.fee, t.pct, slip=t.o.get("slip", 0.0))
+        v.eq.clear()
+        v.hi, v.since, v.entries, v.sold_at, v.run_sig, v.sig = {}, {}, {}, {}, {}, {}
+        v.veto_wait, v.lost_at, v.entry_flags, v.conf_last = [], {}, {}, {}
+        v.log.clear()
+        v.born_px = None
+        v.age = v.ntrades = v.wins = v.losses = v.win_steps = v.streak = 0
+        v.peak, v.maxdd, v.strikes, v.live_n, v.live_eq0 = 0.0, 0.0, 0, 0, None
+        v.inducted = False
+    t.hold_curve = deque([1.0], maxlen=t.W * 10 + 2)
+    t.info, t.active, t.slowed = {}, [], []
+
+
+def train_farm(closes, extra, opts, cap=40, passes=2, exam_frac=0.25, seed_genes=None, start_cash=1000.0, fee=0.006,
+               pct=0.1, evolve=24, params=None, retire_steps=0, progress=None, stop=None, seed=None):
+    """Training camp: a whole farm lives through a stretch of history, `passes` times over, breeding and learning as it
+    goes (bots keep their genes and lessons between passes, with fresh money each time). The last exam_frac of the
+    history is held back: afterwards the best bots are frozen and sent through it as a final exam on prices they never
+    saw. Returns dict(tourn, results=[...best first], train_bars, exam_bars, passes_done).
+    progress(done, total, text) is called now and then; stop() returning True ends it early (TrainingStopped)."""
+    coins = list(closes)
+    L = min(len(closes[c]) for c in coins)
+    cut = int(L * (1 - exam_frac)) if exam_frac > 0 else L
+    if cut - WARM < 100:
+        raise ValueError("not enough history: pick a longer stretch or smaller candles")
+    train = {c: closes[c][:cut] for c in coins}
+    tx = {c: {k: x[:cut] for k, x in extra[c].items()} for c in coins} if extra else None
+    t = Tournament(coins, start_cash, fee, pct, evolve, params=params, opts=opts, cap=cap, retire_steps=retire_steps,
+                   rng=random.Random(seed))
+    for g in seed_genes or []:
+        if g.get("name") in STRATS:
+            t.add_variant(g["name"], g.get("params") or {}, None, g.get("size", 1.0), note="Training seed:", tf=g.get("tf", 1),
+                          origin="seeded", risk=g.get("risk"), traits=g.get("traits"), vetoes=g.get("vetoes"), layers=g.get("layers"))
+    while len(t.vars) > max(cap, len(seed_genes or [])):
+        drop = next((v for v in t.vars if v.origin != "seeded"), None)
+        if drop is None:
+            break
+        t._remove(drop, "made room for your bots")
+    total = passes * (cut - WARM)
+    done = 0
+    for p_ in range(passes):
+        if p_:
+            _fresh_money(t)
+        for i in range(WARM, cut):
+            t.step({c: View(train[c], i + 1) for c in coins}, slice_extra(tx, i + 1))
+            done += 1
+            if done % 100 == 0:
+                if stop and stop():
+                    raise TrainingStopped()
+                if progress:
+                    best = t.active[0] if t.active else None
+                    progress(done, total, f"pass {p_ + 1} of {passes}, generation {max((v.gen for v in t.vars), default=0)}, "
+                                          f"{len(t.vars)} bots" + (f", leading: {best.name}" if best else ""))
+    def rank_key(v):  # bots that actually traded first, then by how far they beat holding
+        lf = t.life(v)
+        return (lf["trades"] < 3, -(lf["edge"] if lf["edge"] is not None else lf["ret"]))
+    ranked = sorted(t.vars, key=rank_key)
+    results = []
+    exam_hold = (sum(closes[c][L - 1] / closes[c][cut - 1] for c in coins) / len(coins) - 1) if cut < L else None
+    seen, picked = set(), []
+    for v in ranked:  # identical twins count once
+        if v.key() not in seen:
+            seen.add(v.key())
+            picked.append(v)
+    for v in picked[:max(12, cap // 3)]:
+        lf = t.life(v)
+        r = dict(v=v, genes=_genes(v), train_ret=lf["ret"], train_edge=lf["edge"], trades=lf["trades"], winrate=lf["winrate"],
+                 exam_ret=None, exam_edge=None, passed=None, layer_stats={k: list(x) for k, x in v.layer_stats.items()},
+                 veto_stats={k: list(x) for k, x in v.veto_stats.items()})
+        if cut < L:
+            er = backtest_simple(r["genes"], closes, extra, cut, L, start_cash, fee, pct, t.o.get("slip", 0.0))
+            r.update(exam_ret=er, exam_edge=er - exam_hold,
+                     passed=er - exam_hold > 0 and (lf["edge"] or 0) > 0 and lf["trades"] >= 3)
+        results.append(r)
+        if stop and stop():
+            break
+    results.sort(key=lambda r: (not r["passed"], -(r["exam_edge"] if r["exam_edge"] is not None else r["train_edge"] or 0)))
+    return dict(tourn=t, results=results, train_bars=cut, exam_bars=L - cut, passes_done=passes, exam_hold=exam_hold)
+
+
+def teach_from(dst, src):
+    """Passes a trained farm's memory to another farm: elders, post-trade review, mutation memory and season champions."""
+    dst.elders = (dst.elders + [e for e in src.elders])[-40:]
+    for k, x in src.review.items():
+        d = dst.review.setdefault(k, [0, 0])
+        d[0] += x[0]
+        d[1] += x[1]
+    for k, x in src.mut_stats.items():
+        d = dst.mut_stats.setdefault(k, [0, 0])
+        d[0] += x[0]
+        d[1] += x[1]
+    for m, ch in src.champions.items():
+        if ch.get("fit", 0) > dst.champions.get(m, {}).get("fit", 0):
+            dst.champions[m] = dict(ch, uid=-1)  # not on this farm: woken up from its genes when its season comes
 
 
 def _warm_island(args):
