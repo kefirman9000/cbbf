@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.9.3
+- Live mode is now **blue** (Coinbase blue) and Practice stays **green**: switch, stripe, banner, border and Start
+  button follow the mode. Red is only used for Stop.
+
 ## 1.9.2
 - **Practice and Live are now clearly separate parts of the app.**
   - A big **PRACTICE / LIVE** switch at the top left replaces the small radio buttons.
