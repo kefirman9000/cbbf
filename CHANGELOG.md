@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.7.4
+- **CBBF has its own sounds**, so you can tell them apart from Windows: a soft blip for trades (only if
+  "...also every trade" is on), a two-note chime for notices, a little fanfare when a bot joins the Hall of Fame,
+  and a low double tone for problems. Volume slider and a play button to hear them in Settings (bottom). The
+  mute bell in the top bar silences everything.
+- **Turn individual sounds on or off** (trades, notices, Hall of Fame, problems), each with its own play button.
+- GitHub now builds a downloadable release zip automatically for every new version.
+
 ## 1.7.3
 - **Quieter**: no more Windows "ding" on every trade. Sound is now off unless you turn it on (Settings, bottom),
   routine trades no longer notify unless you tick "...also every trade", and there's a mute button (bell) in the
