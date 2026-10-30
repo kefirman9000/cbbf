@@ -501,9 +501,9 @@ def sig_trend_dip(p, n, a):
 
 STRATS = {
     "SMA crossover": dict(fn=sig_sma, params={"fast": 5, "slow": 20},
-                          bounds={"fast": (2, 30), "slow": (10, 100)}),
+                          bounds={"fast": (2, 60), "slow": (10, 200)}, keep=420),
     "RSI": dict(fn=sig_rsi, params={"period": 14, "lo": 30, "hi": 70},
-                bounds={"period": (5, 30), "lo": (15, 40), "hi": (60, 85)}),
+                bounds={"period": (2, 30), "lo": (5, 40), "hi": (60, 95)}),
     "Momentum": dict(fn=sig_mom, params={"n": 10, "thr": 0.5},
                      bounds={"n": (3, 40), "thr": (0.1, 3.0)}),
     "Bollinger bands": dict(fn=sig_boll, params={"n": 20, "k": 2.0},
@@ -535,6 +535,47 @@ STRATS = {
     "Dollar-cost averaging": dict(fn=sig_dca, params={"every": 24},
                                   bounds={"every": (6, 96)}),
 }
+
+
+# Famous strategies, some historically popular, some controversial. With Wildcard on they are mixed into the
+# eggs alongside random ones, hatch from silver eggs, and have to earn their place like everyone else.
+CLASSICS = [
+    dict(title="Golden cross", name="SMA crossover", params={"fast": 50, "slow": 200}, tf=1,
+         note="The famous 50/200 moving-average cross. Slow, trend-following, popular with long-term investors."),
+    dict(title="Turtle breakout", name="Breakout", params={"n": 20}, tf=1, risk={"sl": 2.0},
+         note="The 1980s Turtle Traders' rule: buy a 20-bar high, sell a 20-bar low, with a tight stop."),
+    dict(title="Wilder's RSI", name="RSI", params={"period": 14, "lo": 30, "hi": 70}, tf=1,
+         note="J. Welles Wilder's original 1978 settings: buy oversold under 30, sell overbought over 70."),
+    dict(title="Connors RSI-2", name="RSI", params={"period": 2, "lo": 10, "hi": 90}, tf=1,
+         note="Larry Connors' very short RSI: buy sharp pullbacks, sell quick bounces."),
+    dict(title="Classic MACD", name="MACD", params={"fast": 12, "slow": 26, "signal": 9}, tf=1,
+         note="Gerald Appel's standard 12/26/9 MACD signal-line cross."),
+    dict(title="Bollinger reversion", name="Bollinger bands", params={"n": 20, "k": 2.0}, tf=1,
+         note="John Bollinger's 20-bar, 2-standard-deviation bands, traded as a snap-back."),
+    dict(title="Day-trader EMA", name="EMA crossover", params={"fast": 9, "slow": 21, "min_gap": 0.0}, tf=1,
+         note="The 9/21 EMA cross loved by day traders."),
+    dict(title="Fibonacci ribbon", name="MA ribbon", params={"fast": 8, "mid": 13, "slow": 21}, tf=1,
+         note="Averages on Fibonacci numbers lined up as a trend ribbon."),
+    dict(title="Supertrend 10/3", name="Supertrend", params={"n": 10, "m": 3.0}, tf=1,
+         note="The default Supertrend found on most charting sites."),
+    dict(title="Ichimoku 9/26", name="Ichimoku cross", params={"fast": 9, "slow": 26}, tf=1,
+         note="Goichi Hosoda's conversion / base line cross."),
+    dict(title="Stochastic 14", name="Stochastic", params={"n": 14, "lo": 20, "hi": 80}, tf=1,
+         note="George Lane's stochastic with the usual 20 / 80 levels."),
+    dict(title="Buy the 5% dip", name="Mean reversion", params={"n": 50, "thr": 5.0}, tf=3,
+         note="Buy when the price is 5% under its average, sell 5% over."),
+    dict(title="Time-series momentum", name="Momentum", params={"n": 40, "thr": 1.0}, tf=10,
+         note="Hold what has been rising, drop what has been falling (a staple of trend funds)."),
+    dict(title="Average down", name="Mean reversion", params={"n": 30, "thr": 2.0}, tf=1, traits={"entries": 5, "exit": 1},
+         risk={"tp": 4.0}, controversial=True,
+         note="CONTROVERSIAL: keeps buying more as the price falls (martingale-style) with no stop, sells only at a "
+              "profit target. Wins often, but one long slide can be painful."),
+    dict(title="Pump chaser", name="Volume breakout", params={"n": 10, "vmult": 3.0}, tf=1, traits={"maxhold": 20},
+         controversial=True, note="CONTROVERSIAL: jumps on sudden volume spikes and gets out fast. Often buys the top."),
+    dict(title="Diamond hands", name="Trend + dip", params={"trend": 100, "period": 14, "lo": 35, "hi": 85}, tf=10,
+         traits={"exit": 1}, risk={"tp": 15.0}, controversial=True,
+         note="CONTROVERSIAL: buys dips in an uptrend and never sells at a loss, only at +15%."),
+]
 
 
 def fix_params(name, p):
@@ -588,6 +629,8 @@ DEFAULT_SETTINGS = {
     "team_locked": True,         # trading with your team: keep exactly those bots (False = they may breed new ones)
     # Orders and costs
     "bot_stops": True,           # Wildcard: the account's safety stop / lock-in-profit follow what the winning bots learned
+    "classics": True,            # mix famous strategies (golden cross, turtle, RSI-2...) into the eggs
+    "classic_rate": 25,          # % of new eggs that are a famous strategy (when one isn't on the farm yet)
     "prove_live": True,          # a bot can only be Winning after it also made money on prices it hadn't seen yet
     "risk_adjusted": True,       # rank winners by gain per unit of downside swing, not raw gain
     "long_holds": True,          # include slow, longer-holding bots from the start
@@ -730,6 +773,7 @@ def tournament_opts(settings):
                 regime_aware=bool(settings.get("regime_aware", True)),
                 slip=slip, fee_aware=bool(settings.get("fee_aware", True)),
                 prove_live=bool(settings.get("prove_live", True)), risk_adjusted=bool(settings.get("risk_adjusted", True)),
+                classics=bool(settings.get("classics", True)), classic_rate=float(settings.get("classic_rate", 25)) / 100,
                 long_holds=bool(settings.get("long_holds", True)))
 
 
@@ -889,6 +933,7 @@ class Variant:
         self.inducted = False
         self.origin = ""
         self.royal = False       # descends from a bot you saved (Library / Hall of Fame / team): hatches from a royal egg
+        self.classic = ""        # name of the famous strategy it is (silver egg), or "" 
         self.live_n = 0          # decisions made on prices that came in after the bot was created
         self.live_eq0 = None     # its equity when it started trading live (after any replay)
         self.log = deque(maxlen=300)  # (decision number, coin, side, price) of this bot's own trades, for charts
@@ -936,7 +981,7 @@ class Tournament:
         self.retire_steps = max(0, int(retire_steps))  # decisions a bot may go without winning before it is replaced
         self.o = dict(trade_more=True, winner_boost=2.5, add_every=3, slow_every=6, fail_drop=3.0,
                       beat_hold=True, crossbreed=True, regime_aware=True, slip=0.0, fee_aware=True,
-                      prove_live=True, risk_adjusted=True, long_holds=True)
+                      prove_live=True, risk_adjusted=True, long_holds=True, classics=True, classic_rate=0.25)
         self.replaying = False
         self.o.update(opts or {})
         self.slowed, self.cool, self.add_cool, self.kind = [], {}, {}, {}
@@ -953,6 +998,11 @@ class Tournament:
         self.lineage = {}       # uid -> family-tree record (kept after a bot is removed)
         self.vars = []
         self.info, self.active = {}, []
+        if self.o.get("classics", True):  # a few famous strategies join the starters
+            for cl in self.rng.sample(CLASSICS, min(4, len(CLASSICS))):
+                v = self._new(cl["name"], dict(cl["params"]), cl.get("tf", 1), cl.get("risk"), cl.get("traits"))
+                v.classic = cl["title"]
+                self.vars.append(v)
         for name in WILDCARD_STRATS:
             p = dict((params or {}).get(name) or STRATS[name]["params"])
             self.vars.append(self._new(name, p))
@@ -965,7 +1015,7 @@ class Tournament:
                                        risk=self.rand_risk(), traits=self.rand_traits()))
         del self.vars[max(self.cap, 14):]
         for v in self.vars:
-            self._register(v, [], "starter")
+            self._register(v, [], "classic" if v.classic else "starter")
 
     def window_for(self, tf):
         """How many bars a bot is judged over: slow bots get a longer window so they make enough decisions in it."""
@@ -1315,7 +1365,8 @@ class Tournament:
                      failing=d.get("failing", False), driving=d["status"] == "active", v=v, size=v.size_mult,
                      edge=d.get("edge"), behind=d.get("behind", False), proving=d.get("proving", False),
                      life=self.life(v), origin=v.origin,
-                     risk=dict(v.risk), traits=dict(v.traits), uid=v.uid, parents=list(v.parents), gen=v.gen)
+                     risk=dict(v.risk), traits=dict(v.traits), uid=v.uid, parents=list(v.parents), gen=v.gen,
+                     classic=v.classic)
                 for v, d in rows]
 
     def mutate(self, name, params, scale=0.25):
@@ -1495,8 +1546,22 @@ class Tournament:
         self._rate()
         return child
 
+    def spawn_classic(self, closes=None):
+        """Hatches one famous strategy that isn't on the farm yet (silver egg). None if all are already here."""
+        have = {v.classic for v in self.vars}
+        pool = [c for c in CLASSICS if c["title"] not in have]
+        if not pool:
+            return None
+        cl = self.rng.choice(pool)
+        v = self.add_variant(cl["name"], dict(cl["params"]), closes, note=f"Classic strategy hatched: {cl['title']}:",
+                             tf=cl.get("tf", 1), origin="classic", risk=cl.get("risk"), traits=cl.get("traits"))
+        if v:
+            v.classic = cl["title"]
+        return v
+
     def spawn_random(self, closes=None):
-        """A brand new strategy with random settings. Makes room by dropping the weakest duplicate."""
+        """A brand new strategy with random settings, or now and then a famous one. Makes room by dropping the
+        weakest duplicate."""
         name = self.rng.choice(WILDCARD_STRATS)
         p = self._rand_params(name)
         if len(self.vars) >= self.cap:
@@ -1507,6 +1572,10 @@ class Tournament:
                 self.events.append(f"Dropped {cands[0].label}")
             else:
                 return None
+        if self.o.get("classics", True) and self.rng.random() < float(self.o.get("classic_rate", 0.25)):
+            v = self.spawn_classic(closes)
+            if v:
+                return v
         return self.add_variant(name, p, closes, note="Random new strategy:", tf=self.rng.choice(TIMEFRAMES),
                                 origin="random", risk=self.rand_risk(), traits=self.rand_traits(0.35))
 

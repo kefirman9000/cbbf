@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.9.4
+- **Famous strategies join the farm** (Wildcard): golden cross (50/200), Turtle breakout, Wilder's RSI 30/70,
+  Connors RSI-2, MACD 12/26/9, Bollinger 20/2, the 9/21 EMA, a Fibonacci ribbon, Supertrend 10/3, Ichimoku 9/26,
+  Stochastic 14, "buy the 5% dip" and time-series momentum, plus three controversial ones marked \u26a0: averaging
+  down (martingale-style), pump chasing and "diamond hands". A few start on the farm, and about a quarter of new
+  eggs are a famous strategy that isn't there yet, mixed in with the random ones. They hatch from **silver eggs**
+  (\u272a), show "Classic: ..." on their cards and their story on their detail card, compete like everyone else,
+  and can be bred. Settings > Wildcard switches them off or changes how often they appear.
+- Moving-average and RSI settings can now go further (averages up to 200 bars, RSI down to 2) so the classics fit.
+
 ## 1.9.3
 - Live mode is now **blue** (Coinbase blue) and Practice stays **green**: switch, stripe, banner, border and Start
   button follow the mode. Red is only used for Stop.
