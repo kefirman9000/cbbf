@@ -132,6 +132,8 @@ SETTING_GROUPS = [
         ("max_bots", "Farm size: most bots competing at once (14 to 200)", int),
         ("retire_hours", "Replace a strategy that hasn't been winning for this many hours (0 = never)", float),
         ("crossbreed", "New strategies can mix the settings of two winners (crossbreeding)", bool),
+        ("layers", "Studies: bots can evolve several positive studies (other strategies that must agree before buying), "
+                   "several negative studies (a sell from any counts against buying), exit studies and a sizing rule", bool),
         ("vetoes", "Never-rules: bots can evolve things they refuse to do (no falling knives, no chasing, no panic selling...). "
                    "Each rule is graded by what the blocked trade would have done; good rules spread, bad ones die out", bool),
         ("classics", "Mix famous strategies into the eggs (golden cross, turtle breakout, RSI-2, MACD 12/26/9... plus a few "
@@ -1405,7 +1407,7 @@ class App:
                     self.write(f"Skipped {friendly_label(d['name'], d['params'])}: you already have it.", "warn")
                     continue
                 if self.tourn.add_variant(d["name"], d["params"], closes, d["size"], note="Imported", tf=d.get("tf", 1),
-                                          risk=d.get("risk"), traits=d.get("traits"), vetoes=d.get("vetoes"), origin="imported") is None:
+                                          risk=d.get("risk"), traits=d.get("traits"), vetoes=d.get("vetoes"), layers=d.get("layers"), origin="imported") is None:
                     continue
                 added += 1
                 s = d.get("stats") or {}
@@ -1428,7 +1430,7 @@ class App:
         closes = {c: self.hist[c] for c in self.session_coins}
         for d in saved:
             self.tourn.add_variant(d["name"], d["params"], closes, d.get("size", 1.0), note="Loaded saved", tf=d.get("tf", 1),
-                                   risk=d.get("risk"), traits=d.get("traits"), vetoes=d.get("vetoes"), origin="saved")
+                                   risk=d.get("risk"), traits=d.get("traits"), vetoes=d.get("vetoes"), layers=d.get("layers"), origin="saved")
         self.flush_events()
         self.refresh_board()
 
@@ -2775,7 +2777,7 @@ class App:
                 for b in squad:
                     tourn.add_variant(b["name"], b["params"], hist, b.get("size", 1.0),
                                       note=f"{'Team' if roster == 'team' else 'Hall of Fame'}: {b.get('nickname') or E.bot_nickname(E.bot_key(b))}",
-                                      tf=b.get("tf", 1), risk=b.get("risk"), traits=b.get("traits"), vetoes=b.get("vetoes"), origin="team")
+                                      tf=b.get("tf", 1), risk=b.get("risk"), traits=b.get("traits"), vetoes=b.get("vetoes"), layers=b.get("layers"), origin="team")
                 locked = roster == "hof" or self.settings.get("team_locked", True)
                 if locked:
                     tourn.retire_steps, tourn.evolve_every = 0, 10 ** 9
@@ -2785,7 +2787,7 @@ class App:
             saved = [] if squad else E.load_strategies()
             for d in saved:
                 tourn.add_variant(d["name"], d["params"], hist, d.get("size", 1.0), note="Loaded saved", tf=d.get("tf", 1),
-                                  risk=d.get("risk"), traits=d.get("traits"), vetoes=d.get("vetoes"), origin="saved")
+                                  risk=d.get("risk"), traits=d.get("traits"), vetoes=d.get("vetoes"), layers=d.get("layers"), origin="saved")
             if saved:
                 self.q.put(("log", f"Loaded {len(saved)} saved strategies into the tournament."))
             if self.settings.get("hof_load", True) and not squad:
@@ -2793,7 +2795,7 @@ class App:
                 hof = [b for b in E.load_hof() if E.bot_key(b) not in have][:10]
                 for b in hof:
                     v = tourn.add_variant(b["name"], b["params"], hist, b.get("size", 1.0), note="Hall of Fame:",
-                                          tf=b.get("tf", 1), risk=b.get("risk"), traits=b.get("traits"), vetoes=b.get("vetoes"), origin="hall of fame")
+                                          tf=b.get("tf", 1), risk=b.get("risk"), traits=b.get("traits"), vetoes=b.get("vetoes"), layers=b.get("layers"), origin="hall of fame")
                     if v:
                         v.inducted = True
                 if hof:
@@ -4259,6 +4261,12 @@ class App:
                      (f"{lf['trades']} trades", MUTED)]
             if t == "beast":
                 chips.insert(0, (f"{r['stake']:.1f}x size", gold))
+            if r.get("layers"):
+                L_ = r["layers"]
+                bits = [f"+{1 + len(L_.get('plus', []))}" if L_.get("plus") else "", f"-{len(L_['minus'])}" if L_.get("minus") else "",
+                        f"x{len(L_['exits'])}" if L_.get("exits") else ""]
+                if any(bits):
+                    chips.append(("studies " + " ".join(b for b in bits if b), "#a78bfa"))
             if r.get("vetoes"):
                 good = sum(1 for k, s in (r.get("veto_stats") or {}).items() if s[0] >= 3 and s[1] > 0)
                 chips.append((f"{len(r['vetoes'])} never-rule{'s' if len(r['vetoes']) != 1 else ''}"
@@ -4404,8 +4412,10 @@ class App:
         (a royal egg) and/or save it to the Library."""
         w = tk.Toplevel(self.root)
         w.title("Design an egg")
-        w.resizable(False, False)
-        f = ttk.Frame(w, padding=14)
+        w.geometry(f"900x{min(820, self.root.winfo_screenheight() - 120)}")
+        sf = ScrollFrame(w, BG, width=880)  # tall form: it scrolls on small screens
+        sf.pack(fill="both", expand=True)
+        f = ttk.Frame(sf.inner, padding=14)
         f.pack()
         ttk.Label(f, text="Design an egg", font=("", 13, "bold")).grid(row=0, column=0, columnspan=4, sticky="w")
         ttk.Label(f, foreground=MUTED, wraplength=560, text=(
@@ -4482,6 +4492,41 @@ class App:
             ttk.Checkbutton(mrow, text=m, variable=var).pack(side="left", padx=(6, 0))
             mood_vars.append(var)
         row += 1
+        lbox = ttk.LabelFrame(f, text=" Studies: several reasons to buy, several reasons not to (optional) ", padding=8)
+        lbox.grid(row=row, column=0, columnspan=4, sticky="ew", pady=(10, 0))
+        row += 1
+        gl = E.clean_layers((preset or {}).get("layers") or {})
+        fams = [STRAT_LABELS.get(n, n) for n in E.WILDCARD_STRATS]
+        to_name = {STRAT_LABELS.get(n, n): n for n in E.WILDCARD_STRATS}
+        lists = {}
+        for col, (key, title, cap) in enumerate((("plus", "Positive studies (also say buy)", E.MAX_PLUS),
+                                                 ("minus", "Negative studies (a sell counts against)", E.MAX_MINUS),
+                                                 ("exits", "Exit studies (any sell = sell)", E.MAX_EXITS))):
+            ttk.Label(lbox, text=f"{title}, up to {cap}").grid(row=0, column=col, sticky="w", padx=(0, 10))
+            lb = tk.Listbox(lbox, selectmode="multiple", height=7, exportselection=False, width=26,
+                            bg=CARD, fg=TEXT, selectbackground=ACCENT, highlightthickness=0)
+            for fam in fams:
+                lb.insert("end", fam)
+            for sub in gl.get(key, []):
+                lbl = STRAT_LABELS.get(sub["name"], sub["name"])
+                if lbl in fams:
+                    lb.selection_set(fams.index(lbl))
+            lb.grid(row=1, column=col, sticky="w", padx=(0, 10))
+            lists[key] = (lb, cap)
+        need_v = tk.StringVar(value=str(gl.get("need", 1)))
+        nrow = ttk.Frame(lbox)
+        nrow.grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Label(nrow, text="Buy when at least").pack(side="left")
+        ttk.Spinbox(nrow, from_=1, to=1 + E.MAX_PLUS, width=3, textvariable=need_v).pack(side="left", padx=4)
+        ttk.Label(nrow, text="positive studies (the main strategy counts as one) say buy, minus one for each negative "
+                             "study saying sell.", foreground=MUTED).pack(side="left")
+        size_on = tk.BooleanVar(value=bool(gl.get("size")))
+        size_t = tk.StringVar(value=str((gl.get("size") or {}).get("target", 0.5)))
+        srow = ttk.Frame(lbox)
+        srow.grid(row=3, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        ttk.Checkbutton(srow, text="Size trades to the market's swing, aiming for this % move per decision:",
+                        variable=size_on).pack(side="left")
+        ttk.Entry(srow, textvariable=size_t, width=6).pack(side="left", padx=4)
         nbox = ttk.LabelFrame(f, text=f" Never-rules (up to {E.MAX_VETOES}), tick to use ", padding=8)
         nbox.grid(row=row, column=0, columnspan=4, sticky="ew", pady=(10, 0))
         given_v = (preset or {}).get("vetoes") or {}
@@ -4527,9 +4572,21 @@ class App:
                 vetoes = {k: float(val.get()) for k, (on, val) in vvars.items() if on.get()}
                 if len(vetoes) > E.MAX_VETOES:
                     raise ValueError(f"pick at most {E.MAX_VETOES} never-rules")
+                layers = {}
+                for key, (lb, cap) in lists.items():
+                    picks = [to_name[lb.get(i_)] for i_ in lb.curselection()]
+                    if len(picks) > cap:
+                        raise ValueError(f"pick at most {cap} {'positive' if key == 'plus' else 'negative' if key == 'minus' else 'exit'} studies")
+                    if picks:
+                        layers[key] = [dict(name=pn, params=dict(E.STRATS[pn]["params"])) for pn in picks]
+                if layers.get("plus") or layers.get("minus"):
+                    layers["need"] = int(float(need_v.get() or 1))
+                if size_on.get():
+                    layers["size"] = dict(target=float(size_t.get()))
                 entry = dict(name=n, params=params, tf=paces[pace.get()], size=min(max(float(size.get() or 1), 0.25), 3.0),
                              risk=E.clean_risk({"sl": float(sl.get() or 0), "tp": float(tp.get() or 0)}),
-                             traits=E.clean_traits(traits), vetoes=E.clean_vetoes(vetoes), stats={}, notes="designed by you")
+                             traits=E.clean_traits(traits), vetoes=E.clean_vetoes(vetoes), layers=E.clean_layers(layers),
+                             stats={}, notes="designed by you")
                 return entry
             except ValueError as ex:
                 messagebox.showerror("Design an egg", f"Please check the numbers: {ex}", parent=w)
@@ -4545,6 +4602,7 @@ class App:
                                                                 "'Save to Library' to keep it for later.", parent=w)
                 v = self.tourn.add_variant(entry["name"], entry["params"], {c: self.hist[c] for c in self.session_coins},
                                            entry["size"], note="Designed egg:", tf=entry["tf"], risk=entry["risk"], vetoes=entry["vetoes"],
+                                           layers=entry["layers"],
                                            traits=entry["traits"], origin="designed")
                 if v:
                     if len(self.tourn.vars) > self.tourn.cap:
@@ -5528,7 +5586,7 @@ class App:
         for b in entries:
             if E.bot_key(b) not in have and self.tourn.add_variant(
                     b["name"], b["params"], closes, b.get("size", 1.0), note="Added:", tf=b.get("tf", 1), risk=b.get("risk"),
-                    traits=b.get("traits"), vetoes=b.get("vetoes"), origin="library"):
+                    traits=b.get("traits"), vetoes=b.get("vetoes"), layers=b.get("layers"), origin="library"):
                 n += 1
         self.flush_events()
         self.refresh_board()
@@ -5730,7 +5788,7 @@ class App:
             if E.bot_key(b) in have:
                 continue
             if self.tourn.add_variant(b["name"], b["params"], closes, b.get("size", 1.0), note=f"{b.get('nickname')} joined:",
-                                      tf=b.get("tf", 1), risk=b.get("risk"), traits=b.get("traits"), vetoes=b.get("vetoes"), origin="collection"):
+                                      tf=b.get("tf", 1), risk=b.get("risk"), traits=b.get("traits"), vetoes=b.get("vetoes"), layers=b.get("layers"), origin="collection"):
                 n += 1
         self.flush_events()
         self.refresh_board()
@@ -5747,7 +5805,7 @@ class App:
         for b in bots:
             v = next((x for x in self.tourn.vars if x.key() == E.bot_key(b)), None) or self.tourn.add_variant(
                 b["name"], b["params"], closes, b.get("size", 1.0), note="Parent joined:", tf=b.get("tf", 1),
-                risk=b.get("risk"), traits=b.get("traits"), vetoes=b.get("vetoes"), origin="library")
+                risk=b.get("risk"), traits=b.get("traits"), vetoes=b.get("vetoes"), layers=b.get("layers"), origin="library")
             if v:
                 parents.append(v)
         if len(parents) != 2:
@@ -5795,7 +5853,7 @@ class App:
             return messagebox.showinfo("Bot details", "Click a bot on the farm or the scoreboard first.")
         w = tk.Toplevel(self.root)
         w.title(STRAT_LABELS.get(v.name, v.name))
-        w.geometry("760x620")
+        w.geometry("800x780")
         f = ttk.Frame(w, padding=12)
         f.pack(fill="both", expand=True)
         title = friendly_label(v.name, v.params, v.tf, self.session_bar)
@@ -5812,6 +5870,15 @@ class App:
             l = ttk.Label(stats, text="-", font=("", 10, "bold"), wraplength=230)
             l.grid(row=i // 3, column=(i % 3) * 2 + 1, sticky="w", padx=(0, 22), pady=2)
             info_lbls[key] = l
+        stack = ttk.LabelFrame(f, text=" Rule stack (each layer evolves on its own) ", padding=(8, 4))
+        stack.pack(fill="x", pady=(8, 0))
+        stack_lbls = []
+        for i in range(5):
+            a = ttk.Label(stack, text="", font=("", 9, "bold"), width=16)
+            a.grid(row=i, column=0, sticky="nw")
+            b = ttk.Label(stack, text="", wraplength=600, justify="left")
+            b.grid(row=i, column=1, sticky="w", pady=1)
+            stack_lbls.append((a, b))
         crow = ttk.Frame(f)
         crow.pack(fill="x", pady=(10, 2))
         ttk.Label(crow, text="Entries and exits on").pack(side="left")
@@ -5845,6 +5912,9 @@ class App:
                         "  |  " + next((cl["note"] for cl in E.CLASSICS if cl["title"] == v.classic), "") if v.classic else ""), "Fees paid": f"${v.sim.fees:,.2f}"}
             for k, l in info_lbls.items():
                 l.config(text=vals[k])
+            for (a, b), (title, txt) in zip(stack_lbls, E.rule_stack(v)):
+                a.config(text=title)
+                b.config(text=txt)
             cv.delete("all")
             c = coin.get()
             h = self.hist.get(c, [])[-300:]
@@ -6050,7 +6120,7 @@ class App:
                 if E.bot_key(b) in have:
                     continue
                 v = self.tourn.add_variant(b["name"], b["params"], closes, b.get("size", 1.0), note="Hall of Fame:",
-                                           tf=b.get("tf", 1), risk=b.get("risk"), traits=b.get("traits"), vetoes=b.get("vetoes"), origin="hall of fame")
+                                           tf=b.get("tf", 1), risk=b.get("risk"), traits=b.get("traits"), vetoes=b.get("vetoes"), layers=b.get("layers"), origin="hall of fame")
                 if v:
                     v.inducted, n = True, n + 1
             self.flush_events()
@@ -6174,7 +6244,7 @@ class App:
             n = 0
             for r in picked():
                 if self.tourn.add_variant(r["name"], r["params"], closes, r.get("size", 1.0), note="From the Bot Lab:",
-                                          tf=r["tf"], risk=r.get("risk"), traits=r.get("traits"), vetoes=r.get("vetoes"), origin="bot lab"):
+                                          tf=r["tf"], risk=r.get("risk"), traits=r.get("traits"), vetoes=r.get("vetoes"), layers=r.get("layers"), origin="bot lab"):
                     n += 1
             self.flush_events()
             self.refresh_board()
