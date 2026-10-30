@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.9.6
+- **Picks up right where it left off.** The whole farm is now saved (every bot, its money and positions, its history,
+  levels, traits, eggs and family tree), not just your account. When you open CBBF, your last session and its farm
+  are back on screen straight away, paused; press Continue to carry on with the same bots. If it was running when
+  you closed it, it carries on by itself (Live still asks first). The farm is saved every 20 decisions and whenever
+  you stop, switch mode or close. "Start a new session" starts a fresh farm.
+- **More memory**: twice as many trades, four times as many bot practice trades and a much longer account chart are
+  kept between sessions.
+
 ## 1.9.5
 - No more "Resume session?" pop-up. When a saved session exists, the main button says **Continue practice session**
   (or Continue LIVE session) with its cash and trade count, and a **Start a new ... session** button appears under it.

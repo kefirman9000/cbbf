@@ -628,6 +628,7 @@ class App:
         root.after(700, self.maybe_welcome)
         root.after(1500, self.maybe_setup)
         root.after(4000, self.auto_check_update)
+        root.after(1200, self.restore_last_session)
         root.after(2500, self.auto_resume)
         if self.migrated:
             root.after(900, lambda: self.write("Welcome to CBBF. Your data from the old Desk Utils folder was copied over.", "good"))
@@ -675,9 +676,68 @@ class App:
             return
         E.save_json(E.state_path(self.live), dict(
             start_cash=self.start_cash, cash=self.cash, pos=self.pos, cost=self.cost,
-            trades=self.trades[-5000:], shadow=self.shadow_trades[-1000:], curve=self.curve[-1500:], bench_units=self.bench_units,
+            trades=self.trades[-10000:], shadow=self.shadow_trades[-4000:], curve=self.curve[-8000:], bench_units=self.bench_units,
             coins=self.session_coins, bar_n=self.bar_n, bar=self.session_bar, quote=self.quote, high=self.high,
             fees_paid=self.fees_paid, bought_at=self.bought_at))
+
+    def save_farm(self, force=False):
+        """Saves the whole farm (every bot, its history and family tree) next to the session, so it carries on
+        where it left off. Done every 20 decisions and whenever the bot stops, switches mode or the app closes."""
+        if not (self.session and self.tourn and self.seeded):
+            return
+        if not force and self.bar_n % 20:
+            return
+        try:
+            E.save_json(E.farm_path(self.live), dict(coins=self.session_coins, bar=self.session_bar,
+                                                      saved_at=time.time(), farm=self.tourn.to_state()))
+        except Exception:
+            note = self._record_error("saving the farm")
+            if note:
+                self.write(note, "bad")
+
+    def load_farm(self):
+        """The saved farm for this session, ready to carry on (or None)."""
+        d = E.load_json(E.farm_path(self.live))
+        if not isinstance(d, dict) or d.get("coins") != self.session_coins or float(d.get("bar", -1)) != float(self.session_bar):
+            return None
+        t = E.Tournament(self.session_coins, self.start_cash, *E.cost_model(self.settings)[:1],
+                         self.settings["trade_pct"] / 100, self.settings["evolve_every"], params=self.settings["params"],
+                         opts=E.tournament_opts(self.settings), cap=int(self.settings["max_bots"]),
+                         retire_steps=self.retire_steps(self.session_bar))
+        return t if t.restore(d.get("farm")) else None
+
+    def restore_last_session(self):
+        """On start-up: put the last session (and its farm) back on screen, paused, exactly where it left off."""
+        if self.session:
+            return
+        mode = self.cfg.get("last_mode", "paper")
+        saved = self.saved_session(mode == "live")
+        if not saved:
+            return
+        if mode == "live":  # Live never opens by itself: show it, waiting on its Continue button
+            if self.mode_var.get() != "live":
+                self.mode_var.set("live")
+                self.update_status()
+                self.update_team_label()
+            return
+        self._auto_resume = True
+        try:
+            ok = self.begin_session(list(saved.get("coins") or []), quiet=True)
+        finally:
+            self._auto_resume = False
+        if not ok:
+            return
+        self.wild_var.set(bool(self.cfg.get("last_wild", True)))
+        self.toggle_wild()
+        if self.wild_var.get():
+            t = self.load_farm()
+            if t:
+                self.tourn, self.seeded, self._restored_farm = t, False, t
+                self.refresh_board()
+        self.update_status()
+        self.refresh_view()
+        self.write(f"Welcome back: your {'LIVE' if mode == 'live' else 'Practice'} session is just as you left it"
+                   + (f", with all {len(self.tourn.vars)} bots" if self.tourn else "") + ". Press Continue to carry on.", "good")
 
     def load_state(self, s):
         self.start_cash, self.cash = s["start_cash"], s["cash"]
@@ -696,6 +756,7 @@ class App:
                 "Quit", "The bot is running. Quitting stops it (open positions stay open).\n\nQuit anyway?"):
             return
         self.cfg["was_running"] = bool(self.running)  # closed while running: pick it up next time
+        self.save_farm(force=True)
         self.running = False
         self.awake.off()
         try:
@@ -1739,6 +1800,7 @@ class App:
             self.ui_running(False)
         if self.session:
             self.save_state()
+            self.save_farm(force=True)
             self.write(f"{name[cur]} session saved.")
         self.session = False
         try:
@@ -2540,6 +2602,7 @@ class App:
         if self.running:
             self.running = False
             self.cfg["was_running"] = False  # stopped on purpose: don't auto-resume next time
+            self.save_farm(force=True)
             try:
                 E.save_json(CONFIG_PATH, self.cfg)
             except OSError:
@@ -2572,6 +2635,10 @@ class App:
         self.active = [n for n, v in self.strat_vars.items() if v.get()]
         if self.wild and self.tourn is None:
             self.seeded = False
+            if not getattr(self, "_restored_farm", None):
+                t = self.load_farm()
+                if t:
+                    self._restored_farm = t
         if self.session and self.live and not self.client:
             return messagebox.showerror("Live mode", "Log in to Coinbase first.")
         self.running = True
@@ -2587,12 +2654,18 @@ class App:
                             self.settings["trade_pct"] / 100, self.settings["evolve_every"])
         self.launch_worker()
 
-    def begin_session(self, coins):
+    def begin_session(self, coins, quiet=False):
         live = self.mode_var.get() == "live"
         saved = E.load_json(E.state_path(live))
         resume = False
         if saved:  # the Continue / Start new buttons decide (no pop-up)
             resume = getattr(self, "_auto_resume", False) or getattr(self, "_choice", "continue") != "new"
+        if not resume:
+            self._restored_farm = None
+            try:
+                os.remove(E.farm_path(live))  # a new session starts a new farm
+            except OSError:
+                pass
         try:
             budget = float(self.cash_var.get())
             assert budget > 0
@@ -2677,6 +2750,14 @@ class App:
         if bar_min < 1:  # scale 1-minute volume to the shorter bar so volume strategies compare like with like
             hx = {c: dict(d, v=[x * bar_min for x in d["v"]]) for c, d in hx.items()}
         tourn = None
+        restored = getattr(self, "_restored_farm", None)
+        self._restored_farm = None
+        if wild and restored is not None and restored.coins == list(coins):
+            restored.o.update(E.tournament_opts(self.settings))
+            restored.xfull = None
+            self.q.put(("log", (f"Carrying on with your farm of {len(restored.vars)} bots where it left off.", "good")))
+            self.q.put(("seed", (hist, restored, hx)))
+            return
         if wild:
             tourn = E.Tournament(coins, self.start_cash, fee, pct, evolve, params=self.settings["params"],
                                  opts=E.tournament_opts(self.settings), cap=int(self.settings["max_bots"]),
@@ -3030,6 +3111,7 @@ class App:
             for k in ("h", "l", "v"):
                 del x[k][:-keep]
         if self.wild and self.tourn:
+            self.save_farm()
             self.tourn.step({c: self.hist[c] for c in self.session_coins}, {c: self.hx[c] for c in self.session_coins})
             self.collect_shadow()
             self.check_hof()
@@ -3136,7 +3218,7 @@ class App:
                     price=round(t["price"], 6), usd=round(t["usd"], 2),
                     pl="" if t["pl"] is None else round(t["pl"], 2), reason="bot-test",
                     who=friendly_label(t["name"], t["params"], t.get("tf", 1), self.session_bar)))
-            del self.shadow_trades[:-2000]
+            del self.shadow_trades[:-4000]
             if new:
                 if self.nb.tab(self.nb.select(), "text").strip() == "Trades":
                     self.refresh_trades()
@@ -4456,7 +4538,7 @@ class App:
     # ---------------- auto-resume ----------------
     def auto_resume(self):
         """If the bot was running when CBBF last closed, pick that session back up."""
-        if not self.settings.get("auto_resume", True) or not self.cfg.get("was_running") or self.session:
+        if not self.settings.get("auto_resume", True) or not self.cfg.get("was_running") or self.running:
             return
         mode = self.cfg.get("last_mode", "paper")
         saved = E.load_json(E.state_path(mode == "live"))
@@ -4474,9 +4556,10 @@ class App:
             if not messagebox.askyesno("Resume LIVE session?", "Your LIVE session was running when CBBF closed.\n\n"
                                                                "Resume it now? (You'll be asked to type LIVE.)"):
                 return
-        self.mode_var.set(mode)
-        self.wild_var.set(bool(self.cfg.get("last_wild", True)))
-        self.toggle_wild()
+        if not self.session:
+            self.mode_var.set(mode)
+            self.wild_var.set(bool(self.cfg.get("last_wild", True)))
+            self.toggle_wild()
         self._auto_resume = True
         self.write(f"Picking up where you left off ({'LIVE' if mode == 'live' else 'Practice'} session).", "good")
         self.toggle()
