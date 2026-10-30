@@ -130,11 +130,13 @@ SETTING_GROUPS = [
         ("regime_aware", "Favour strategies that do well in the current market mood (trending, choppy...)", bool),
         ("auto_coins", "Let the bot pick this many coins when Wildcard starts (0 = use the ticked coins)", int),
     ]),
-    ("Hall of Fame", "Long-term winners are saved automatically so you keep the bots that really work.", [
-        ("hof_hours", "Hours a strategy must spend Winning (in total) to get in", float),
+    ("Library & Hall of Fame", "The Bot Library keeps every bot you save, plus long-term winners the farm saves for you. "
+                               "The Hall of Fame holds only the bots you promote yourself (right-click a bot).", [
+        ("hof_hours", "Hours a strategy must spend Winning (in total) to count as a long-term winner", float),
         ("hof_min_trades", "...and at least this many finished (sold) trades", int),
-        ("hof_load", "Bring the 10 best Hall of Fame bots back each time Wildcard starts", bool),
-        ("auto_catch", "Hall of Fame bots also go into your Bot Collection automatically", bool),
+        ("auto_catch", "Save long-term winners to the Bot Library automatically", bool),
+        ("auto_hof", "Also put long-term winners straight into the Hall of Fame (off = you choose who goes in)", bool),
+        ("hof_load", "When the whole farm trades, bring the 10 best Hall of Fame bots back to compete", bool),
         ("team_locked", "Trading with my team: keep exactly those bots (untick to let the team breed new bots)", bool),
     ]),
     ("Orders", "How orders are placed, and the extra costs Practice mode pretends to pay.", [
@@ -152,6 +154,7 @@ SETTING_GROUPS = [
     ("Timing", "How often the bot looks at prices.", [
         ("bar_minutes", "How often strategies decide (15 sec is the fastest)", "bar"),
         ("refresh", "Check prices every N seconds (1 or more)", int),
+        ("animations", "Dragon animations (Light uses less computer power)", "anim"),
     ]),
     ("Alerts", "Get a message on your phone when something happens. Leave blank to turn off.", [
         ("alert_discord", "Discord webhook link (Server settings > Integrations > Webhooks)", str),
@@ -353,7 +356,30 @@ def fmt_px(px):
     return f"${px:,.2f}" if px >= 1 else f"${px:,.6f}"
 
 
-def draw_dragon(c, x, y, size, color, awake=True, phase=0, mood="plain", fire=False, flash=False, gold=False, tags=()):
+def draw_egg(c, x, y, size, color, progress=0.0, phase=0, tags=()):
+    """A speckled dragon egg. It wobbles more and cracks open as it gets closer to hatching (progress 0..1)."""
+    k = size / 40.0
+    wob = math.sin(phase / 1.7) * (1 + 3 * progress) if phase else 0
+    cx = x + 20 * k + wob
+
+    def P(*pts):
+        return [v * k + (x + wob if i % 2 == 0 else y) for i, v in enumerate(pts)]
+    c.create_oval(x + 6 * k, y + 50 * k, x + 34 * k, y + 56 * k, fill="#111827", outline="", tags=tags)  # shadow
+    c.create_oval(*P(4, 4, 36, 52), fill="#f5f0e1", outline=color, width=2, tags=tags)
+    for sx, sy, r in ((12, 18, 3), (25, 12, 2.5), (27, 30, 3.5), (14, 38, 2.5), (22, 44, 2)):
+        c.create_oval(*P(sx - r, sy - r, sx + r, sy + r), fill=color, outline="", tags=tags)
+    if progress > 0.3:
+        c.create_line(*P(8, 26, 13, 22, 17, 27, 21, 23), fill="#57534e", width=max(1, 1.5 * k), tags=tags)
+    if progress > 0.6:
+        c.create_line(*P(21, 23, 25, 28, 29, 24, 33, 27), fill="#57534e", width=max(1, 1.5 * k), tags=tags)
+    if progress > 0.85:
+        c.create_oval(*P(15, 14, 18, 17), fill="#111827", outline="", tags=tags)  # someone peeking out
+        c.create_oval(*P(22, 14, 25, 17), fill="#111827", outline="", tags=tags)
+    _ = cx
+
+
+def draw_dragon(c, x, y, size, color, awake=True, phase=0, mood="plain", fire=False, flash=False, gold=False, tags=(),
+                crown=False):
     """A small dragon on a Tk canvas, inside a size x size box at (x, y). Awake dragons flap their wings
     and look around; sleeping ones curl up with their eyes shut. fire = a little puff of flame."""
     k = size / 26.0
@@ -399,6 +425,9 @@ def draw_dragon(c, x, y, size, color, awake=True, phase=0, mood="plain", fire=Fa
     # near wing
     if awake:
         mk('polygon', *P(10, 13, 6, 3 + flap, 12, 6 + flap / 2, 16, 12), fill=color, outline="#111827", width=1)
+    if crown:
+        mk('polygon', *P(17 + look, 2 + hy, 17.5 + look, -3 + hy, 19.5 + look, -0.5 + hy, 21.5 + look, -4 + hy,
+                         23.5 + look, -0.5 + hy, 25 + look, -3 + hy, 25 + look, 2 + hy), fill="#facc15", outline="#a16207")
     if fire:
         f = (phase % 3)
         mk('polygon', *P(26 + look, 7 + hy, 31 + f, 5 + hy, 30 + f, 7 + hy, 33 + f, 8 + hy, 26 + look, 9 + hy),
@@ -579,13 +608,15 @@ class App:
                                    relief="flat", bd=0, bg=LINE, fg=TEXT, activebackground=LINE, activeforeground=TEXT,
                                    padx=10, pady=3, cursor="hand2")
         self.theme_btn.pack(side="right", padx=(0, 14))
-        self.mute_btn = tk.Button(header, text="\U0001F515" if self.cfg.get("muted") else "\U0001F514", command=self.toggle_mute,
+        self.mute_btn = tk.Button(header, text="\u266a off" if self.cfg.get("muted") else "\u266a", command=self.toggle_mute,
                                   relief="flat", bd=0, bg=CARD, fg=TEXT, activebackground=CARD, cursor="hand2", font=("", 11))
         self.mute_btn.pack(side="right", padx=(0, 8))
         Tip(self.mute_btn, "Mute or unmute all notifications. Sounds are off unless you turn them on in Settings.")
-        self.upd_btn = tk.Button(header, text="Update", command=self.show_update, relief="flat", bd=0, bg=GREEN,
-                                 fg="white", activebackground=GREEN, activeforeground="white", padx=10, pady=3,
+        self.upd_btn = tk.Button(header, text="\u27f3 Check for updates", command=self.update_clicked, relief="flat", bd=0,
+                                 bg=LINE, fg=TEXT, activebackground=LINE, activeforeground=TEXT, padx=10, pady=3,
                                  cursor="hand2", font=("", 9, "bold"))
+        self.upd_btn.pack(side="right", padx=(0, 8))
+        Tip(self.upd_btn, f"You have version {self.version}. Checks GitHub for a newer one; nothing installs until you accept.")
         self.conn_lbl = tk.Label(header, text="Not logged in", bg=CARD, fg=MUTED)
         self.conn_lbl.pack(side="right", padx=14)
         self.net_lbl = tk.Label(header, text="\u25cf", bg=CARD, fg=MUTED, font=("", 11))
@@ -678,12 +709,18 @@ class App:
         mb = ttk.Checkbutton(c, text="Winners trade more", variable=self.more_var, style="Card.TCheckbutton",
                              command=self.toggle_more)
         mb.pack(anchor="w", padx=(18, 0))
-        self.team_var = tk.BooleanVar(value=bool(self.cfg.get("team_mode", False)) and bool(E.team()))
-        self.team_cb = ttk.Checkbutton(c, text="Trade with my team", variable=self.team_var, style="Card.TCheckbutton",
-                                       command=self.toggle_team_mode)
-        self.team_cb.pack(anchor="w", padx=(18, 0))
-        Tip(self.team_cb, "Wildcard runs only the bots on your team from the Bot Collection (Ctrl+B). "
-                          "Settings > Wildcard decides whether the team may breed new bots or stays exactly as picked.")
+        rrow = tk.Frame(c, bg=CARD)
+        rrow.pack(fill="x", padx=(18, 0), pady=(2, 0))
+        tk.Label(rrow, text="Bots trading:", bg=CARD, fg=MUTED, font=("", 8)).pack(side="left")
+        if "roster_paper" not in self.cfg:  # first start after this feature: keep an old "trade with my team" choice
+            self.cfg["roster_paper"] = "team" if self.cfg.get("team_mode") else "farm"
+        self.roster_var = tk.StringVar()
+        self.roster_box = ttk.Combobox(rrow, textvariable=self.roster_var, state="readonly", width=20)
+        self.roster_box.pack(side="left", padx=(4, 0))
+        self.roster_box.bind("<<ComboboxSelected>>", lambda e: self.set_roster())
+        Tip(self.roster_box, "Which bots may trade (Wildcard). Whole farm: everyone competes and the winners are followed. "
+                             "My team: only your team from the Bot Library. Hall of Fame only: only the champions you "
+                             "picked, nothing new is bred. Practice and Live each remember their own choice.")
         self.update_team_label()
         Tip(mb, "Strategies that keep winning get bigger trades and keep adding while they hold a coin. "
                 "Shaky ones are slowed down and failing ones are stopped. Turn off for calmer, less frequent trading. "
@@ -758,7 +795,7 @@ class App:
         nb = self.nb = ttk.Notebook(nbf)
         nb.pack(fill="both", expand=True, pady=(8, 0))
         t0, t1, t2, t3, t4, t5 = (ttk.Frame(nb) for _ in range(6))
-        nb.add(t0, text="  \U0001F409 Bot Farm  ")
+        nb.add(t0, text="  \u25c6 Bot Farm  ")
         nb.add(t1, text="  Portfolio  ")
         nb.add(t4, text="  Live prices  ")
         nb.add(t5, text="  Trades  ")
@@ -790,7 +827,7 @@ class App:
                  "Bots that kept winning for a long time are saved here automatically. Export them or bring them back. (Ctrl+H)"),
                 ("Catch!", self.catch_selected, "Catch the selected bots for your Bot Collection. They get a name, a rarity "
                  "and a level, and you can trade with your favourite team later."),
-                ("Collection...", self.open_collection, "Your caught bots, their rarities and levels, and your team. (Ctrl+B)"),
+                ("Library...", self.open_collection, "Your saved bots (the Bot Library): rarities, levels, your team, and who is in the Hall of Fame. (Ctrl+B)"),
                 ("Family tree...", self.open_family, "Which bot was bred or tweaked from which, including ones that died out."),
                 ("Bot Lab...", self.open_lab,
                  "Evolve bots on months of past prices, then test them on prices they never saw. Only the ones that "
@@ -807,6 +844,9 @@ class App:
                                     ("Strategy", "Recent gain", "vs holding", "Wins lately", "Win rate", "Lifetime",
                                      "Size", "What the bot does", "Trades"))
         self.board.bind("<Double-1>", lambda e: self.bot_detail())
+        for btn in ("<Button-3>", "<Button-2>"):
+            self.board.bind(btn, lambda e: (lambda iid: self.bot_menu(e, next((v for v in self.tourn.vars if str(id(v)) == iid), None))
+                                            if iid and self.tourn else None)(self.board.identify_row(e.y)))
         Tip(self.board, "Double-click a strategy for its full track record.")
         self.style_board_tags()
         self.empty_board = tk.Label(t2, text="Tick 'Let the bot choose (Wildcard)' and press Start.\nStrategies will compete here.",
@@ -844,6 +884,7 @@ class App:
                         ("<Control-k>", self.open_coin_browser), ("<Control-b>", self.open_collection), ("<Control-comma>", self.open_settings),
                         ("<F5>", self.refresh_trades)):
             root.bind_all(seq, lambda e, f=fn: (f(), "break")[1])
+        root.after(60, self.set_farm_style)
 
     def build_menu(self):
         bar = tk.Menu(self.root)
@@ -866,7 +907,7 @@ class App:
         m.add_command(label="Bot Lab...", command=self.open_lab, accelerator="Ctrl+L")
         m.add_command(label="Hall of Fame...", command=self.open_hof, accelerator="Ctrl+H")
         m.add_command(label="Bot family tree...", command=self.open_family)
-        m.add_command(label="Bot Collection...", command=self.open_collection, accelerator="Ctrl+B")
+        m.add_command(label="Bot Library...", command=self.open_collection, accelerator="Ctrl+B")
         m.add_command(label="Browse Coinbase coins...", command=self.open_coin_browser, accelerator="Ctrl+K")
         m.add_command(label="Settings...", command=self.open_settings, accelerator="Ctrl+,")
         m.add_command(label="Install add-ons (setup)...", command=self.open_setup)
@@ -1447,6 +1488,7 @@ class App:
         self.budget_lbl.config(text=f"Money to trade with ({self.cur_quote()})" if live else f"Practice money (pretend {self.cur_quote()})")
 
     def on_mode_change(self):
+        self.update_team_label()
         if self.mode_var.get() == "live" and not self.client and not self.session:
             if messagebox.askyesno("Live mode", "Live mode trades with REAL money and needs your Coinbase login.\n\n"
                                                 "Log in now? (You can stay in Practice mode instead.)"):
@@ -1548,7 +1590,7 @@ class App:
     def toggle_mute(self):
         self.cfg["muted"] = not self.cfg.get("muted", False)
         E.save_json(CONFIG_PATH, self.cfg)
-        self.mute_btn.config(text="\U0001F515" if self.cfg["muted"] else "\U0001F514")
+        self.mute_btn.config(text="\u266a off" if self.cfg["muted"] else "\u266a")
         self.write("Notifications muted." if self.cfg["muted"] else "Notifications on.")
 
     # ---------------- help / welcome ----------------
@@ -1992,6 +2034,12 @@ class App:
 
     def chart_hover(self, e, cv=None):
         self.hover = {str(cv or self.chart): e.x}
+        if not getattr(self, "_hover_pending", False):  # redraw at most once per screen refresh
+            self._hover_pending = True
+            self.root.after(30, self._hover_draw)
+
+    def _hover_draw(self):
+        self._hover_pending = False
         self.draw_chart()
 
     def position_price(self, coin):
@@ -2071,6 +2119,7 @@ class App:
                 self.best_lbl.config(text="")
             return
         self.empty_board.place_forget()
+        hofk = self.hof_keys()
         for r in self.tourn.board():
             sc = "-" if r["score"] is None else f"{r['score'] * 100:+.1f}%"
             cons = "-" if r["cons"] is None else f"{int(r['cons'] * 100)}%"
@@ -2081,8 +2130,9 @@ class App:
             elif r["status"] == "slowed" and r.get("behind"):
                 status = "Shaky (not beating holding)"
             lf = r["life"]
-            star = "\u2605 " if r["v"].inducted else ""
-            tags = (STATUS_TAG.get(r["status"], "learning"),) + (("hof",) if r["v"].inducted else ())
+            in_hof = r["v"].key() in hofk
+            star = "\u2605 " if in_hof else ""
+            tags = (STATUS_TAG.get(r["status"], "learning"),) + (("hof",) if in_hof else ())
             self.board.insert("", "end", iid=str(id(r["v"])), tags=tags, values=(
                 star + friendly_label(r["name"], r["params"], r.get("tf", 1), self.session_bar), sc, pct_txt(r.get("edge")),
                 cons, "-" if lf["winrate"] is None else f"{lf['winrate'] * 100:.0f}%", pct_txt(lf["ret"]),
@@ -2244,17 +2294,22 @@ class App:
                                  retire_steps=self.retire_steps(bar_min))
             if L > E.WARM:
                 tourn.warmup(hist, extra=hx)
-            squad = E.team() if self.cfg.get("team_mode") else []
+            roster = self.roster("live" if self.live else "paper")
+            squad = (E.team() if roster == "team" else self.hof()[:max(14, int(self.settings["max_bots"]))]
+                     if roster == "hof" else [])
             if squad:
                 for v in list(tourn.vars):
                     tourn._remove(v, "benched for your team")
                 for b in squad:
-                    tourn.add_variant(b["name"], b["params"], hist, b.get("size", 1.0), note=f"Team: {b.get('nickname')}",
+                    tourn.add_variant(b["name"], b["params"], hist, b.get("size", 1.0),
+                                      note=f"{'Team' if roster == 'team' else 'Hall of Fame'}: {b.get('nickname') or E.bot_nickname(E.bot_key(b))}",
                                       tf=b.get("tf", 1), risk=b.get("risk"), traits=b.get("traits"), origin="team")
-                if self.settings.get("team_locked", True):
+                locked = roster == "hof" or self.settings.get("team_locked", True)
+                if locked:
                     tourn.retire_steps, tourn.evolve_every = 0, 10 ** 9
-                self.q.put(("log", (f"Trading with your team: {', '.join(b.get('nickname', '?') for b in squad)}"
-                                    + (" (locked)." if self.settings.get("team_locked", True) else " (they may breed)."), "good")))
+                who = ", ".join(b.get("nickname") or E.bot_nickname(E.bot_key(b)) for b in squad)
+                self.q.put(("log", (f"Trading with {'your team' if roster == 'team' else 'your Hall of Fame only'}: {who}"
+                                    + (" (locked: no new bots)." if locked else " (they may breed)."), "good")))
             saved = [] if squad else E.load_strategies()
             for d in saved:
                 tourn.add_variant(d["name"], d["params"], hist, d.get("size", 1.0), note="Loaded saved", tf=d.get("tf", 1),
@@ -2648,22 +2703,21 @@ class App:
             if not cands:
                 return
             rows = [dict(r, bar_minutes=self.session_bar) for r in self.tourn.board() if r["v"] in cands]
-            entries = E.export_bots(rows, self.version, note=f"Hall of Fame, {', '.join(self.session_coins)}")["bots"]
-            new = E.induct(entries, self.version)
+            entries = E.export_bots(rows, self.version, note=f"long-term winner, {', '.join(self.session_coins)}")["bots"]
+            to_hof = self.settings.get("auto_hof", False)
             if self.settings.get("auto_catch", True):
-                self.catch_rows(entries, "hall of fame")
+                self.catch_rows(entries, "long-term winner")
+            new = E.induct(entries, self.version) if to_hof else 0
             for v in cands:
-                v.inducted = True
-                rec = self.tourn.lineage.get(v.uid)
-                if rec:
-                    rec["inducted"] = True
+                v.inducted = True  # remembered so it is only saved once
                 lf = self.tourn.life(v)
-                msg = (f"Hall of Fame: {friendly_label(v.name, v.params, v.tf, self.session_bar)} made "
-                       f"{lf['ret'] * 100:+.1f}% ({pct_txt(lf['edge'])} vs holding) and was saved.")
+                where = "the Hall of Fame" if to_hof else "your Bot Library (promote it to the Hall of Fame if you trust it)"
+                msg = (f"Long-term winner: {E.bot_nickname(v.key())} ({friendly_label(v.name, v.params, v.tf, self.session_bar)}) "
+                       f"made {lf['ret'] * 100:+.1f}% ({pct_txt(lf['edge'])} vs holding). Saved to {where}.")
                 self.write(msg, "good")
                 self.alert("hof", msg)
-            if new:
-                self.notify("CBBF", f"{new} bot{'s' if new != 1 else ''} joined the Hall of Fame", sound="hof")
+            self.notify("CBBF", f"{len(cands)} long-term winner{'s' if len(cands) != 1 else ''} saved"
+                        + (" to the Hall of Fame" if new else " to your Library"), sound="hof")
         except Exception:
             note = self._record_error("updating the Hall of Fame")
             if note:
@@ -2959,9 +3013,16 @@ class App:
         warn = ("\nWildcard picks strategies automatically based on recent results. "
                 "Recent winners often stop winning" + (", and with 'Winners trade more' on it trades more often, "
                 "which means more fees" if self.more_var.get() else "") + ".\n" if self.wild_var.get() else "")
+        roster = self.roster("live")
+        who = ({"farm": "the WHOLE FARM (any winning bot, including brand-new ones). Tip: choose 'Hall of Fame only' "
+                        "under Strategy to trade real money with only the bots you picked",
+                "team": f"only YOUR TEAM ({len(E.team())} bots)",
+                "hof": f"only YOUR HALL OF FAME ({len(self.hof())} bots you picked)"}[roster]
+               if self.wild_var.get() else "the strategies you ticked")
         ans = simpledialog.askstring(
             "Confirm LIVE trading",
             f"This will place REAL market orders using up to ${self.cash:,.2f}.\n"
+            f"Bots allowed to trade: {who}.\n"
             f"Automated strategies can lose money.{warn}\nType LIVE to continue:")
         return (ans or "").strip() == "LIVE"
 
@@ -3297,73 +3358,202 @@ class App:
                        "settings are included. The wildcard row only starts ranking after ~100 bars.").pack()
         self.write("Backtest complete.")
 
-    # ---------------- Bot Farm grid (default tab) ----------------
+    # ---------------- Bot Farm grid (default tab): eggs, rising, BEASTS, Hall of Fame ----------------
     GRID_STATUS = {"active": ("WINNING", "#22c55e"), "slowed": ("SHAKY", "#f59e0b"), "standby": ("STANDBY", "#3b82f6"),
                    "benched": ("RESTING", "#6b7280"), "warming up": ("LEARNING", "#8b5cf6")}
+    SECTIONS = (("Eggs", "\u25d2 Eggs"), ("Rising", "\u25b2 Rising"), ("BEASTS", "\u265b BEASTS"),
+                ("Hall of Fame", "\u2605 Hall of Fame"), ("All", "All"), ("Caught", "\u25c9 Library"))
+    SECTION_TIPS = {
+        "Eggs": "New bots still learning. They hatch once they've seen enough prices and made a few trades.",
+        "Rising": "Hatched bots doing OK: shaky, on standby, or winning but not dominant yet. Resting ones are at the end.",
+        "BEASTS": "The dominant ones: winning, steady (3 of the last 4 stretches or more) and ahead of holding. "
+                  "The account follows these the most.",
+        "Hall of Fame": "The bots YOU picked as champions. Only you add or remove them (right-click any bot). "
+                        "'Bots trading: Hall of Fame only' trades with just these.",
+        "All": "Every bot on the farm.", "Caught": "Bots on the farm that are saved in your Bot Library."}
+
+    def tier(self, r):
+        """egg / rising / beast for a scoreboard row."""
+        v = r["v"]
+        if r["status"] == "warming up" or v.age < (self.tourn.W if self.tourn else 100):
+            return "egg"
+        if r["status"] == "active" and ((r.get("cons") or 0) >= 0.75 or v.streak >= 30) and (r.get("edge") is None or r["edge"] > 0):
+            return "beast"
+        return "rising"
 
     def build_grid_tab(self, parent):
         top = tk.Frame(parent, bg=BG)
         top.pack(fill="x", padx=6, pady=(6, 2))
-        self.grid_title = tk.Label(top, text="Bot Farm", bg=BG, fg=TEXT, font=("", 12, "bold"))
-        self.grid_title.pack(side="left")
-        self.grid_sum = tk.Label(top, text="", bg=BG, fg=MUTED, font=("", 9))
-        self.grid_sum.pack(side="left", padx=12)
-        right = tk.Frame(top, bg=BG)
-        right.pack(side="right")
-        self.grid_filter = tk.StringVar(value=self.cfg.get("grid_filter", "All"))
+        chips = tk.Frame(top, bg=BG)
+        chips.pack(side="left")
+        self.grid_filter = tk.StringVar(value=self.cfg.get("grid_filter", "BEASTS"))
+        if self.grid_filter.get() not in dict(self.SECTIONS):
+            self.grid_filter.set("BEASTS")
         self.grid_chips = {}
-        for name in ("All", "Working", "Winning", "Sleeping", "Caught"):
-            l = tk.Label(right, text=name, bg=CARD, fg=MUTED, padx=10, pady=2, cursor="hand2", font=("", 8, "bold"))
-            l.pack(side="left", padx=2)
-            l.bind("<Button-1>", lambda e, n=name: self._grid_set_filter(n))
-            self.grid_chips[name] = l
-        ttk.Button(right, text="Catch!", style="Accent.TButton", command=self.catch_selected).pack(side="left", padx=(10, 0))
-        self.grid = tk.Canvas(parent, bg=BG, highlightthickness=0)
-        ys = ttk.Scrollbar(parent, orient="vertical", command=self.grid.yview)
+        for key, label in self.SECTIONS:
+            l = tk.Label(chips, text=label, bg=CARD, fg=MUTED, padx=12, pady=4, cursor="hand2", font=("", 9, "bold"))
+            l.pack(side="left", padx=(0, 3))
+            l.bind("<Button-1>", lambda e, n=key: self._grid_set_filter(n))
+            Tip(l, self.SECTION_TIPS[key])
+            self.grid_chips[key] = l
+        ttk.Button(top, text="Catch!", style="Accent.TButton", command=self.catch_selected).pack(side="right")
+        self.farm_style = tk.StringVar(value=self.cfg.get("farm_style", "Dragons"))
+        vb = ttk.Combobox(top, textvariable=self.farm_style, values=["Dragons", "Simple cards", "List"], state="readonly", width=12)
+        vb.pack(side="right", padx=(0, 8))
+        vb.bind("<<ComboboxSelected>>", lambda e: self.set_farm_style())
+        tk.Label(top, text="View", bg=BG, fg=MUTED, font=("", 8)).pack(side="right", padx=(0, 4))
+        Tip(vb, "Dragons: animated cards. Simple cards: the same cards without animation. List: a plain table.")
+        self.grid_sum = tk.Label(parent, text="", bg=BG, fg=MUTED, font=("", 9), anchor="w")
+        self.grid_sum.pack(fill="x", padx=8)
+        self.grid_area = tk.Frame(parent, bg=BG)
+        self.grid_area.pack(fill="both", expand=True)
+        self.grid = tk.Canvas(self.grid_area, bg=BG, highlightthickness=0)
+        ys = ttk.Scrollbar(self.grid_area, orient="vertical", command=self.grid.yview)
         self.grid.configure(yscrollcommand=ys.set)
+        self.grid_ys = ys
         ys.pack(side="right", fill="y")
         self.grid.pack(fill="both", expand=True, padx=(6, 0), pady=(2, 4))
+        self.grid_list = None
         self.grid.bind("<Configure>", lambda e: self.grid_refresh())
         self.grid.bind("<Button-1>", self._grid_click)
-        self.grid.bind("<Double-1>", lambda e: (self._grid_click(e), self.bot_detail()))
+        self.grid.bind("<Double-1>", lambda e: (self._grid_click(e), self.bot_detail() if self.selected_variant() else None))
         self.grid.bind("<Motion>", self._grid_motion)
+        for btn in ("<Button-3>", "<Button-2>"):
+            self.grid.bind(btn, lambda e: (lambda card: self.bot_menu(e, card[4]) if card else None)(self._grid_at(e)))
         self.grid.bind("<Leave>", lambda e: setattr(self, "grid_hover", None))
         for ev, d in (("<Button-4>", -1), ("<Button-5>", 1)):
             self.grid.bind(ev, lambda e, d=d: self.grid.yview_scroll(d, "units"))
         self.grid.bind("<MouseWheel>", lambda e: self.grid.yview_scroll(-1 if e.delta > 0 else 1, "units"))
-        self.grid_cards, self.grid_hover, self.grid_sig = [], None, None
+        self.grid_cards, self.grid_hover, self.beasts_seen = [], None, set()
         self._grid_paint_chips()
-        self.root.after(250, self.grid_animate)
+        self.root.after(300, self.animate_all)
+
+    def set_farm_style(self):
+        st = self.farm_style.get()
+        self.cfg["farm_style"] = st
+        E.save_json(CONFIG_PATH, self.cfg)
+        if st == "List":
+            self.grid.pack_forget()
+            self.grid_ys.pack_forget()
+            if self.grid_list is None:
+                box = tk.Frame(self.grid_area, bg=BG)
+                self.grid_list_box = box
+                self.grid_list = self.make_tree(box, ("tier", "name", "strategy", "status", "recent", "edge", "winrate", "trades", "saved"),
+                                                (80, 140, 190, 140, 70, 75, 65, 55, 110),
+                                                ("Section", "Name", "Strategy", "Status", "Recent", "vs holding", "Win rate",
+                                                 "Trades", "Saved"))
+                self.grid_list.bind("<Double-1>", lambda e: self.bot_detail(self._list_variant()))
+                self.grid_list.bind("<<TreeviewSelect>>", lambda e: self._list_select())
+                for btn in ("<Button-3>", "<Button-2>"):
+                    self.grid_list.bind(btn, lambda e: (self.grid_list.selection_set(self.grid_list.identify_row(e.y))
+                                                        if self.grid_list.identify_row(e.y) else None,
+                                                        self.bot_menu(e, self._list_variant())))
+            self.grid_list_box.pack(fill="both", expand=True, padx=6, pady=(2, 4))
+        else:
+            if self.grid_list is not None:
+                self.grid_list_box.pack_forget()
+            self.grid_ys.pack(side="right", fill="y")
+            self.grid.pack(fill="both", expand=True, padx=(6, 0), pady=(2, 4))
+        if hasattr(self, "farm"):
+            if st == "Dragons":
+                if not self.farm.winfo_ismapped():
+                    self.farm.pack(fill="x", padx=4, pady=(0, 4), after=self.best_lbl)
+            else:
+                self.farm.pack_forget()
+        self.grid_refresh()
+
+    def _list_variant(self):
+        sel = self.grid_list.selection() if self.grid_list is not None else ()
+        if not sel or not self.tourn:
+            return None
+        return next((v for v in self.tourn.vars if str(id(v)) == sel[0]), None)
+
+    def _list_select(self):
+        v = self._list_variant()
+        if v and self.board.exists(str(id(v))):
+            self.board.selection_set(str(id(v)))
+
+    def _fill_grid_list(self, items):
+        t = self.grid_list
+        sel = t.selection()
+        t.delete(*t.get_children())
+        lib, hofk = self.library_keys(), self.hof_keys()
+        names = {"egg": "Egg", "rising": "Rising", "beast": "BEAST"}
+        for kind, data, extra in items:
+            if kind == "hof":
+                b = data
+                lt = b.get("lifetime") or {}
+                t.insert("", "end", values=("Hall of Fame", E.bot_nickname(E.bot_key(b)), STRAT_LABELS.get(b["name"], b["name"]),
+                                            "on the farm" if extra else "resting",
+                                            "-", "-" if lt.get("vs_holding_pct") is None else f"{lt['vs_holding_pct']:+.1f}%",
+                                            "-" if lt.get("win_rate_pct") is None else f"{lt['win_rate_pct']:.0f}%",
+                                            lt.get("trades", "-"), "\u2605 HoF"))
+                continue
+            r, tier = data, extra
+            v, lf = r["v"], r["life"]
+            saved = ("\u2605 HoF" if v.key() in hofk else "") + (" \u25c9 Library" if v.key() in lib else "")
+            t.insert("", "end", iid=str(id(v)), tags=(STATUS_TAG.get(r["status"], "learning"),), values=(
+                names[tier], E.bot_nickname(v.key()), friendly_label(v.name, v.params, v.tf, self.session_bar),
+                STATUS_TEXT.get(r["status"], r["status"]), pct_txt(r["score"]), pct_txt(r.get("edge")),
+                "-" if lf["winrate"] is None else f"{lf['winrate'] * 100:.0f}%", lf["trades"], saved.strip()))
+        amber = "#fbbf24" if DARK else "#b45309"
+        for tag, color in (("win", GREEN), ("shaky", amber), ("standby", TEXT), ("stopped", MUTED), ("learning", MUTED)):
+            t.tag_configure(tag, foreground=color)
+        keep = [i for i in sel if t.exists(i)]
+        if keep:
+            t.selection_set(keep)
+        resort(t)
 
     def _grid_set_filter(self, n):
         self.grid_filter.set(n)
         self.cfg["grid_filter"] = n
         self._grid_paint_chips()
-        self.grid_sig = None
         self.grid.yview_moveto(0)
         self.grid_refresh()
 
     def _grid_paint_chips(self):
+        counts = getattr(self, "grid_counts", {})
         for n, l in self.grid_chips.items():
             on = n == self.grid_filter.get()
-            l.config(bg=ACCENT if on else CARD, fg="white" if on else MUTED)
+            base = dict(self.SECTIONS)[n]
+            l.config(text=base + (f"  {counts[n]}" if n in counts else ""),
+                     bg=("#b45309" if n == "BEASTS" else "#a16207" if n == "Hall of Fame" else ACCENT) if on else CARD,
+                     fg="white" if on else (("#f59e0b" if n in ("BEASTS", "Hall of Fame") else MUTED)))
 
-    def _grid_rows(self):
-        if not self.tourn:
-            return []
-        awake = self.running and self.seeded
-        rows = self.tourn.board()
+    def _grid_items(self):
+        """Cards to show: ('farm', row, tier) for live bots or ('hof', entry, in_farm) for Hall of Fame bots."""
         f = self.grid_filter.get()
-        if f == "Working":
-            rows = [r for r in rows if awake and r["status"] != "benched"]
-        elif f == "Winning":
-            rows = [r for r in rows if r["status"] == "active"]
-        elif f == "Sleeping":
-            rows = [r for r in rows if not awake or r["status"] == "benched"]
-        elif f == "Caught":
-            have = {E.bot_key(b) for b in E.load_collection()}
-            rows = [r for r in rows if r["v"].key() in have]
-        return rows
+        rows = self.tourn.board() if self.tourn else []
+        tiers = [(r, self.tier(r)) for r in rows]
+        hof = self.hof()
+        self._hof_n = len(hof)
+        self.grid_counts = {"Eggs": sum(1 for _, t in tiers if t == "egg"),
+                            "Rising": sum(1 for _, t in tiers if t == "rising"),
+                            "BEASTS": sum(1 for _, t in tiers if t == "beast"),
+                            "Hall of Fame": getattr(self, "_hof_n", 0), "All": len(rows)}
+        # new BEASTS get announced
+        for r, t in tiers:
+            k = r["v"].key()
+            if t == "beast" and k not in self.beasts_seen and self.running and self.seeded:
+                self.beasts_seen.add(k)
+                msg = (f"{E.bot_nickname(k)} became a BEAST! ({friendly_label(r['name'], r['params'], r.get('tf', 1), self.session_bar)}, "
+                       f"{pct_txt(r['score'])} recently, {pct_txt(r.get('edge'))} vs holding)")
+                self.write("\u265b " + msg, "good")
+                self.notify("CBBF", msg, sound="hof")
+        if f == "Hall of Fame":
+            live = {r["v"].key(): r for r in rows}
+            return [("hof", b, live.get(E.bot_key(b))) for b in hof]
+        if f == "Caught":
+            have = self.library_keys()
+            return [("farm", r, t) for r, t in tiers if r["v"].key() in have]
+        want = {"Eggs": "egg", "Rising": "rising", "BEASTS": "beast"}.get(f)
+        items = [("farm", r, t) for r, t in tiers if want is None or t == want]
+        if f == "Rising":  # resting ones last
+            items.sort(key=lambda it: it[1]["status"] == "benched")
+        if f == "All":
+            order = {"beast": 0, "rising": 1, "egg": 2}
+            items.sort(key=lambda it: order[it[2]])
+        return items
 
     @staticmethod
     def round_rect(c, x0, y0, x1, y1, r=12, **kw):
@@ -3371,119 +3561,197 @@ class App:
                x0, y1 - r, x0, y0 + r, x0, y0)
         return c.create_polygon(*pts, smooth=True, **kw)
 
+    def _bar(self, c, x, y, w, name, frac, col):
+        c.create_text(x, y + 4, anchor="w", text=name, fill=MUTED, font=("", 7, "bold"), tags="card")
+        self.round_rect(c, x + 20, y, x + w, y + 8, 4, fill=LINE, outline="", tags="card")
+        if frac > 0.02:
+            self.round_rect(c, x + 20, y, x + 20 + (w - 20) * min(frac, 1), y + 8, 4, fill=col, outline="", tags="card")
+
+    def _chips(self, c, x, y, xmax, chips):
+        cx = x
+        for txt, tc in chips:
+            t = c.create_text(cx + 5, y, anchor="w", text=txt, fill=tc, font=("", 7, "bold"), tags="card")
+            bb = c.bbox(t)
+            if bb[2] > xmax:
+                c.delete(t)
+                break
+            bgc = self.round_rect(c, bb[0] - 5, bb[1] - 2, bb[2] + 5, bb[3] + 2, 6, fill=BG, outline="", tags="card")
+            c.tag_lower(bgc, t)
+            cx = bb[2] + 9
+
     def grid_refresh(self):
-        """Draws the cards (the still parts). The dragons are animated separately by grid_animate."""
+        """Draws the cards (the still parts). Dragons and eggs are animated separately by grid_animate."""
         if not hasattr(self, "grid"):
             return
         c = self.grid
         W = max(c.winfo_width(), 200)
-        rows = self._grid_rows()
+        items = self._grid_items()
+        self._grid_paint_chips()
         c.delete("card")
         self.grid_cards = []
         awake = self.running and self.seeded
-        if self.tourn:
-            st = [r["status"] for r in self.tourn.board()]
-            asleep = len(st) if not awake else st.count("benched")
-            self.grid_sum.config(text=f"{len(st)} dragons  |  {st.count('active')} winning  |  {st.count('slowed')} shaky  |  "
-                                      f"{len(st) - asleep} working  |  {asleep} asleep"
-                                      + (f"  |  generation {max(v.gen for v in self.tourn.vars)}" if self.tourn.vars else ""))
-        else:
-            self.grid_sum.config(text="")
-        if not rows:
-            msg = ("Your dragons hatch here when the bot runs with 'Let the bot choose (Wildcard)' ticked.\n"
-                   "Press Start the bot. Each dragon is one trading bot." if not self.tourn else "No dragons match this filter.")
-            c.create_text(W // 2, 90, text=msg, fill=MUTED, justify="center", tags="card", font=("", 10))
+        gc = self.grid_counts
+        self.grid_sum.config(text=(f"\u25d2 {gc['Eggs']} eggs   \u25b2 {gc['Rising']} rising   "
+                                   f"\u265b {gc['BEASTS']} BEASTS   \u2605 {gc['Hall of Fame']} in the Hall of Fame"
+                                   + (f"   |   generation {max(v.gen for v in self.tourn.vars)}" if self.tourn and self.tourn.vars else "")
+                                   + ("" if awake or not self.tourn else "   |   the farm is asleep (press Start)")))
+        f = self.grid_filter.get()
+        style = self.farm_style.get()
+        if style == "List" and self.grid_list is not None:
+            self._fill_grid_list(items)
+            return
+        if not items:
+            msgs = {"Eggs": "No eggs right now. New bots appear here while they learn.",
+                    "Rising": "Nobody in the middle right now.",
+                    "BEASTS": "No BEASTS yet. A bot becomes one when it keeps winning steadily and beats just holding.\n"
+                              "It can take a while, and that's the point: they have to earn it.",
+                    "Hall of Fame": "The Hall of Fame is empty so far. Bots that stay winners for hours are saved here.",
+                    "Caught": "None of the bots on the farm are in your collection yet. Select some and press Catch!"}
+            msg = msgs.get(f) if self.tourn or f == "Hall of Fame" else (
+                "Your dragons hatch here when the bot runs with 'Let the bot choose (Wildcard)' ticked.\n"
+                "Press Start the bot. Each dragon is one trading bot.")
+            c.create_text(W // 2, 90, text=msg or "", fill=MUTED, justify="center", tags="card", font=("", 10))
             c.configure(scrollregion=(0, 0, W, 200))
             return
-        cw, ch, g = 236, 150, 12
+        big = f == "BEASTS"
+        cw, ch, g = (300, 168, 14) if big else (236, 150, 12)
         per = max(1, (W - g) // (cw + g))
-        caught = {E.bot_key(b): b for b in E.load_collection()}
+        caught = self.library_keys()
+        hofk = self.hof_keys()
         sel = set(self.board.selection())
-        for i, r in enumerate(rows):
-            v, lf = r["v"], r["life"]
+        gold = "#f59e0b"
+        for i, (kind, data, extra) in enumerate(items):
             x = g + (i % per) * (cw + g)
             y = g + (i // per) * (ch + g)
+            if kind == "hof":
+                self._hof_card(c, x, y, cw, ch, data, extra)
+                self.grid_cards.append((x, y, x + cw, y + ch, extra["v"] if extra else None, "hof", "hof"))
+                continue
+            r, t = data, extra
+            v, lf = r["v"], r["life"]
             label, col = self.GRID_STATUS.get(r["status"], ("?", MUTED))
+            if t == "egg":
+                label, col = f"EGG {int(min(1, len(v.eq) / max(1, self.tourn.W)) * 100)}%", "#8b5cf6"
+            elif t == "beast":
+                label, col = "\u265b BEAST", "#dc2626"
             if not awake:
                 label, col = "ASLEEP", "#6b7280"
             rec = E.lifetime_record(lf, self.session_bar)
             rar = E.rarity_for(rec)
-            rc = E.RARITY_COLORS[rar]
+            rc = gold if t == "beast" else E.RARITY_COLORS[rar]
             xp = E.xp_for(rec)
             lvl = E.level_for(xp)
             lo_xp, hi_xp = 10 * (lvl - 1) ** 2, 10 * lvl ** 2
             is_sel = str(id(v)) in sel
+            if t == "beast":  # glow
+                self.round_rect(c, x - 4, y - 4, x + cw + 4, y + ch + 4, 18, fill="", outline="#7c2d12", width=4, tags="card")
             self.round_rect(c, x, y, x + cw, y + ch, 14, fill=CARD, outline=TEXT if is_sel else rc,
-                            width=3 if is_sel else (2 if rar != "Common" else 1), tags="card")
-            self.round_rect(c, x + 3, y + 3, x + 76, y + 76, 10, fill=BG, outline="", tags="card")
-            # status pill
-            c.create_rectangle(x + cw - 84, y + 10, x + cw - 10, y + 28, fill=col, outline="", tags="card")
-            c.create_text(x + cw - 47, y + 19, text=label, fill="white", font=("", 8, "bold"), tags="card")
+                            width=3 if (is_sel or t == "beast") else (2 if rar != "Common" else 1), tags="card")
+            port = 92 if big else 76
+            self.round_rect(c, x + 3, y + 3, x + port, y + port, 10, fill="#2a1406" if t == "beast" else BG, outline="", tags="card")
+            c.create_rectangle(x + cw - 92, y + 10, x + cw - 10, y + 28, fill=col, outline="", tags="card")
+            c.create_text(x + cw - 51, y + 19, text=label, fill="white", font=("", 8, "bold"), tags="card")
             nick = E.bot_nickname(v.key())
-            star = "★ " if v.inducted else ""
+            if style != "Dragons":  # plain badge instead of an animated dragon
+                pc = col if awake else "#6b7280"
+                c.create_oval(x + 14, y + 14, x + port - 10, y + port - 10, fill=pc, outline="", tags="card")
+                c.create_text((x + 2 + port) / 2, (y + 2 + port) / 2, tags="card", fill="white", font=("", 13, "bold"),
+                              text="".join(w[0] for w in nick.split()[:2]) if t != "egg" else "...")
+            star = "★ " if v.key() in hofk else ""
             ball = " ◉" if v.key() in caught else ""
-            c.create_text(x + 84, y + 40, anchor="w", text=star + nick + ball, fill=TEXT, font=("", 10, "bold"), tags="card")
-            c.create_text(x + 84, y + 57, anchor="w", text=STRAT_LABELS.get(v.name, v.name), fill=MUTED, font=("", 8), tags="card")
-            pace = E.fmt_bar(v.tf * self.session_bar)
-            c.create_text(x + 84, y + 71, anchor="w", text=f"every {pace}  |  {rar}", fill=rc, font=("", 8, "bold"), tags="card")
+            tx = x + port + 8
+            c.create_text(tx, y + 40, anchor="w", text=star + nick + ball, fill=gold if t == "beast" else TEXT,
+                          font=("", 12 if big else 10, "bold"), tags="card")
+            c.create_text(tx, y + 58, anchor="w", text=STRAT_LABELS.get(v.name, v.name), fill=MUTED, font=("", 8), tags="card")
+            sub = "hatching..." if t == "egg" else f"every {E.fmt_bar(v.tf * self.session_bar)}  |  {rar}"
+            c.create_text(tx, y + 72, anchor="w", text=sub, fill=rc, font=("", 8, "bold"), tags="card")
             c.create_text(x + 10, y + 15, anchor="w", text=f"LV {lvl}", fill=rc, font=("", 9, "bold"), tags="card")
-            # XP and health bars
-            frac = (xp - lo_xp) / max(1, hi_xp - lo_xp)
-            dd = self.tourn.drawdown(v) if v.eq else 0
-            hp = max(0.0, 1 - dd * 10)
-            for j, (name, f, bc) in enumerate((("XP", frac, "#a855f7"), ("HP", hp, GREEN if hp > 0.5 else "#f59e0b" if hp > 0.2 else RED))):
-                by = y + 88 + j * 13
-                c.create_text(x + 10, by + 4, anchor="w", text=name, fill=MUTED, font=("", 7, "bold"), tags="card")
-                self.round_rect(c, x + 30, by, x + cw - 10, by + 8, 4, fill=LINE, outline="", tags="card")
-                if f > 0.02:
-                    self.round_rect(c, x + 30, by, x + 30 + (cw - 40) * min(f, 1), by + 8, 4, fill=bc, outline="", tags="card")
-            # stat chips
+            by = y + (port + 12)
+            if t == "egg":
+                prog = min(1, len(v.eq) / max(1, self.tourn.W))
+                self._bar(c, x + 10, by, cw - 10, "HATCH", prog, "#8b5cf6")
+                self._bar(c, x + 10, by + 13, cw - 10, "TRADES", min(1, len(v.sim.tbars) / max(1, self.tourn.min_trades)), "#a78bfa")
+            else:
+                dd = self.tourn.drawdown(v) if v.eq else 0
+                hp = max(0.0, 1 - dd * 10)
+                self._bar(c, x + 10, by, cw - 10, "XP", (xp - lo_xp) / max(1, hi_xp - lo_xp), "#a855f7")
+                self._bar(c, x + 10, by + 13, cw - 10, "HP", hp, GREEN if hp > 0.5 else "#f59e0b" if hp > 0.2 else RED)
             chips = [(pct_txt(r["score"]), GREEN if (r["score"] or 0) > 0 else RED if r["score"] else MUTED),
                      ("vs hold " + pct_txt(r.get("edge")), GREEN if (r.get("edge") or 0) > 0 else MUTED),
                      ("WR " + ("-" if lf["winrate"] is None else f"{lf['winrate'] * 100:.0f}%"), TEXT),
                      (f"{lf['trades']} trades", MUTED)]
-            cx = x + 10
-            for txt, tc in chips:
-                t = c.create_text(cx + 5, y + ch - 17, anchor="w", text=txt, fill=tc, font=("", 7, "bold"), tags="card")
-                bb = c.bbox(t)
-                if bb[2] > x + cw - 8:  # no room left on this card
-                    c.delete(t)
-                    break
-                bgc = self.round_rect(c, bb[0] - 5, bb[1] - 2, bb[2] + 5, bb[3] + 2, 6, fill=BG, outline="", tags="card")
-                c.tag_lower(bgc, t)
-                cx = bb[2] + 9
-            self.grid_cards.append((x, y, x + cw, y + ch, v, r["status"]))
-        nrows = (len(rows) + per - 1) // per
+            if t == "beast":
+                chips.insert(0, (f"{r['stake']:.1f}x size", gold))
+            self._chips(c, x + 10, y + ch - 17, x + cw - 8, chips)
+            self.grid_cards.append((x, y, x + cw, y + ch, v, r["status"], t))
+        nrows = (len(items) + per - 1) // per
         c.configure(scrollregion=(0, 0, W, nrows * (ch + g) + g))
 
-    def grid_animate(self):
-        try:
-            self._grid_anim_frame()
-        except Exception:
-            pass
-        self.root.after(160, self.grid_animate)
+    def _hof_card(self, c, x, y, cw, ch, b, live):
+        gold = "#f59e0b"
+        if self.farm_style.get() != "Dragons":
+            c.create_oval(x + 14, y + 14, x + 66, y + 66, fill="#a16207", outline="", tags="card")
+            c.create_text(x + 40, y + 40, text="\u2605", fill="white", font=("", 18, "bold"), tags="card")
+        lt = b.get("lifetime") or {}
+        self.round_rect(c, x - 3, y - 3, x + cw + 3, y + ch + 3, 17, fill="", outline="#713f12", width=3, tags="card")
+        self.round_rect(c, x, y, x + cw, y + ch, 14, fill=CARD, outline=gold, width=2, tags="card")
+        self.round_rect(c, x + 3, y + 3, x + 76, y + 76, 10, fill="#2a2006", outline="", tags="card")
+        pill, pc = ("ON THE FARM", "#16a34a") if live else ("RESTING", "#a16207")
+        c.create_rectangle(x + cw - 92, y + 10, x + cw - 10, y + 28, fill=pc, outline="", tags="card")
+        c.create_text(x + cw - 51, y + 19, text=pill, fill="white", font=("", 8, "bold"), tags="card")
+        c.create_text(x + 84, y + 40, anchor="w", text="\u2605 " + E.bot_nickname(E.bot_key(b)), fill=gold,
+                      font=("", 10, "bold"), tags="card")
+        c.create_text(x + 84, y + 57, anchor="w", text=STRAT_LABELS.get(b["name"], b["name"]), fill=MUTED, font=("", 8), tags="card")
+        when = str(b.get("inducted_at", ""))[:10]
+        c.create_text(x + 84, y + 71, anchor="w", text=f"since {when}" if when else "champion", fill=gold, font=("", 8, "bold"), tags="card")
+
+        def p(k):
+            v = lt.get(k)
+            return "-" if v is None else f"{v:+.1f}%"
+        c.create_text(x + 10, y + 92, anchor="w", fill=TEXT, font=("", 8), tags="card",
+                      text=f"Lifetime {p('return_pct')}   vs holding {p('vs_holding_pct')}")
+        hrs = lt.get("hours_winning")
+        c.create_text(x + 10, y + 108, anchor="w", fill=MUTED, font=("", 8), tags="card",
+                      text=(f"won for {hrs:.1f} h" if hrs is not None else lt.get("source", "")) +
+                           (f"   |   win rate {lt['win_rate_pct']:.0f}%" if lt.get("win_rate_pct") is not None else ""))
+        extras = ", ".join(x for x in (E.risk_text(b.get("risk")), E.traits_text(b.get("traits"))) if x)
+        if extras:
+            c.create_text(x + 10, y + 124, anchor="w", fill=MUTED, font=("", 7), tags="card", text=extras[:48])
 
     def _grid_anim_frame(self):
         c = self.grid
         c.delete("anim")
-        if not c.winfo_ismapped() or not self.grid_cards:
+        if not c.winfo_ismapped() or not self.grid_cards or self.farm_style.get() != "Dragons":
             return
-        self.farm_phase = getattr(self, "farm_phase", 0) + 1
-        ph = self.farm_phase
+        ph = getattr(self, "farm_phase", 0)
         top, bottom = c.canvasy(0), c.canvasy(c.winfo_height())
         awake = self.running and self.seeded
-        for i, (x0, y0, x1, y1, v, st) in enumerate(self.grid_cards):
+        big = self.grid_filter.get() == "BEASTS"
+        for i, (x0, y0, x1, y1, v, st, t) in enumerate(self.grid_cards):
             if y1 < top or y0 > bottom:
                 continue  # off screen: skip
+            if t == "hof":
+                draw_dragon(c, x0 + 14, y0 + 22 + math.sin(ph / 3) * 1.5, 50, "#eab308", awake=True,
+                            phase=ph // 3, mood="happy", gold=True, crown=True, tags="anim")
+                continue
+            if t == "egg":
+                prog = min(1, len(v.eq) / max(1, self.tourn.W)) if self.tourn else 0
+                draw_egg(c, x0 + 20, y0 + 12, 40, "#8b5cf6", prog, ph if awake else 0, tags="anim")
+                continue
             label, col = self.GRID_STATUS.get(st, ("?", MUTED))
             working = awake and st != "benched"
             just = awake and bool(v.log) and v.log[-1][0] == (self.tourn.n if self.tourn else -1)
-            bob = 2 * math.sin((ph + i * 3) / 2.4) if working else 0
-            draw_dragon(c, x0 + 14, y0 + 22 + bob, 50, col if awake else "#6b7280", awake=working, phase=ph + i * 3,
-                        mood="happy" if st == "active" else "plain", fire=just and v.log[-1][2] == "buy",
-                        flash=just and ph % 2 == 0, tags="anim")
+            bob = 2 * math.sin(ph / 2.4) if working else 0
+            if t == "beast":
+                fire = working and (just or ph % 30 < 4)
+                draw_dragon(c, x0 + 12, y0 + 22 + bob, 64 if big else 50, "#dc2626" if awake else "#6b7280", awake=working,
+                            phase=ph, mood="happy", fire=fire, flash=just and ph % 2 == 0, crown=True, tags="anim")
+            else:
+                draw_dragon(c, x0 + 14, y0 + 22 + bob, 50, col if awake else "#6b7280", awake=working, phase=ph,
+                            mood="happy" if st == "active" else "plain", fire=just and v.log[-1][2] == "buy",
+                            flash=just and ph % 2 == 0, tags="anim")
             if not working:
-                k = (ph + i * 5) % 18
+                k = ph % 18
                 if k < 12:
                     c.create_text(x0 + 66 + k / 3, y0 + 26 - k, text="z" if k < 6 else "Z", fill=MUTED,
                                   font=("", 8 + k // 6, "bold"), tags="anim")
@@ -3509,7 +3777,7 @@ class App:
 
     def _grid_click(self, e):
         card = self._grid_at(e)
-        if not card:
+        if not card or card[4] is None:
             return
         iid = str(id(card[4]))
         if self.board.exists(iid):
@@ -3882,7 +4150,9 @@ class App:
         self.farm.bind("<Leave>", lambda e: setattr(self, "farm_hover", None))
         self.farm.bind("<Button-1>", self._farm_click)
         self.farm.bind("<Double-1>", lambda e: (self._farm_click(e), self.bot_detail()))
-        self.root.after(200, self.animate_farm)
+        for btn in ("<Button-3>", "<Button-2>"):
+            self.farm.bind(btn, lambda e: self.bot_menu(e, self._farm_at(e.x, e.y)))
+        # (animated by the shared clock in animate_all)
 
     def _farm_at(self, x, y):
         for x0, y0, x1, y1, v in self.farm_hits:
@@ -3899,21 +4169,28 @@ class App:
             self.board.selection_set(str(id(v)))
             self.board.see(str(id(v)))
 
-    def animate_farm(self):
-        """Little robots for every bot: working ones bob and blink, sleeping ones snooze, a bot that just
-        traded flashes. Runs about 6 times a second; cheap enough to never slow the app down."""
+    def animate_all(self):
+        """One clock for every animation, so all the dragons move in step. Only the view you can see is drawn,
+        nothing is drawn while the window is minimised, and Settings > Animations can slow it or switch it off."""
+        mode = self.settings.get("animations", "Full")
+        delay = {"Full": 160, "Light": 480}.get(mode, 1000)
         try:
-            self._draw_farm()
+            if mode != "Off" and self.root.state() != "iconic":
+                self.farm_phase = getattr(self, "farm_phase", 0) + 1
+                tab = self.nb.index(self.nb.select()) if hasattr(self, "nb") else 0
+                if tab == 0:
+                    self._grid_anim_frame()
+                elif self.nb.tab(tab, "text").strip() == "Strategy scoreboard":
+                    self._draw_farm()
         except Exception:
             pass
-        self.root.after(170, self.animate_farm)
+        self.root.after(delay, self.animate_all)
 
     def _draw_farm(self):
         c = self.farm
-        if not c.winfo_ismapped():
+        if not c.winfo_ismapped() or self.farm_style.get() != "Dragons":
             return
         c.delete("all")
-        self.farm_phase += 1
         ph = self.farm_phase
         W = max(c.winfo_width(), 100)
         self.farm_hits = []
@@ -3923,13 +4200,14 @@ class App:
             c.config(height=46)
             return
         rows = self.tourn.board()
-        size, gap = 26, 6
+        size, gap = (26, 6) if len(rows) <= 60 else (18, 4)
         per_row = max(1, (W - 8) // (size + gap))
         nrows = (len(rows) + per_row - 1) // per_row
         want_h = nrows * (size + 18) + 6
         if int(c.cget("height")) != want_h:
             c.config(height=want_h)
         amber = "#fbbf24" if DARK else "#d97706"
+        hofk = self.hof_keys()
         colors = {"active": GREEN, "slowed": amber, "standby": ACCENT, "benched": "#6b7280", "warming up": "#8b5cf6"}
         awake_now = self.running and self.seeded
         for i, r in enumerate(rows):
@@ -3940,13 +4218,13 @@ class App:
             y0 = 12 + (i // per_row) * (size + 18)
             working = awake_now and st in ("active", "slowed", "standby", "warming up")
             just_traded = bool(v.log) and v.log[-1][0] == self.tourn.n and awake_now
-            bob = round(2 * math.sin((ph + i * 3) / 2.2)) if working else 0
+            bob = round(2 * math.sin(ph / 2.2)) if working else 0
             y = y0 + bob
             mood = "happy" if st == "active" else "plain"
-            draw_dragon(c, x0, y, size, col, awake=working, phase=ph + i * 3, mood=mood,
+            draw_dragon(c, x0, y, size, col, awake=working, phase=ph, mood=mood,
                         fire=just_traded and v.log[-1][2] == "buy", flash=just_traded and ph % 2 == 0)
             if not working:
-                k = (ph + i * 5) % 18
+                k = ph % 18
                 if k < 12:
                     c.create_text(x0 + size + 1 + k / 3, y + 2 - k, text="z" if k < 6 else "Z", fill=MUTED,
                                   font=("", 7 + k // 6, "bold"))
@@ -3954,7 +4232,7 @@ class App:
                 side = v.log[-1][2]
                 c.create_text(x0 + size / 2, y - 9, text="$" if side == "sell" else "+", fill=GREEN if side == "buy" else amber,
                               font=("", 9, "bold"))
-            if v.inducted:
+            if v.key() in hofk:
                 c.create_text(x0 + size - 1, y + 5, text="★", fill="#f59e0b", font=("", 8))
             sel = self.board.selection()
             if sel and sel[0] == str(id(v)):
@@ -3971,6 +4249,29 @@ class App:
             bb = c.bbox(t)
             c.create_rectangle(bb[0] - 3, bb[1] - 1, bb[2] + 3, bb[3] + 1, fill=CARD, outline=LINE)
             c.tag_raise(t)
+
+    # ---------------- cached look-ups (no file reading on every frame) ----------------
+    def _cached(self, path, loader):
+        try:
+            m = os.path.getmtime(path)
+        except OSError:
+            m = None
+        cache = self.__dict__.setdefault("_file_cache", {})
+        if path not in cache or cache[path][0] != m:
+            cache[path] = (m, loader())
+        return cache[path][1]
+
+    def library(self):
+        return self._cached(E.collection_path(), E.load_collection)
+
+    def library_keys(self):
+        return {E.bot_key(b) for b in self.library()}
+
+    def hof(self):
+        return self._cached(E.hof_path(), E.load_hof)
+
+    def hof_keys(self):
+        return {E.bot_key(b) for b in self.hof()}
 
     # ---------------- Bot Collection ----------------
     def catch_rows(self, rows, source):
@@ -3999,36 +4300,185 @@ class App:
         ids = {id(v) for v in vs}
         self.catch_rows([r for r in self.tourn.board() if id(r["v"]) in ids], "scoreboard")
 
-    def toggle_team_mode(self):
-        on = self.team_var.get()
-        self.cfg["team_mode"] = on
+    ROSTERS = ("farm", "team", "hof")
+
+    def roster_mode(self):
+        return "live" if (self.live if self.session else self.mode_var.get() == "live") else "paper"
+
+    def roster(self, mode=None):
+        mode = mode or self.roster_mode()
+        r = self.cfg.get(f"roster_{mode}", "farm")
+        return r if r in self.ROSTERS else "farm"
+
+    def roster_labels(self):
+        return {"farm": "Whole farm", "team": f"My team ({len(E.team())}/{E.TEAM_MAX})",
+                "hof": f"Hall of Fame only ({len(self.hof())})"}
+
+    def set_roster(self):
+        lab = {v: k for k, v in self.roster_labels().items()}
+        r = lab.get(self.roster_var.get(), "farm")
+        if r == "team" and not E.team():
+            messagebox.showinfo("Team", "Your team is empty. Open the Bot Library (Ctrl+B), select up to "
+                                        f"{E.TEAM_MAX} bots and press 'Add to team' (or right-click a bot).")
+            r = self.roster()
+        elif r == "hof" and not self.hof():
+            messagebox.showinfo("Hall of Fame", "Your Hall of Fame is empty. Right-click any bot (farm, scoreboard or "
+                                                "Library) and choose 'Add to Hall of Fame'.")
+            r = self.roster()
+        self.cfg[f"roster_{self.roster_mode()}"] = r
         E.save_json(CONFIG_PATH, self.cfg)
-        n = len(E.team())
-        if on and not n:
-            self.team_var.set(False)
-            self.cfg["team_mode"] = False
-            return messagebox.showinfo("Team", "Your team is empty. Open the Bot Collection (Ctrl+B), pick up to "
-                                               f"{E.TEAM_MAX} bots and press 'Add to team'.")
-        if on and not self.wild_var.get():
+        if r != "farm" and not self.wild_var.get():
             self.wild_var.set(True)
             self.toggle_wild()
         self.update_team_label()
         if self.session and self.tourn:
-            self.write("The team change applies when Wildcard next starts (File > Reset session).", "warn")
+            self.write("The change of who trades applies when Wildcard next starts (File > Reset session).", "warn")
 
     def update_team_label(self):
-        n = len(E.team())
-        self.team_cb.config(text=f"Trade with my team ({n}/{E.TEAM_MAX})")
+        if not hasattr(self, "roster_box"):
+            return
+        labels = self.roster_labels()
+        self.roster_box.config(values=[labels[k] for k in self.ROSTERS])
+        self.roster_var.set(labels[self.roster()])
+
+    # ---------------- Hall of Fame: only what you pick ----------------
+    def promote_variants(self, vs):
+        if not vs or not self.tourn:
+            return
+        ids = {id(v) for v in vs}
+        rows = [dict(r, bar_minutes=self.session_bar) for r in self.tourn.board() if id(r["v"]) in ids]
+        entries = E.export_bots(rows, self.version, note="picked by you")["bots"]
+        self.catch_rows(entries, "hall of fame")  # Hall of Fame bots are always in the Library too
+        E.induct(entries, self.version)
+        self.write(f"\u2605 Added {', '.join(E.bot_nickname(v.key()) for v in vs)} to the Hall of Fame.", "good")
+        self.after_hof_change()
+
+    def promote_entries(self, entries):
+        if not entries:
+            return
+        E.induct(E.export_bots(entries, self.version)["bots"], self.version)
+        self.write(f"\u2605 Added {', '.join(b.get('nickname') or E.bot_nickname(E.bot_key(b)) for b in entries)} "
+                   f"to the Hall of Fame.", "good")
+        self.after_hof_change()
+
+    def demote_keys(self, keys, names=""):
+        keys = set(keys)
+        if not keys:
+            return
+        E.remove_from_hof(keys)
+        self.write(f"Removed {names or str(len(keys)) + ' bots'} from the Hall of Fame (still in your Library).")
+        self.after_hof_change()
+
+    def after_hof_change(self):
+        self.update_team_label()
+        self.refresh_board()
+        if getattr(self, "col_win", None) is not None and self.col_win.winfo_exists():
+            self.col_refresh()
+        if getattr(self, "hof_win", None) is not None and self.hof_win.winfo_exists():
+            self.hof_win.destroy()
+            self.open_hof()
+
+    # ---------------- right-click menus ----------------
+    def _menu(self):
+        return tk.Menu(self.root, tearoff=0, bg=CARD, fg=TEXT, activebackground=ACCENT, activeforeground="white")
+
+    def bot_menu(self, e, v):
+        """Right-click menu for a bot on the farm."""
+        if v is None or not self.tourn or v not in self.tourn.vars:
+            return
+        if self.board.exists(str(id(v))) and str(id(v)) not in self.board.selection():
+            self.board.selection_set(str(id(v)))
+        chosen = self.selected_variants() or [v]
+        many = len(chosen) > 1
+        name = f"{len(chosen)} bots" if many else E.bot_nickname(v.key())
+        in_hof = v.key() in self.hof_keys()
+        in_lib = v.key() in self.library_keys()
+        m = self._menu()
+        m.add_command(label=name, state="disabled")
+        m.add_separator()
+        if not many:
+            m.add_command(label="Details...", command=lambda: self.bot_detail(v))
+            m.add_command(label="Show on chart", command=lambda: (self.chart_bot.set(True), self.chart_view.set(
+                next((c for n, c, _, _ in reversed(v.log)), self.session_coins[0] if self.session_coins else "Account value")),
+                self.draw_chart()))
+        m.add_command(label="\u25c9 Save to Library" if not in_lib or many else "\u25c9 Update in Library",
+                      command=lambda: self.catch_rows([r for r in self.tourn.board() if r["v"] in chosen], "right-click"))
+        if in_hof and not many:
+            m.add_command(label="\u2715 Remove from Hall of Fame", command=lambda: self.demote_keys([v.key()], E.bot_nickname(v.key())))
+        else:
+            m.add_command(label="\u2605 Add to Hall of Fame", command=lambda: self.promote_variants(chosen))
+        m.add_command(label="Add to my team", command=lambda: self._team_from_variants(chosen))
+        m.add_separator()
+        m.add_command(label="Trade size +", command=lambda: [self._size(x, 0.25) for x in chosen])
+        m.add_command(label="Trade size -", command=lambda: [self._size(x, -0.25) for x in chosen])
+        m.add_command(label="Export...", command=self.export_bots)
+        try:
+            m.tk_popup(e.x_root, e.y_root)
+        finally:
+            m.grab_release()
+
+    def _size(self, v, d):
+        v.size_mult = round(min(max(v.size_mult + d, 0.25), 3.0), 2)
+        self.tourn._rate()
+        self.refresh_board()
+
+    def _team_from_variants(self, vs):
+        caught = self.catch_rows([r for r in self.tourn.board() if r["v"] in vs], "team")
+        size, full = E.set_team([E.bot_key(b) for b in caught], True)
+        self.write(f"Team: {size}/{E.TEAM_MAX}." + (f" {full} didn't fit (the team is full)." if full else ""))
+        self.update_team_label()
+
+    def entry_menu(self, e, entries, where):
+        """Right-click menu for saved bots (Library cards or Hall of Fame rows)."""
+        if not entries:
+            return
+        hofk = self.hof_keys()
+        m = self._menu()
+        name = f"{len(entries)} bots" if len(entries) > 1 else (entries[0].get("nickname") or E.bot_nickname(E.bot_key(entries[0])))
+        m.add_command(label=name, state="disabled")
+        m.add_separator()
+        out = [b for b in entries if E.bot_key(b) not in hofk]
+        inn = [b for b in entries if E.bot_key(b) in hofk]
+        if out:
+            m.add_command(label="\u2605 Add to Hall of Fame", command=lambda: self.promote_entries(out))
+        if inn:
+            m.add_command(label="\u2715 Remove from Hall of Fame", command=lambda: self.demote_keys(
+                [E.bot_key(b) for b in inn], ", ".join(b.get("nickname") or E.bot_nickname(E.bot_key(b)) for b in inn)))
+        if where == "library":
+            m.add_command(label="Add to team", command=lambda: (E.set_team([E.bot_key(b) for b in entries], True), self.col_refresh()))
+            m.add_command(label="Remove from team", command=lambda: (E.set_team([E.bot_key(b) for b in entries], False), self.col_refresh()))
+        m.add_command(label="Add to this run", command=lambda: self._add_entries_to_run(entries))
+        m.add_separator()
+        if where == "library":
+            m.add_command(label="Release from Library", command=self._col_release)
+        try:
+            m.tk_popup(e.x_root, e.y_root)
+        finally:
+            m.grab_release()
+
+    def _add_entries_to_run(self, entries):
+        if not self.tourn or not self.seeded:
+            return messagebox.showinfo("Add bots", "Start the bot with Wildcard ticked first.")
+        closes = {c: self.hist[c] for c in self.session_coins}
+        have, n = {v.key() for v in self.tourn.vars}, 0
+        for b in entries:
+            if E.bot_key(b) not in have and self.tourn.add_variant(
+                    b["name"], b["params"], closes, b.get("size", 1.0), note="Added:", tf=b.get("tf", 1), risk=b.get("risk"),
+                    traits=b.get("traits"), origin="library"):
+                n += 1
+        self.flush_events()
+        self.refresh_board()
+        self.write(f"Added {n} bots to this run." if n else "Those bots are already on the farm.")
 
     def open_collection(self):
         if getattr(self, "col_win", None) is not None and self.col_win.winfo_exists():
             return self.col_win.lift()
         w = self.col_win = tk.Toplevel(self.root)
-        w.title("Bot Collection")
+        w.title("Bot Library")
         w.geometry("1020x680")
         top = ttk.Frame(w, padding=(12, 10, 12, 4))
         top.pack(fill="x")
-        self.col_head = ttk.Label(top, text="Bot Collection", font=("", 13, "bold"))
+        self.col_head = ttk.Label(top, text="Bot Library", font=("", 13, "bold"))
         self.col_head.pack(anchor="w")
         ttk.Label(top, foreground=MUTED, wraplength=980, text=(
             "Catch bots from the scoreboard, the Bot Lab or the Hall of Fame. Rarity comes from how much they beat "
@@ -4058,6 +4508,8 @@ class App:
         self.col_canvas.bind("<Configure>", lambda e: self.col_draw())
         self.col_canvas.bind("<Button-1>", self._col_click)
         self.col_canvas.bind("<Double-1>", lambda e: (self._col_click(e), self._col_team(None)))
+        for btn in ("<Button-3>", "<Button-2>"):
+            self.col_canvas.bind(btn, self._col_right)
         self.col_canvas.bind("<MouseWheel>", lambda e: self.col_canvas.yview_scroll(-1 if e.delta > 0 else 1, "units"))
         self.col_canvas.bind("<Button-4>", lambda e: self.col_canvas.yview_scroll(-1, "units"))
         self.col_canvas.bind("<Button-5>", lambda e: self.col_canvas.yview_scroll(1, "units"))
@@ -4065,6 +4517,12 @@ class App:
         for txt, cmd, tip in (("Add to team", lambda: self._col_team(True), "Your team trades together when "
                                "'Trade with my team' is ticked. Double-click a card to add or remove it."),
                               ("Remove from team", lambda: self._col_team(False), ""),
+                              ("\u2605 Add to Hall of Fame", lambda: self.promote_entries(self._col_chosen()) if self._col_chosen()
+                               else messagebox.showinfo("Hall of Fame", "Click a card first.", parent=self.col_win),
+                               "Your Hall of Fame holds only the bots you pick. 'Bots trading: Hall of Fame only' "
+                               "trades with just them."),
+                              ("Remove from Hall of Fame", lambda: self.demote_keys([E.bot_key(b) for b in self._col_chosen()]),
+                               "They stay in your Library."),
                               ("Add to this run", self._col_add_run, "Drop the selected bots into the running tournament."),
                               ("Export...", self._col_export, "Save the selected bots (or all) to a bot file to share."),
                               ("Release", self._col_release, "Remove the selected bots from your collection.")):
@@ -4083,12 +4541,12 @@ class App:
         self.col_sel &= keys
         counts = {r: sum(1 for b in self.col_bots if b.get("rarity") == r) for r in E.RARITIES}
         shiny = sum(1 for b in self.col_bots if b.get("shiny"))
-        self.col_head.config(text=f"Bot Collection: {len(self.col_bots)} caught  |  "
+        self.col_head.config(text=f"Bot Library: {len(self.col_bots)} saved  |  {len(self.hof())} in the Hall of Fame  |  "
                                   + "  ".join(f"{n} {r}" for r, n in reversed(list(counts.items())) if n)
                                   + (f"  |  ✨ {shiny} shiny" if shiny else ""))
         n_team = sum(1 for b in self.col_bots if b.get("team"))
         self.col_team_lbl.config(text=f"Team: {n_team}/{E.TEAM_MAX}")
-        if hasattr(self, "team_cb"):
+        if hasattr(self, "roster_box"):
             self.update_team_label()
         self.col_draw()
 
@@ -4149,8 +4607,9 @@ class App:
                               font=("", 9, "bold") if j == 0 else ("", 8))
             settings = "/".join(f"{v:g}" for v in b["params"].values()) + (f", pace x{b.get('tf', 1)}" if b.get("tf", 1) > 1 else "")
             c.create_text(x + 8, y + ch - 12, anchor="w", text=settings, fill=MUTED, font=("", 7))
-            if b.get("team"):
-                c.create_text(x + cw - 8, y + ch - 12, anchor="e", text="★ TEAM", fill="#f59e0b", font=("", 8, "bold"))
+            tags_txt = (["TEAM"] if b.get("team") else []) + (["\u2605 HALL OF FAME"] if k in self.hof_keys() else [])
+            if tags_txt:
+                c.create_text(x + cw - 8, y + ch - 12, anchor="e", text="  ".join(tags_txt), fill="#f59e0b", font=("", 8, "bold"))
             self.col_cards.append((x, y, x + cw, y + ch, k))
         rows = (len(bots) + per - 1) // per
         c.configure(scrollregion=(0, 0, W, rows * (ch + g) + g))
@@ -4167,6 +4626,15 @@ class App:
         else:
             self.col_sel = set()
         self.col_draw()
+
+    def _col_right(self, e):
+        x, y = self.col_canvas.canvasx(e.x), self.col_canvas.canvasy(e.y)
+        for x0, y0, x1, y1, k in self.col_cards:
+            if x0 <= x <= x1 and y0 <= y <= y1:
+                if k not in self.col_sel:
+                    self.col_sel = {k}
+                    self.col_draw()
+                return self.entry_menu(e, self._col_chosen(), "library")
 
     def _col_chosen(self, all_if_none=False):
         bots = [b for b in self.col_bots if E.bot_key(b) in self.col_sel]
@@ -4235,7 +4703,8 @@ class App:
         f = ttk.Frame(w, padding=12)
         f.pack(fill="both", expand=True)
         title = friendly_label(v.name, v.params, v.tf, self.session_bar)
-        ttk.Label(f, text=("★ " if v.inducted else "") + title, font=("", 12, "bold")).pack(anchor="w")
+        ttk.Label(f, text=("★ " if v.key() in self.hof_keys() else "") + E.bot_nickname(v.key()) + ":  " + title,
+                  font=("", 12, "bold")).pack(anchor="w")
         ttk.Label(f, text=STRAT_TIPS.get(v.name, ""), foreground=MUTED, wraplength=720).pack(anchor="w", pady=(2, 8))
         stats = ttk.Frame(f)
         stats.pack(fill="x")
@@ -4323,11 +4792,7 @@ class App:
                 self.write(f"Exported {title} to {p}")
 
         def to_hof():
-            rows = [dict(r, bar_minutes=self.session_bar) for r in self.tourn.board() if r["v"] is v]
-            E.induct(E.export_bots(rows, self.version, note="added by hand")["bots"], self.version)
-            v.inducted = True
-            self.write(f"Added {title} to the Hall of Fame.", "good")
-            self.refresh_board()
+            self.promote_variants([v])
             paint()
 
         def size(d):
@@ -4424,10 +4889,9 @@ class App:
         top.pack(fill="x")
         ttk.Label(top, text="Hall of Fame", font=("", 13, "bold")).pack(anchor="w")
         ttk.Label(top, foreground=MUTED, wraplength=900, text=(
-            f"Bots get in automatically after {self.settings.get('hof_hours', 6):g} hours of Winning with at least "
-            f"{self.settings.get('hof_min_trades', 4)} finished trades, ahead of both zero and just holding over their whole life. "
-            "Bot Lab passes can be added too. The file is a normal bot file you can share. "
-            "Past wins don't guarantee future ones, so they always have to win again on live prices.")).pack(anchor="w", pady=(2, 0))
+            "Only the bots YOU pick are here: right-click any bot on the farm, scoreboard or in the Library and choose "
+            "'Add to Hall of Fame' (right-click here to remove). Choose 'Bots trading: Hall of Fame only' to trade "
+            "with just these, for example on your real account. Past wins don't guarantee future ones.")).pack(anchor="w", pady=(2, 0))
         mid = ttk.Frame(w, padding=(10, 4))
         mid.pack(fill="both", expand=True)
         t = self.make_tree(mid, ("strategy", "edge", "ret", "win", "hours", "best", "stops", "when"),
@@ -4435,6 +4899,16 @@ class App:
                            ("Strategy", "vs holding", "Return", "Win rate", "Hrs winning", "Best market", "Own stops", "Added"))
         t.configure(selectmode="extended")
         state = {"bots": []}
+
+        def right(e):
+            iid = t.identify_row(e.y)
+            if not iid:
+                return
+            if iid not in t.selection():
+                t.selection_set(iid)
+            self.entry_menu(e, [state["bots"][int(i)] for i in t.selection()], "hof")
+        for btn in ("<Button-3>", "<Button-2>"):
+            t.bind(btn, right)
 
         def fill():
             t.delete(*t.get_children())
@@ -4783,6 +5257,10 @@ class App:
                     var = tk.StringVar(value=BAR_LABELS.get(float(cur), "1 min"))
                     ttk.Combobox(f, textvariable=var, values=list(BAR_LABELS.values()), state="readonly", width=12).grid(
                         row=r, column=1, padx=(10, 0), sticky="w")
+                elif typ == "anim":
+                    var = tk.StringVar(value=cur if cur in ("Full", "Light", "Off") else "Full")
+                    ttk.Combobox(f, textvariable=var, values=["Full", "Light", "Off"], state="readonly", width=8).grid(
+                        row=r, column=1, padx=(10, 0), sticky="w")
                 elif typ == "order":
                     var = tk.StringVar(value=ORDER_LABELS.get(cur, ORDER_LABELS["market"]))
                     ttk.Combobox(f, textvariable=var, values=list(ORDER_LABELS.values()), state="readonly", width=34).grid(
@@ -4865,7 +5343,7 @@ class App:
                         new[k] = next(b for b, l in BAR_LABELS.items() if l == v)
                     elif typ == "order":
                         new[k] = next(o for o, l in ORDER_LABELS.items() if l == v)
-                    elif typ is str:
+                    elif typ is str or typ == "anim":
                         new[k] = v.strip()
                     else:
                         new[k] = typ(float(v)) if typ is int else float(v)
@@ -4977,6 +5455,8 @@ class App:
 
     def on_update_msg(self, kind, data):
         self._upd_busy = False
+        if kind in ("error", "none") and not getattr(self, "update_info", None):
+            self.upd_btn.config(text="\u27f3 Check for updates")
         if kind == "error":
             msg, silent = data
             if not silent:
@@ -4989,15 +5469,15 @@ class App:
         if kind == "found":
             remote, notes, silent = data
             self.update_info = (remote, notes)
-            self.upd_btn.config(text=f"\u2b06 Update to {remote}")
-            self.upd_btn.pack(side="right", padx=(0, 8), before=self.theme_btn)
+            self.upd_btn.config(text=f"\u2b06 Update to {remote}", bg=GREEN, fg="white", activebackground=GREEN,
+                                activeforeground="white")
             self.write(f"Version {remote} is available. Click 'Update' at the top to see what's new.", "good")
             if not silent:
                 self.show_update()
             return
         if kind == "installed":
             written, backup = data
-            self.upd_btn.pack_forget()
+            self.upd_btn.config(text="\u27f3 Restart to finish updating", bg=ACCENT, fg="white")
             self.write(f"Updated {len(written)} files. The old version is kept in {backup}.", "good")
             if messagebox.askyesno("Update installed", "The update is installed. Restart CBBF now to use it?\n\n"
                                                        "(Your session is saved first. Tools > Undo last update goes back.)"):
@@ -5005,6 +5485,12 @@ class App:
             return
         if kind == "install_fail":
             messagebox.showerror("Update", f"The update didn't install, nothing was changed: {data}")
+
+    def update_clicked(self):
+        if getattr(self, "update_info", None):
+            return self.show_update()
+        self.upd_btn.config(text="\u27f3 Checking...")
+        self.check_update()
 
     def show_update(self):
         if not getattr(self, "update_info", None):

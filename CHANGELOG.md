@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.8.0
+- **The Bot Farm has four sections:**
+  - ◒ **Eggs**: new bots still learning. Eggs wobble and crack as they get close to hatching.
+  - ▲ **Rising**: hatched bots doing OK (shaky, standby, or winning but not dominant yet).
+  - ♛ **BEASTS**: the dominant ones, winning steadily and ahead of holding. Big crowned dragons that
+    breathe fire. The log (and a fanfare) announces every new BEAST.
+  - ★ **Hall of Fame**: your all-time champions, marked when they're back on the farm.
+  Plus All and Caught. Each section shows how many dragons it has.
+- **Bot Library and Hall of Fame are separate.** The Library (old Collection, Ctrl+B) keeps every bot you save plus
+  long-term winners the farm saves for you. The **Hall of Fame now holds only the bots you pick** (nothing goes in
+  on its own unless you turn that on in Settings > Library & Hall of Fame).
+- **Bots trading: Whole farm / My team / Hall of Fame only** (Strategy panel). Practice and Live remember their own
+  choice, and the Live confirmation spells out exactly which bots can trade your real money. Hall of Fame only is
+  always locked: nothing new is bred.
+- **Right-click menus** on the farm cards, the scoreboard, the dragon strip, the Library and the Hall of Fame:
+  details, show on chart, save to Library, add to / remove from Hall of Fame, add to team, trade size, export.
+- **View: Dragons, Simple cards or List**, for when you'd rather have a plain table.
+- **Lighter and in sync**: one animation clock for everything (all dragons move together), only the visible view is
+  drawn, nothing is drawn while minimised, cached look-ups, and Settings > Timing > Animations: Full, Light or Off.
+- **Update button always in the top bar**: "Check for updates", turning green when a new version is out.
+- Symbols that display everywhere (some emoji showed as boxes on Windows).
+
 ## 1.7.4
 - **CBBF has its own sounds**, so you can tell them apart from Windows: a soft blip for trades (only if
   "...also every trade" is on), a two-note chime for notices, a little fanfare when a bot joins the Hall of Fame,
