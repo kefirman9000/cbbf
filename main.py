@@ -715,7 +715,18 @@ class App:
         header = tk.Frame(root, bg=CARD, highlightthickness=1, highlightbackground=LINE)
         header.pack(fill="x")
         tk.Label(header, text="CBBF", bg=CARD, fg=TEXT, font=("", 14, "bold")).pack(side="left", padx=14, pady=10)
-        self.mode_pill = tk.Label(header, text="PAPER", bg=GREEN, fg="white", font=("", 9, "bold"), padx=10, pady=2)
+        self.mode_var = tk.StringVar(value="paper")
+        segs = tk.Frame(header, bg=CARD)
+        segs.pack(side="left")
+        self.seg_paper = tk.Label(segs, text="PRACTICE", font=("", 10, "bold"), padx=14, pady=4, cursor="hand2")
+        self.seg_live = tk.Label(segs, text="LIVE", font=("", 10, "bold"), padx=14, pady=4, cursor="hand2")
+        self.seg_paper.pack(side="left")
+        self.seg_live.pack(side="left", padx=(2, 0))
+        self.seg_paper.bind("<Button-1>", lambda e: self.switch_mode("paper"))
+        self.seg_live.bind("<Button-1>", lambda e: self.switch_mode("live"))
+        Tip(self.seg_paper, "PRACTICE: pretend money on real prices. Nothing real happens. Has its own session, separate from Live.")
+        Tip(self.seg_live, "LIVE: REAL money on your Coinbase account. Has its own session, separate from Practice.")
+        self.mode_pill = tk.Label(header, text="", bg=CARD, fg=GREEN, font=("", 9, "bold"), padx=10)
         self.mode_pill.pack(side="left")
         self.theme_btn = tk.Button(header, text="Light mode" if DARK else "Dark mode", command=lambda: self.set_dark(not DARK),
                                    relief="flat", bd=0, bg=LINE, fg=TEXT, activebackground=LINE, activeforeground=TEXT,
@@ -740,11 +751,13 @@ class App:
         self.err_lbl = tk.Label(header, text="", bg=CARD, fg=RED, cursor="hand2", font=("", 9, "bold"))
         self.err_lbl.bind("<Button-1>", lambda e: self.show_diagnostics())
 
+        self.mode_stripe = tk.Frame(root, height=4, bg=GREEN)
+        self.mode_stripe.pack(fill="x")
         self.headline_lbl = tk.Label(root, text="", bg="#1e3a5f" if DARK else "#eff6ff", fg="#bfdbfe" if DARK else "#1e3a8a", anchor="w", justify="left",
                                      padx=14, pady=7, wraplength=1000, font=("", 10))
         self.headline_lbl.pack(fill="x")
 
-        body = tk.Frame(root, bg=BG)
+        body = self.body = tk.Frame(root, bg=BG, highlightthickness=0)
         body.pack(fill="both", expand=True, padx=10, pady=10)
         self.left_scroll = ScrollFrame(body, BG, width=262)
         self.left_scroll.pack(side="left", fill="y", padx=(0, 10))
@@ -755,17 +768,9 @@ class App:
         # --- account card
         f, c = self.card(left, "ACCOUNT")
         f.pack(fill="x", pady=(0, 8))
-        self.mode_var = tk.StringVar(value="paper")
-        seg = tk.Frame(c, bg=CARD)
-        seg.pack(fill="x")
-        r1 = ttk.Radiobutton(seg, text="Practice", variable=self.mode_var, value="paper", style="Seg.TRadiobutton",
-                             command=self.on_mode_change)
-        r1.pack(side="left", expand=True, fill="x")
-        r2 = ttk.Radiobutton(seg, text="Live", variable=self.mode_var, value="live", style="Seg.TRadiobutton",
-                             command=self.on_mode_change)
-        r2.pack(side="left", expand=True, fill="x")
-        Tip(r1, "Practice uses pretend money. Nothing real happens, so it's completely safe.")
-        Tip(r2, "Live trades REAL money on your Coinbase account. Needs a login.")
+        self.mode_desc = tk.Label(c, text="", bg=CARD, fg=TEXT, font=("", 10, "bold"), anchor="w", justify="left",
+                                  wraplength=230)
+        self.mode_desc.pack(fill="x")
         self.budget_lbl = tk.Label(c, text="Practice money (pretend, USD)", bg=CARD, fg=MUTED)
         self.budget_lbl.pack(anchor="w", pady=(8, 0))
         self.cash_var = tk.StringVar(value="1000")
@@ -1625,7 +1630,10 @@ class App:
 
     def ui_running(self, on):
         self.root.after(50, self.grid_refresh)
-        self.btn.config(text="Stop the bot" if on else "Start the bot", style="Stop.TButton" if on else "Accent.TButton")
+        live = self.live if self.session else self.mode_var.get() == "live"
+        self.btn.config(text=("Stop the LIVE bot" if live else "Stop the practice bot") if on else
+                        ("Start LIVE bot (real money)" if live else "Start practice bot"),
+                        style="Stop.TButton" if (on or live) else "Accent.TButton")
         if not on:
             self._gap_ref = None
         self.apply_awake()
@@ -1639,8 +1647,23 @@ class App:
 
     def update_status(self):
         live = self.live if self.session else self.mode_var.get() == "live"
-        self.mode_pill.config(text=("LIVE" if live else "PAPER") + ("  ●  RUNNING" if self.running else ""),
-                              bg=RED if live else GREEN)
+        self.mode_pill.config(text="\u25cf  RUNNING" if self.running else "", fg=RED if live else GREEN)
+        on_p, on_l = not live, live
+        self.seg_paper.config(bg=GREEN if on_p else LINE, fg="white" if on_p else MUTED,
+                              text="PRACTICE" + ("  \u25cf" if on_p and self.running else ""))
+        self.seg_live.config(bg=RED if on_l else LINE, fg="white" if on_l else MUTED,
+                             text="LIVE  \u2022  REAL MONEY" + ("  \u25cf" if on_l and self.running else "") if on_l else "LIVE")
+        self.mode_stripe.config(bg=RED if live else GREEN, height=6 if live else 4)
+        self.body.config(highlightthickness=3 if live else 0, highlightbackground=RED, highlightcolor=RED)
+        if live:
+            self.headline_lbl.config(bg="#450a0a" if DARK else "#fef2f2", fg="#fecaca" if DARK else "#991b1b")
+        else:
+            self.headline_lbl.config(bg="#052e16" if DARK else "#ecfdf5", fg="#bbf7d0" if DARK else "#065f46")
+        self.mode_desc.config(text=("LIVE: real money on your Coinbase account." if live else
+                                    "PRACTICE: pretend money on real prices."), fg=RED if live else GREEN)
+        if not self.running:
+            self.btn.config(text="Start LIVE bot (real money)" if live else "Start practice bot",
+                            style="Stop.TButton" if live else "Accent.TButton")
         if self.logging_in:
             self.conn_lbl.config(text="Logging in...", fg=MUTED)
         elif self.client:
@@ -1649,6 +1672,43 @@ class App:
             self.conn_lbl.config(text="Not logged in" + ("  (needed for Live)" if live else ""), fg=MUTED)
         self.login_btn.config(text="Log out" if self.client else "Log in to Coinbase")
         self.budget_lbl.config(text=f"Money to trade with ({self.cur_quote()})" if live else f"Practice money (pretend {self.cur_quote()})")
+
+    def switch_mode(self, target):
+        """Practice and Live are separate: each keeps its own session. Switching saves and closes the current
+        one, clears the screen, then shows the other mode (press Start to resume its saved session)."""
+        cur = "live" if (self.live if self.session else self.mode_var.get() == "live") else "paper"
+        if target == cur:
+            return
+        name = {"paper": "Practice", "live": "LIVE"}
+        if self.running and not messagebox.askyesno(
+                "Switch mode", f"The {name[cur]} bot is running. Stop it and switch to {name[target]}?\n\n"
+                               f"Your {name[cur]} session is saved and can be resumed later. Open positions stay open."):
+            return
+        if self.running:
+            self.running = False
+            self.ui_running(False)
+        if self.session:
+            self.save_state()
+            self.write(f"{name[cur]} session saved.")
+        self.session = False
+        try:
+            cash = float(self.cash_var.get())
+        except ValueError:
+            cash = 1000.0
+        self.reset_state(cash)
+        self.live = target == "live"
+        self.mode_var.set(target)
+        self.refresh_board()
+        self.refresh_trades()
+        self.refresh_view()
+        saved = E.load_json(E.state_path(target == "live"))
+        if saved:
+            self.write(f"Now in {name[target]}. A saved {name[target]} session is waiting (cash ${saved.get('cash', 0):,.2f}, "
+                       f"{len(saved.get('trades', []))} trades): press Start to resume it.", "good" if target == "paper" else "warn")
+        else:
+            self.write(f"Now in {name[target]}.", "good" if target == "paper" else "warn")
+        self.live = False  # no session yet; the mode switch decides what Start opens
+        self.on_mode_change()
 
     def on_mode_change(self):
         self.update_team_label()
@@ -2332,7 +2392,9 @@ class App:
         if self.running and self.seeded and self.last_tick:
             left = max(0, int(self.last_bar + self.session_bar * 60 - time.time()))
             nxt = f" | next {left // 60}:{left % 60:02d}"
-        self.root.title(f"CBBF - {'RUNNING ' if self.running else ''}{pl:+,.2f}{nxt}" if self.session else "CBBF")
+        live = self.live if self.session else self.mode_var.get() == "live"
+        mode = "LIVE (REAL MONEY)" if live else "PRACTICE"
+        self.root.title(f"CBBF {mode} - {'RUNNING ' if self.running else ''}{pl:+,.2f}{nxt}" if self.session else f"CBBF {mode}")
         self.tiles["equity"].config(text=f"${eq:,.2f}")
         pct = pl / self.start_cash * 100 if self.start_cash else 0.0
         self.tiles["pl"].config(text=f"{pl:+,.2f}  ({pct:+.2f}%)", fg=GREEN if pl >= 0 else RED)

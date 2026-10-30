@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.9.2
+- **Practice and Live are now clearly separate parts of the app.**
+  - A big **PRACTICE / LIVE** switch at the top left replaces the small radio buttons.
+  - **Practice** is green throughout: green switch, green stripe and banner, "Start practice bot".
+  - **Live** is red throughout: a red border around the whole app, a red stripe, a dark-red "LIVE" banner, a red
+    "Start LIVE bot (real money)" button, and "CBBF LIVE (REAL MONEY)" in the window title.
+  - Each mode keeps its own session. Switching saves and closes the current one and clears the screen, so Practice
+    numbers never show in Live or the other way round. The other mode's saved session is waiting: press Start to
+    resume it. Switching while the bot runs asks first.
+
 ## 1.9.1
 - **Design an egg** (Bot Farm tab or Ctrl+E): write your own bot. Pick a strategy and its numbers (for example RSI:
   buy below 28, sell above 72), how often it decides, its own safety stop and profit target, and habits like a
