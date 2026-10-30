@@ -1507,7 +1507,7 @@ class App:
         self.log.see("end")
         self.log.config(state="disabled")
 
-    def notify(self, title, msg, important=True):
+    def notify(self, title, msg, important=True, sound="notify"):
         """Desktop notification. Routine events (every trade) only notify if 'notify_trades' is on, the
         system sound only plays if 'sound' is on, and the mute button in the top bar silences everything."""
         if not self.settings.get("notify") or self.cfg.get("muted"):
@@ -1515,8 +1515,8 @@ class App:
         if not important and not self.settings.get("notify_trades", False):
             return
         try:
-            if self.settings.get("sound", False):
-                self.root.bell()
+            if self.settings.get("chime", True) and sound not in (self.settings.get("sounds_off") or []):
+                E.play_sound(sound, self.settings.get("chime_volume", 60))
             msg = msg.replace('"', "'")
             if sys.platform == "darwin":
                 subprocess.Popen(["osascript", "-e", f'display notification "{msg}" with title "{title}"'])
@@ -2374,7 +2374,7 @@ class App:
                         self.tick_lbl.config(fg=RED, text=f"No new prices for {mins}m {secs:02d}s. Reconnecting...")
                         if age > 300 and not self._stale_sent:
                             self._stale_sent = True
-                            self.notify("CBBF", "No prices for over 5 minutes. Check your connection.")
+                            self.notify("CBBF", "No prices for over 5 minutes. Check your connection.", sound="problem")
                     else:
                         self._stale_sent = False
                         self.tick_lbl.config(fg=MUTED)
@@ -2663,7 +2663,7 @@ class App:
                 self.write(msg, "good")
                 self.alert("hof", msg)
             if new:
-                self.notify("CBBF", f"{new} bot{'s' if new != 1 else ''} joined the Hall of Fame")
+                self.notify("CBBF", f"{new} bot{'s' if new != 1 else ''} joined the Hall of Fame", sound="hof")
         except Exception:
             note = self._record_error("updating the Hall of Fame")
             if note:
@@ -2757,7 +2757,7 @@ class App:
             self.ui_running(False)
             self.write(f"HALTED: daily loss limit ({self.settings['daily_loss']}%) reached. Positions are still open.")
             self.alert("problems", f"HALTED: daily loss limit ({self.settings['daily_loss']}%) reached. Positions are still open.")
-            self.notify("CBBF", "Daily loss limit reached. Trading halted.")
+            self.notify("CBBF", "Daily loss limit reached. Trading halted.", sound="problem")
             self.save_state()
 
     # ---------------- trading ----------------
@@ -2830,7 +2830,7 @@ class App:
         else:
             msg = f"Sold {c} at ${px:,.2f} for ${usd:,.2f}, {'made' if (pl or 0) >= 0 else 'lost'} ${abs(pl or 0):,.2f} ({why})"
         self.write(("LIVE: " if self.live else "Practice: ") + msg)
-        self.notify("CBBF", f"{side.upper()} {c} @ {px:,.2f} ({reason})", important=False)
+        self.notify("CBBF", f"{side.upper()} {c} @ {px:,.2f} ({reason})", important=False, sound="trade")
         self.alert("trades", ("LIVE " if self.live else "Practice ") + msg)
 
     def sell_all(self):
@@ -3159,7 +3159,7 @@ class App:
             self.running = False
             self.ui_running(False)
             self.write(f"Stopped after {MAX_FAILS} consecutive order failures.")
-            self.notify("CBBF", "Stopped after repeated order failures.")
+            self.notify("CBBF", "Stopped after repeated order failures.", sound="problem")
         self.refresh_view()
 
     # ---------------- add-on setup ----------------
@@ -4832,8 +4832,25 @@ class App:
         ttk.Checkbutton(misc, text="Notifications (important events)", variable=notify).pack(side="left")
         ntr = tk.BooleanVar(value=bool(self.settings.get("notify_trades", False)))
         ttk.Checkbutton(misc, text="...also every trade", variable=ntr).pack(side="left", padx=(8, 0))
-        snd = tk.BooleanVar(value=bool(self.settings.get("sound", False)))
-        ttk.Checkbutton(misc, text="Sound", variable=snd).pack(side="left", padx=(8, 0))
+        snd = tk.BooleanVar(value=bool(self.settings.get("chime", True)))
+        ttk.Checkbutton(misc, text="CBBF sounds", variable=snd).pack(side="left", padx=(8, 0))
+        vol = tk.IntVar(value=int(self.settings.get("chime_volume", 60)))
+        ttk.Scale(misc, from_=5, to=100, variable=vol, length=80).pack(side="left", padx=(4, 0))
+        sb = ttk.Button(misc, text="\u25b6", width=3, command=lambda: E.play_sound(
+            ("trade", "notify", "hof", "problem")[getattr(self, "_demo", 0) % 4], vol.get()) or
+            setattr(self, "_demo", getattr(self, "_demo", 0) + 1))
+        sb.pack(side="left", padx=(4, 0))
+        Tip(sb, "Hear the sounds: each click plays the next one (trade, notice, Hall of Fame, problem).")
+        srow = ttk.Frame(outer)
+        srow.pack(fill="x", pady=(4, 0))
+        ttk.Label(srow, text="Play a sound for:", foreground=MUTED).pack(side="left")
+        off = set(self.settings.get("sounds_off") or [])
+        snd_vars = {}
+        for kind, txt in (("trade", "trades (blip)"), ("notify", "notices (chime)"), ("hof", "Hall of Fame (fanfare)"),
+                          ("problem", "problems (low tone)")):
+            snd_vars[kind] = tk.BooleanVar(value=kind not in off)
+            ttk.Checkbutton(srow, text=txt, variable=snd_vars[kind]).pack(side="left", padx=(8, 0))
+            ttk.Button(srow, text="\u25b6", width=2, command=lambda k=kind: E.play_sound(k, vol.get())).pack(side="left")
         keep = tk.BooleanVar(value=bool(self.settings.get("keep_awake", True)))
         ttk.Checkbutton(misc, text="Keep the computer awake while the bot runs", variable=keep).pack(side="left", padx=12)
 
@@ -4882,7 +4899,9 @@ class App:
             self.settings.update(new)
             self.settings["params"], self.settings["notify"] = params, notify.get()
             self.settings["keep_awake"] = keep.get()
-            self.settings["notify_trades"], self.settings["sound"] = ntr.get(), snd.get()
+            self.settings["notify_trades"], self.settings["chime"] = ntr.get(), snd.get()
+            self.settings["chime_volume"] = int(vol.get())
+            self.settings["sounds_off"] = [k for k, v in snd_vars.items() if not v.get()]
             self.apply_awake()
             self.auto_coin_var.set(int(self.settings.get("auto_coins", 0)) > 0)
             match = [n for n, p in E.STYLES.items() if all(abs(self.settings[k] - v) < 1e-9 for k, v in p.items())]

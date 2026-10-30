@@ -438,7 +438,10 @@ WILDCARD_STRATS = [n for n in STRATS if n != "Dollar-cost averaging"]  # DCA nev
 DEFAULT_SETTINGS = {
     "trade_pct": 10.0, "stop_loss": 5.0, "take_profit": 10.0, "daily_loss": 10.0,
     "bar_minutes": 1, "refresh": 2, "fee_pct": 0.6, "evolve_every": 24, "notify": True,
-    "sound": False,              # play the system sound with notifications (off: it gets noisy)
+    "sound": False,              # (old setting, no longer used: CBBF has its own chime now)
+    "chime": True,               # play CBBF's own sounds with notifications (not the Windows system sound)
+    "chime_volume": 60,          # 0-100
+    "sounds_off": [],            # which of CBBF's sounds are switched off: trade, notify, hof, problem
     "notify_trades": False,      # also notify on every trade (off: only important events)
     "max_coin_pct": 50.0, "style": "Balanced", "keep_awake": True,
     "size_mult": {},  # manual-mode trade size per strategy name (1.0 = normal)
@@ -2242,3 +2245,68 @@ def restore_backup(here, backup):
     for rel in os.listdir(backup):
         if UPDATE_FILES.match(rel):
             shutil.copy2(os.path.join(backup, rel), os.path.join(here, rel))
+
+
+# ---------------- CBBF's own notification sounds ----------------
+SOUNDS = {  # (frequency Hz, start s, length s) notes; synthesized, so nothing to download
+    "trade": [(988, 0.0, 0.09), (1319, 0.05, 0.12)],
+    "notify": [(1319, 0.0, 0.35), (1760, 0.13, 0.5)],
+    "hof": [(1047, 0.0, 0.22), (1319, 0.11, 0.22), (1568, 0.22, 0.22), (2093, 0.33, 0.6)],
+    "problem": [(440, 0.0, 0.28), (349, 0.22, 0.42)],
+}
+
+
+def sound_path(kind, volume=60):
+    """Writes (once) and returns a small .wav for this kind of sound: soft bell-like tones with a quick
+    fade, clearly different from the Windows system sounds."""
+    import math as _m
+    import struct
+    import wave
+    vol = max(0, min(100, int(volume)))
+    folder = os.path.join(HOME_DIR, "sounds")
+    path = os.path.join(folder, f"{kind}-{vol}.wav")
+    if os.path.exists(path):
+        return path
+    os.makedirs(folder, exist_ok=True)
+    rate = 22050
+    notes = SOUNDS.get(kind, SOUNDS["notify"])
+    total = max(st + ln for _, st, ln in notes) + 0.05
+    buf = [0.0] * int(rate * total)
+    for f, st, ln in notes:
+        a = int(st * rate)
+        for i in range(int(ln * rate)):
+            t = i / rate
+            env = min(1.0, t / 0.008) * _m.exp(-t * 6.5 / ln)  # quick attack, bell-like decay
+            v = (_m.sin(2 * _m.pi * f * t) + 0.35 * _m.sin(2 * _m.pi * 2 * f * t) + 0.12 * _m.sin(2 * _m.pi * 3 * f * t)) * env
+            if a + i < len(buf):
+                buf[a + i] += v
+    peak = max(1e-9, max(abs(x) for x in buf))
+    scale = 32767 * 0.9 * (vol / 100) / peak
+    with wave.open(path + ".tmp", "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(b"".join(struct.pack("<h", int(x * scale)) for x in buf))
+    os.replace(path + ".tmp", path)
+    return path
+
+
+def play_sound(kind, volume=60):
+    """Plays one of CBBF's sounds without blocking. Silently does nothing if the computer can't."""
+    def run():
+        try:
+            path = sound_path(kind, volume)
+            if sys.platform.startswith("win"):
+                import winsound
+                winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["afplay", path])
+            else:
+                for player in ("paplay", "aplay", "pw-play"):
+                    if shutil.which(player):
+                        subprocess.Popen([player, path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        break
+        except Exception:
+            pass
+    import threading
+    threading.Thread(target=run, daemon=True).start()
