@@ -72,6 +72,7 @@ DARK_P = dict(BG="#111827", CARD="#1f2937", TEXT="#f3f4f6", MUTED="#9ca3af",
               ACCENT="#3b82f6", GREEN="#22c55e", RED="#ef4444", LINE="#374151")
 EXTRA_TO_DARK = {"#eff6ff": "#1e3a5f", "#1e3a8a": "#bfdbfe", "#b45309": "#fbbf24"}  # headline bar, warning text
 DARK = True
+LIVE_BLUE = "#0052ff"  # Live mode colour (Coinbase blue); Practice mode is green
 
 
 def apply_theme(root, dark):
@@ -1086,6 +1087,10 @@ class App:
         st.configure("Accent.TButton", background=ACCENT, foreground="white", font=("", 11, "bold"), padding=8)
         st.map("Accent.TButton", background=[("active", "#1d4ed8")])
         st.configure("Stop.TButton", background=RED, foreground="white", font=("", 11, "bold"), padding=8)
+        st.configure("Live.TButton", background=LIVE_BLUE, foreground="white", font=("", 11, "bold"), padding=8)
+        st.map("Live.TButton", background=[("active", "#003ecb")])
+        st.configure("Go.TButton", background="#16a34a", foreground="white", font=("", 11, "bold"), padding=8)
+        st.map("Go.TButton", background=[("active", "#15803d")])
         st.map("Stop.TButton", background=[("active", "#b91c1c")])
         st.configure("Plain.TButton", padding=5)
         st.configure("Treeview", foreground=TEXT)
@@ -1633,7 +1638,7 @@ class App:
         live = self.live if self.session else self.mode_var.get() == "live"
         self.btn.config(text=("Stop the LIVE bot" if live else "Stop the practice bot") if on else
                         ("Start LIVE bot (real money)" if live else "Start practice bot"),
-                        style="Stop.TButton" if (on or live) else "Accent.TButton")
+                        style="Stop.TButton" if on else ("Live.TButton" if live else "Go.TButton"))
         if not on:
             self._gap_ref = None
         self.apply_awake()
@@ -1647,23 +1652,23 @@ class App:
 
     def update_status(self):
         live = self.live if self.session else self.mode_var.get() == "live"
-        self.mode_pill.config(text="\u25cf  RUNNING" if self.running else "", fg=RED if live else GREEN)
+        self.mode_pill.config(text="\u25cf  RUNNING" if self.running else "", fg=LIVE_BLUE if live else GREEN)
         on_p, on_l = not live, live
         self.seg_paper.config(bg=GREEN if on_p else LINE, fg="white" if on_p else MUTED,
                               text="PRACTICE" + ("  \u25cf" if on_p and self.running else ""))
-        self.seg_live.config(bg=RED if on_l else LINE, fg="white" if on_l else MUTED,
+        self.seg_live.config(bg=LIVE_BLUE if on_l else LINE, fg="white" if on_l else MUTED,
                              text="LIVE  \u2022  REAL MONEY" + ("  \u25cf" if on_l and self.running else "") if on_l else "LIVE")
-        self.mode_stripe.config(bg=RED if live else GREEN, height=6 if live else 4)
-        self.body.config(highlightthickness=3 if live else 0, highlightbackground=RED, highlightcolor=RED)
+        self.mode_stripe.config(bg=LIVE_BLUE if live else GREEN, height=6 if live else 4)
+        self.body.config(highlightthickness=3 if live else 0, highlightbackground=LIVE_BLUE, highlightcolor=LIVE_BLUE)
         if live:
-            self.headline_lbl.config(bg="#450a0a" if DARK else "#fef2f2", fg="#fecaca" if DARK else "#991b1b")
+            self.headline_lbl.config(bg="#0a1f4d" if DARK else "#eff6ff", fg="#bfdbfe" if DARK else "#0b3aa8")
         else:
             self.headline_lbl.config(bg="#052e16" if DARK else "#ecfdf5", fg="#bbf7d0" if DARK else "#065f46")
         self.mode_desc.config(text=("LIVE: real money on your Coinbase account." if live else
-                                    "PRACTICE: pretend money on real prices."), fg=RED if live else GREEN)
+                                    "PRACTICE: pretend money on real prices."), fg=LIVE_BLUE if live else GREEN)
         if not self.running:
             self.btn.config(text="Start LIVE bot (real money)" if live else "Start practice bot",
-                            style="Stop.TButton" if live else "Accent.TButton")
+                            style="Live.TButton" if live else "Go.TButton")
         if self.logging_in:
             self.conn_lbl.config(text="Logging in...", fg=MUTED)
         elif self.client:
