@@ -1,5 +1,64 @@
 # Changelog
 
+## 1.13.0
+**A Learning page, real backtesting with memory, islands, and safety for real money**
+
+Settings > Learning (new)
+- One organised page for everything the bots can learn from, in four groups (how bots are judged, breeding and
+  evolution, rules a bot can grow, memory), each with an on/off switch, plus All on / All off / Recommended.
+
+Backtesting
+- **Backtest any bot** (right-click a dragon, or Tools > Backtest a bot): pick a farm or Library bot, 1 day to 30 days
+  of history and the candle size. You get return vs just holding, worst drop, win rate, fees, a **walk-forward** check
+  (did it beat holding in every quarter of the history, or just one lucky stretch), a **bad-luck stress test** (the
+  same trades in random order), a **double-fees test**, and results per coin, per market mood and per rule.
+- **Save to its memory**: the bot keeps what the test learned (how each study and never-rule did, its weak coins, how
+  it does in each market mood, and the result) and its children inherit it. **Save + teach the farm** also feeds the
+  post-trade review and makes a winning bot an elder.
+- **Backtest the Hall of Fame**: every champion tested and ranked at once, with "Save all to their memories".
+
+Bots learn more
+- **Bigger-trend studies**: a slower timeframe (3 to 12 times the bot's own) must agree before buying.
+- **Bitcoin leads**: BTC's recent move votes for or against buying other coins.
+- **Islands**: the farm is split into sub-farms that breed separately and swap a champion now and then (more variety).
+- **Post-trade review**: losing trades note which never-rule would have stopped them; new rules favour those.
+- **Adaptive stops**: a trait that widens stops in wild markets and tightens them in calm ones.
+- **Mutation memory**: the farm does more of the kinds of change that have produced winners.
+- **Multi-core warm-up**: islands learn on several processor cores at once at the start.
+
+Trust before real money
+- **Shadow Live**: a pretend account that follows only your Hall of Fame bots in real time ("Hall of Fame shadow"
+  chart, and on the farm pulse).
+- **Nightly retest**: once a day the Hall of Fame is re-backtested on the latest prices; stale ones get a RUSTY badge.
+- **Graduation**: before LIVE with your Hall of Fame or team, each bot is checked (hours winning, profit, ahead of
+  holding, trades, a passed twin test or backtest, not rusty). Go with only the graduates, all, or cancel.
+- **Kill switch** (red button at the top): stop, cancel waiting orders, sell everything, lock LIVE until you type UNLOCK.
+- Declining LIVE now always keeps you in Practice, and CBBF always opens in Practice.
+
+Look and feel
+- **Farm pulse** strip: births and retirements this hour, the season, the best bot of the hour, the shadow result.
+- **Badges** (First 10%, Beat the market, Crash survivor, Sharpshooter, Marathon, Dynasty, Twin-proven, Backtested,
+  Powerhouse) on cards and the bot card.
+- **Bloodlines**: a drawn family tree with portraits; strong lines glow gold.
+- **Compare two bots** side by side (differences highlighted).
+- **Farm replay**: play back the farm's eggs, rising and BEASTS over time, with its big moments.
+
+Convenience
+- **See / edit a bot's rules**: right-click a dragon (or its card) to see every learned rule with its evidence, change
+  anything (strategy numbers, studies, bigger-trend and Bitcoin studies, never-rules, stops, habits) and hatch the edit
+  as its child or replace it. Its learned study settings are kept unless you change them.
+- **Export** button right on the farm (whole farm, a den, the Hall of Fame, the Library or your selection).
+- **Reset** button under Start: reset the practice account, the farm, or both (Library and Hall of Fame are kept).
+- **Phone remote** (Telegram): /status, /pause, /resume, /report, /kill confirm.
+- **Trading hours** (and weekdays only) for the account; the bots keep learning outside them.
+- **Settings profiles** (File menu): save and switch whole setups.
+- **Back up everything / Restore** (File menu): one zip with your Library, Hall of Fame, farms and settings.
+
+Snappier
+- Animations and chart redraws pause while you drag or resize the window, and redraw once when you stop.
+- Resizing redraws once instead of on every pixel; bot identities are cached; the Trades list only rebuilds when
+  you're looking at it.
+
 ## 1.12.0
 **Smarter breeding, safer live trading, a fresher farm**
 
