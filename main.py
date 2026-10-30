@@ -874,8 +874,14 @@ class App:
             self.strat_vars[name] = v
             self.strat_btns.append(b)
 
-        self.btn = ttk.Button(left, text="Start the bot", style="Accent.TButton", command=self.toggle)
+        self.btn = ttk.Button(left, text="Start the bot", style="Accent.TButton", command=lambda: self.start_choice("continue"))
         self.btn.pack(fill="x", pady=(2, 4))
+        self.new_btn = ttk.Button(left, text="Start new", style="Plain.TButton", command=lambda: self.start_choice("new"))
+        self.new_btn.pack(fill="x", pady=(0, 4))
+        self.new_btn.pack_forget()
+        self._new_after = self.btn
+        Tip(self.new_btn, "Start a fresh session instead of continuing the saved one. Your trade history stays in the "
+                          "Trades tab and trades.csv.")
         ttk.Button(left, text="Sell everything now", style="Plain.TButton", command=self.sell_all).pack(fill="x")
         trow = tk.Frame(left, bg=BG)
         trow.pack(fill="x", pady=(4, 0))
@@ -1674,8 +1680,23 @@ class App:
         self.mode_desc.config(text=("LIVE: real money on your Coinbase account." if live else
                                     "PRACTICE: pretend money on real prices."), fg=LIVE_BLUE if live else GREEN)
         if not self.running:
-            self.btn.config(text="Start LIVE bot (real money)" if live else "Start practice bot",
-                            style="Live.TButton" if live else "Go.TButton")
+            saved = None if self.session else self.saved_session(live)
+            if self.session:
+                txt = "Continue LIVE bot (real money)" if live else "Continue practice bot"
+            elif saved:
+                txt = (f"Continue {'LIVE' if live else 'practice'} session  "
+                       f"(${float(saved.get('cash', 0)) + 0:,.0f} cash, {len(saved.get('trades', []))} trades)")
+            else:
+                txt = "Start LIVE bot (real money)" if live else "Start practice bot"
+            self.btn.config(text=txt, style="Live.TButton" if live else "Go.TButton")
+            if saved and not self.session:
+                self.new_btn.config(text=f"Start a new {'LIVE' if live else 'practice'} session")
+                if not self.new_btn.winfo_ismapped():
+                    self.new_btn.pack(fill="x", pady=(0, 4), after=self.btn)
+            elif self.new_btn.winfo_ismapped():
+                self.new_btn.pack_forget()
+        elif self.new_btn.winfo_ismapped():
+            self.new_btn.pack_forget()
         if self.logging_in:
             self.conn_lbl.config(text="Logging in...", fg=MUTED)
         elif self.client:
@@ -1684,6 +1705,23 @@ class App:
             self.conn_lbl.config(text="Not logged in" + ("  (needed for Live)" if live else ""), fg=MUTED)
         self.login_btn.config(text="Log out" if self.client else "Log in to Coinbase")
         self.budget_lbl.config(text=f"Money to trade with ({self.cur_quote()})" if live else f"Practice money (pretend {self.cur_quote()})")
+
+    def saved_session(self, live=None):
+        """The saved session for a mode (cached; re-read only when the file changes), or None."""
+        if live is None:
+            live = self.mode_var.get() == "live"
+        path = E.state_path(live)
+        return self._cached(path, lambda: E.load_json(path)) if os.path.exists(path) else None
+
+    def start_choice(self, choice):
+        """Start button: continue the saved session (or start one), or start a new one. While running it stops."""
+        if self.running:
+            return self.toggle()
+        self._choice = choice
+        try:
+            self.toggle()
+        finally:
+            self._choice = "continue"
 
     def switch_mode(self, target):
         """Practice and Live are separate: each keeps its own session. Switching saves and closes the current
@@ -2553,16 +2591,8 @@ class App:
         live = self.mode_var.get() == "live"
         saved = E.load_json(E.state_path(live))
         resume = False
-        if saved and getattr(self, "_auto_resume", False):
-            resume = True
-        elif saved:
-            ans = messagebox.askyesnocancel(
-                "Resume session?",
-                f"A saved {'live' if live else 'paper'} session exists (cash ${saved['cash']:,.2f}, "
-                f"{len(saved['trades'])} trades).\n\nYes = resume it\nNo = start fresh\nCancel = abort")
-            if ans is None:
-                return False
-            resume = ans
+        if saved:  # the Continue / Start new buttons decide (no pop-up)
+            resume = getattr(self, "_auto_resume", False) or getattr(self, "_choice", "continue") != "new"
         try:
             budget = float(self.cash_var.get())
             assert budget > 0

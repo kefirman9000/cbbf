@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.9.5
+- No more "Resume session?" pop-up. When a saved session exists, the main button says **Continue practice session**
+  (or Continue LIVE session) with its cash and trade count, and a **Start a new ... session** button appears under it.
+
 ## 1.9.4
 - **Famous strategies join the farm** (Wildcard): golden cross (50/200), Turtle breakout, Wilder's RSI 30/70,
   Connors RSI-2, MACD 12/26/9, Bollinger 20/2, the 9/21 EMA, a Fibonacci ribbon, Supertrend 10/3, Ichimoku 9/26,
