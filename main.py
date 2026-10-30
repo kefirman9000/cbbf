@@ -579,6 +579,10 @@ class App:
                                    relief="flat", bd=0, bg=LINE, fg=TEXT, activebackground=LINE, activeforeground=TEXT,
                                    padx=10, pady=3, cursor="hand2")
         self.theme_btn.pack(side="right", padx=(0, 14))
+        self.mute_btn = tk.Button(header, text="\U0001F515" if self.cfg.get("muted") else "\U0001F514", command=self.toggle_mute,
+                                  relief="flat", bd=0, bg=CARD, fg=TEXT, activebackground=CARD, cursor="hand2", font=("", 11))
+        self.mute_btn.pack(side="right", padx=(0, 8))
+        Tip(self.mute_btn, "Mute or unmute all notifications. Sounds are off unless you turn them on in Settings.")
         self.upd_btn = tk.Button(header, text="Update", command=self.show_update, relief="flat", bd=0, bg=GREEN,
                                  fg="white", activebackground=GREEN, activeforeground="white", padx=10, pady=3,
                                  cursor="hand2", font=("", 9, "bold"))
@@ -1503,18 +1507,49 @@ class App:
         self.log.see("end")
         self.log.config(state="disabled")
 
-    def notify(self, title, msg):
-        if not self.settings.get("notify"):
+    def notify(self, title, msg, important=True):
+        """Desktop notification. Routine events (every trade) only notify if 'notify_trades' is on, the
+        system sound only plays if 'sound' is on, and the mute button in the top bar silences everything."""
+        if not self.settings.get("notify") or self.cfg.get("muted"):
+            return
+        if not important and not self.settings.get("notify_trades", False):
             return
         try:
-            self.root.bell()
+            if self.settings.get("sound", False):
+                self.root.bell()
             msg = msg.replace('"', "'")
             if sys.platform == "darwin":
                 subprocess.Popen(["osascript", "-e", f'display notification "{msg}" with title "{title}"'])
             elif sys.platform.startswith("linux") and shutil.which("notify-send"):
                 subprocess.Popen(["notify-send", title, msg])
+            elif sys.platform.startswith("win"):
+                self.toast(title, msg)
         except Exception:
             pass
+
+    def toast(self, title, msg):
+        """A small silent pop-up in the corner of the screen (Windows), gone after 6 seconds."""
+        try:
+            w = tk.Toplevel(self.root)
+            w.overrideredirect(True)
+            w.attributes("-topmost", True)
+            f = tk.Frame(w, bg=CARD, highlightthickness=1, highlightbackground=ACCENT, padx=12, pady=8)
+            f.pack()
+            tk.Label(f, text=title, bg=CARD, fg=TEXT, font=("", 9, "bold")).pack(anchor="w")
+            tk.Label(f, text=msg, bg=CARD, fg=MUTED, wraplength=280, justify="left").pack(anchor="w")
+            w.update_idletasks()
+            sw, sh = w.winfo_screenwidth(), w.winfo_screenheight()
+            w.geometry(f"+{sw - w.winfo_reqwidth() - 20}+{sh - w.winfo_reqheight() - 70}")
+            w.bind("<Button-1>", lambda e: w.destroy())
+            w.after(6000, w.destroy)
+        except Exception:
+            pass
+
+    def toggle_mute(self):
+        self.cfg["muted"] = not self.cfg.get("muted", False)
+        E.save_json(CONFIG_PATH, self.cfg)
+        self.mute_btn.config(text="\U0001F515" if self.cfg["muted"] else "\U0001F514")
+        self.write("Notifications muted." if self.cfg["muted"] else "Notifications on.")
 
     # ---------------- help / welcome ----------------
     def info_window(self, title, text):
@@ -2795,7 +2830,7 @@ class App:
         else:
             msg = f"Sold {c} at ${px:,.2f} for ${usd:,.2f}, {'made' if (pl or 0) >= 0 else 'lost'} ${abs(pl or 0):,.2f} ({why})"
         self.write(("LIVE: " if self.live else "Practice: ") + msg)
-        self.notify("CBBF", f"{side.upper()} {c} @ {px:,.2f} ({reason})")
+        self.notify("CBBF", f"{side.upper()} {c} @ {px:,.2f} ({reason})", important=False)
         self.alert("trades", ("LIVE " if self.live else "Practice ") + msg)
 
     def sell_all(self):
@@ -4794,7 +4829,11 @@ class App:
         misc = ttk.Frame(outer)
         misc.pack(fill="x", pady=(8, 0))
         notify = tk.BooleanVar(value=bool(self.settings["notify"]))
-        ttk.Checkbutton(misc, text="Desktop notifications", variable=notify).pack(side="left")
+        ttk.Checkbutton(misc, text="Notifications (important events)", variable=notify).pack(side="left")
+        ntr = tk.BooleanVar(value=bool(self.settings.get("notify_trades", False)))
+        ttk.Checkbutton(misc, text="...also every trade", variable=ntr).pack(side="left", padx=(8, 0))
+        snd = tk.BooleanVar(value=bool(self.settings.get("sound", False)))
+        ttk.Checkbutton(misc, text="Sound", variable=snd).pack(side="left", padx=(8, 0))
         keep = tk.BooleanVar(value=bool(self.settings.get("keep_awake", True)))
         ttk.Checkbutton(misc, text="Keep the computer awake while the bot runs", variable=keep).pack(side="left", padx=12)
 
@@ -4843,6 +4882,7 @@ class App:
             self.settings.update(new)
             self.settings["params"], self.settings["notify"] = params, notify.get()
             self.settings["keep_awake"] = keep.get()
+            self.settings["notify_trades"], self.settings["sound"] = ntr.get(), snd.get()
             self.apply_awake()
             self.auto_coin_var.set(int(self.settings.get("auto_coins", 0)) > 0)
             match = [n for n, p in E.STYLES.items() if all(abs(self.settings[k] - v) < 1e-9 for k, v in p.items())]

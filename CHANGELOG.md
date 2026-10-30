@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.7.3
+- **Quieter**: no more Windows "ding" on every trade. Sound is now off unless you turn it on (Settings, bottom),
+  routine trades no longer notify unless you tick "...also every trade", and there's a mute button (bell) in the
+  top bar. On Windows, notifications are a small silent pop-up in the corner instead of the system sound.
+
 ## 1.7.2
 - **Bot Farm grid** (the new first tab): a live card for every bot with an animated dragon, level, XP and health
   bars, a status badge and stats. Filter by All / Working / Winning / Sleeping / Caught. Click to select (Ctrl-click

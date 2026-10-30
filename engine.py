@@ -438,6 +438,8 @@ WILDCARD_STRATS = [n for n in STRATS if n != "Dollar-cost averaging"]  # DCA nev
 DEFAULT_SETTINGS = {
     "trade_pct": 10.0, "stop_loss": 5.0, "take_profit": 10.0, "daily_loss": 10.0,
     "bar_minutes": 1, "refresh": 2, "fee_pct": 0.6, "evolve_every": 24, "notify": True,
+    "sound": False,              # play the system sound with notifications (off: it gets noisy)
+    "notify_trades": False,      # also notify on every trade (off: only important events)
     "max_coin_pct": 50.0, "style": "Balanced", "keep_awake": True,
     "size_mult": {},  # manual-mode trade size per strategy name (1.0 = normal)
     # Wildcard: how winners and shaky strategies are treated
