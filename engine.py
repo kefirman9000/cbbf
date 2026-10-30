@@ -631,6 +631,7 @@ DEFAULT_SETTINGS = {
     "bot_stops": True,           # Wildcard: the account's safety stop / lock-in-profit follow what the winning bots learned
     "classics": True,            # mix famous strategies (golden cross, turtle, RSI-2...) into the eggs
     "classic_rate": 25,          # % of new eggs that are a famous strategy (when one isn't on the farm yet)
+    "vetoes": True,              # bots can evolve never-rules, each graded by what the blocked trade would have done
     "prove_live": True,          # a bot can only be Winning after it also made money on prices it hadn't seen yet
     "risk_adjusted": True,       # rank winners by gain per unit of downside swing, not raw gain
     "long_holds": True,          # include slow, longer-holding bots from the start
@@ -774,6 +775,7 @@ def tournament_opts(settings):
                 slip=slip, fee_aware=bool(settings.get("fee_aware", True)),
                 prove_live=bool(settings.get("prove_live", True)), risk_adjusted=bool(settings.get("risk_adjusted", True)),
                 classics=bool(settings.get("classics", True)), classic_rate=float(settings.get("classic_rate", 25)) / 100,
+                vetoes=bool(settings.get("vetoes", True)),
                 long_holds=bool(settings.get("long_holds", True)))
 
 
@@ -835,11 +837,107 @@ def traits_text(t):
     return ", ".join(TRAITS[k]["text"](v) for k, v in sorted((t or {}).items()) if k in TRAITS)
 
 
+# ---- "never" rules: things a bot refuses to do. Each one is graded by what the blocked trade would have done. ----
+VETOES = {
+    "knife":   dict(lo=1.0, hi=15.0, side="buy", name="No falling knives",
+                    text=lambda x: f"never buys after a {x:g}% drop in the last 10 decisions"),
+    "spike":   dict(lo=0.3, hi=5.0, side="buy", name="No spike buying",
+                    text=lambda x: f"never buys right after a {x:g}%+ jump in one bar"),
+    "chase":   dict(lo=1.0, hi=10.0, side="buy", name="No chasing",
+                    text=lambda x: f"never buys more than {x:g}% above its 20-decision average"),
+    "revenge": dict(lo=1, hi=50, side="buy", name="No revenge trades",
+                    text=lambda x: f"never re-buys a coin within {int(x)} decisions of losing on it"),
+    "thin":    dict(lo=0.2, hi=1.0, side="buy", name="No thin markets",
+                    text=lambda x: f"never buys when volume is under {x:g}x normal"),
+    "mktdown": dict(lo=0.3, hi=5.0, side="buy", name="No buying into a sell-off",
+                    text=lambda x: f"never buys while the market (BTC) is down {x:g}%+ over 10 decisions"),
+    "panic":   dict(lo=0.5, hi=5.0, side="sell", name="No panic selling",
+                    text=lambda x: f"never sells on its strategy right after a {x:g}%+ one-bar drop (stops still work)"),
+}
+MAX_VETOES = 3
+
+
+def clean_vetoes(d):
+    out = {}
+    for k, spec in VETOES.items():
+        try:
+            x = float((d or {}).get(k, 0) or 0)
+        except (TypeError, ValueError):
+            x = 0
+        if x > 0 and len(out) < MAX_VETOES:
+            x = min(max(x, spec["lo"]), spec["hi"])
+            out[k] = int(round(x)) if k == "revenge" else round(x, 2)
+    return out
+
+
+def vetoes_text(d, stats=None):
+    parts = []
+    for k, x in (d or {}).items():
+        if k in VETOES:
+            t = VETOES[k]["text"](x)
+            st = (stats or {}).get(k)
+            if st and st[0]:
+                t += f" ({'saved' if st[1] >= 0 else 'cost'} {abs(st[1]):.1f}% over {int(st[0])} vetoes)"
+            parts.append(t)
+    return "; ".join(parts)
+
+
+def _veto(v, k, x, c, closes, n, extra, coins):
+    """True if never-rule k (value x) blocks a trade on coin c right now."""
+    p = closes[c]
+    L = 10 * v.tf
+    if len(p) < L + 2:
+        return False
+    if k == "knife":
+        return (p[-1] / p[-1 - L] - 1) * 100 <= -x
+    if k == "spike":
+        return abs(p[-1] / p[-2] - 1) * 100 >= x
+    if k == "chase":
+        seg = tail_series(p, v.tf, 21)
+        return len(seg) >= 20 and (seg[-1] / (sum(seg[-20:]) / 20) - 1) * 100 > x
+    if k == "revenge":
+        return n - v.lost_at.get(c, -10 ** 9) < x * v.tf
+    if k == "thin":
+        vol = ((extra or {}).get(c) or {}).get("v")
+        if not vol or len(vol) < L + 1:
+            return False
+        base = sum(vol[-L - 1:-1]) / L
+        return base > 0 and vol[-1] < x * base
+    if k == "mktdown":
+        ref = "BTC" if "BTC" in coins else None
+        if ref:
+            q = closes[ref]
+            return len(q) > L and (q[-1] / q[-1 - L] - 1) * 100 <= -x
+        moves = [closes[k2][-1] / closes[k2][-1 - L] - 1 for k2 in coins if len(closes[k2]) > L]
+        return bool(moves) and sum(moves) / len(moves) * 100 <= -x
+    if k == "panic":
+        return (p[-1] / p[-2] - 1) * 100 <= -x
+    return False
+
+
+def _grade_vetoes(v, closes, n):
+    """Settles blocked trades whose waiting time is up: how much did skipping them save (or cost)?"""
+    keep = []
+    for k, c, side, px, due in v.veto_wait:
+        if n < due or c not in closes:
+            keep.append((k, c, side, px, due))
+            continue
+        move = (closes[c][-1] / px - 1) * 100
+        # a skipped buy saved money if the price fell (plus the fees it didn't pay); a skipped sell, if it rose
+        saved = (-move + v.rt_cost * 100) if side == "buy" else move
+        st = v.veto_stats.setdefault(k, [0.0, 0.0])
+        st[0] += 1
+        st[1] += saved
+    v.veto_wait = keep
+
+
 def bot_step(v, closes, n, coins, extra=None):
     """One decision of one bot on every coin: its own exits first (stop-loss, take-profit, trailing stop,
     max hold), then its strategy signal filtered by its traits. Returns the trades made [(coin, trade)]."""
     last = {c: closes[c][-1] for c in coins}
     tr, made = v.traits, []
+    if v.veto_wait:
+        _grade_vetoes(v, closes, n)
     for c in coins:
         sim = v.sim
         sim.last = None
@@ -893,6 +991,13 @@ def bot_step(v, closes, n, coins, extra=None):
                 gain = last[c] / (sim.cost[c] / sim.pos[c]) - 1
                 if 0 <= gain < v.fee_guard:
                     s = None  # fee-aware: a profit this small would be eaten by the fees, so keep holding
+            if s and v.vetoes and (s == "buy" or sim.pos.get(c, 0) > 0):
+                for k, x in v.vetoes.items():
+                    if VETOES[k]["side"] == s and _veto(v, k, x, c, closes, n, extra, coins):
+                        if not any(w[0] == k and w[1] == c for w in v.veto_wait):  # one open what-if per rule and coin
+                            v.veto_wait.append((k, c, s, last[c], n + 10 * v.tf))
+                        s = None
+                        break
             v.sig[c] = s
             sim.act(c, s, last[c], n)
         t = sim.last
@@ -906,16 +1011,25 @@ def bot_step(v, closes, n, coins, extra=None):
                 v.since.pop(c, None)
                 v.hi.pop(c, None)
                 v.sold_at[c] = n
+                if t.get("pl") is not None and t["pl"] < 0:
+                    v.lost_at[c] = n
             made.append((c, t))
     return made
 
 
 class Variant:
-    def __init__(self, name, params, sim, maxlen, tf=1, risk=None, traits=None):
+    def __init__(self, name, params, sim, maxlen, tf=1, risk=None, traits=None, vetoes=None):
         self.name, self.params, self.sim = name, params, sim
         self.risk = clean_risk(risk)
         self.traits = clean_traits(traits)
         self.fee_guard = 0.0  # round-trip cost (fraction) when fee-aware: profits smaller than this aren't taken
+        self.rt_cost = 0.0    # round-trip cost (fraction) of a trade, used to grade its never-rules
+        self.vetoes = clean_vetoes(vetoes)
+        self.veto_stats = {}  # rule -> [times it blocked a trade, total % saved (negative = cost)]
+        self.veto_wait = []   # blocked trades waiting to be graded: (rule, coin, side, price, decision due)
+        self.lost_at = {}
+        self.power = 0.0      # 0..10: grows only with real money made on fresh prices while beating holding
+        self.live_high = None
         self.hi, self.since, self.entries, self.sold_at, self.run_sig = {}, {}, {}, {}, {}
         self.uid, self.parents, self.gen = 0, [], 0
         self.tf = clamp_tf(tf)  # decides once every tf bars, on tf-bar candles
@@ -940,20 +1054,21 @@ class Variant:
 
     @property
     def label(self):
-        rt = ", ".join(x for x in (risk_text(self.risk), traits_text(self.traits)) if x)
+        rt = ", ".join(x for x in (risk_text(self.risk), traits_text(self.traits), vetoes_text(self.vetoes)) if x)
         return (f"{self.name} ({', '.join(f'{k}={v}' for k, v in self.params.items())})"
                 + (f" on {self.tf}-bar candles" if self.tf > 1 else "") + (f" [{rt}]" if rt else ""))
 
     def key(self):
         return (self.name, self.tf, tuple(sorted((k, round(float(v), 4)) for k, v in self.params.items())),
-                tuple(sorted(self.risk.items())), tuple(sorted(self.traits.items())))
+                tuple(sorted(self.risk.items())), tuple(sorted(self.traits.items())), tuple(sorted(self.vetoes.items())))
 
 
 def bot_key(d):
     return (d["name"], clamp_tf(d.get("tf", 1)),
             tuple(sorted((k, round(float(v), 4)) for k, v in d["params"].items())),
             tuple(sorted(clean_risk(d.get("risk")).items())),
-            tuple(sorted(clean_traits(d.get("traits")).items())))
+            tuple(sorted(clean_traits(d.get("traits")).items())),
+            tuple(sorted(clean_vetoes(d.get("vetoes")).items())))
 
 
 class Tournament:
@@ -981,7 +1096,7 @@ class Tournament:
         self.retire_steps = max(0, int(retire_steps))  # decisions a bot may go without winning before it is replaced
         self.o = dict(trade_more=True, winner_boost=2.5, add_every=3, slow_every=6, fail_drop=3.0,
                       beat_hold=True, crossbreed=True, regime_aware=True, slip=0.0, fee_aware=True,
-                      prove_live=True, risk_adjusted=True, long_holds=True, classics=True, classic_rate=0.25)
+                      prove_live=True, risk_adjusted=True, long_holds=True, classics=True, classic_rate=0.25, vetoes=True)
         self.replaying = False
         self.o.update(opts or {})
         self.slowed, self.cool, self.add_cool, self.kind = [], {}, {}, {}
@@ -1012,7 +1127,7 @@ class Tournament:
         while len(self.vars) < min(self.cap, 24):  # a bigger, more varied field from the start
             name = self.rng.choice(WILDCARD_STRATS)
             self.vars.append(self._new(name, self._rand_params(name), tf=self.rng.choice(TIMEFRAMES),
-                                       risk=self.rand_risk(), traits=self.rand_traits()))
+                                       risk=self.rand_risk(), traits=self.rand_traits(), vetoes=self.rand_vetoes()))
         del self.vars[max(self.cap, 14):]
         for v in self.vars:
             self._register(v, [], "classic" if v.classic else "starter")
@@ -1021,9 +1136,10 @@ class Tournament:
         """How many bars a bot is judged over: slow bots get a longer window so they make enough decisions in it."""
         return self.W * min(max(1, clamp_tf(tf) // 2), 10)
 
-    def _new(self, name, params, tf=1, risk=None, traits=None):
+    def _new(self, name, params, tf=1, risk=None, traits=None, vetoes=None):
         v = Variant(name, params, Sim(self.start_cash, self.fee, self.pct, slip=self.o.get("slip", 0.0)),
-                    self.window_for(tf) + 1, tf, risk, traits)
+                    self.window_for(tf) + 1, tf, risk, traits, vetoes if self.o.get("vetoes", True) else None)
+        v.rt_cost = 2 * (self.fee + self.o.get("slip", 0.0))
         v.fee_guard = 2 * (self.fee + self.o.get("slip", 0.0)) if self.o.get("fee_aware", True) else 0.0
         return v
 
@@ -1036,6 +1152,42 @@ class Tournament:
                     v = self.rng.randint(1, 14)
                 t[k] = v
         return clean_traits(t)
+
+    def rand_vetoes(self, chance=0.35):
+        if not self.o.get("vetoes", True) or self.rng.random() > chance:
+            return {}
+        out = {}
+        for k in self.rng.sample(list(VETOES), self.rng.randint(1, 2)):
+            out[k] = self.rng.uniform(VETOES[k]["lo"], VETOES[k]["hi"])
+        return clean_vetoes(out)
+
+    def inherit_vetoes(self, parents):
+        """Never-rules for a child: proven rules (saved money when they blocked trades) are very likely passed on,
+        rules that keep blocking winners tend to be dropped, values get small tweaks, and now and then a new rule
+        is tried. The child also inherits half of its parents' evidence for each rule."""
+        if not self.o.get("vetoes", True):
+            return {}, {}
+        pool = {}
+        for p in parents:
+            for k, x in p.vetoes.items():
+                st = p.veto_stats.get(k, [0.0, 0.0])
+                avg = st[1] / st[0] if st[0] else 0.0
+                if k not in pool or avg > pool[k][1]:
+                    pool[k] = (x, avg, st)
+        out, stats = {}, {}
+        for k, (x, avg, st) in sorted(pool.items(), key=lambda kv: -kv[1][1]):
+            proven_bad = st[0] >= 5 and avg < 0
+            keep = 0.25 if proven_bad else 0.95 if avg > 0 and st[0] >= 5 else 0.8
+            if self.rng.random() < keep and len(out) < MAX_VETOES:
+                if self.rng.random() < 0.35:
+                    x *= self.rng.uniform(0.8, 1.25)
+                out[k] = x
+                stats[k] = [st[0] / 2, st[1] / 2]
+        if len(out) < MAX_VETOES and self.rng.random() < 0.15:
+            k = self.rng.choice([k for k in VETOES if k not in out])
+            out[k] = self.rng.uniform(VETOES[k]["lo"], VETOES[k]["hi"])
+        out = clean_vetoes(out)
+        return out, {k: s for k, s in stats.items() if k in out}
 
     def mutate_traits(self, t):
         out = dict(t)
@@ -1227,6 +1379,31 @@ class Tournament:
         fits = [x for x in fits if x[0] is not None]
         return max(fits)[1] if fits and max(fits)[0] > 0 else None
 
+    def health(self, v):
+        """0..1: how the bot is doing right now. Falls with drawdown from its recent best; never-rules that keep
+        saving money add a little, rules that keep blocking winners take some away. Very low health = it rests."""
+        h = 1.0 - self.drawdown(v) * 8 if v.eq else 1.0
+        bonus = 0.0
+        for k in v.vetoes:
+            st = v.veto_stats.get(k)
+            if st and st[0] >= 3:
+                bonus += max(-0.15, min(0.1, st[1] / st[0] / 20))
+        return max(0.0, min(1.0, h + bonus))
+
+    def update_power(self, v, edge):
+        """Power grows only from real money made on fresh prices (not replays) while beating just holding, and
+        fades slowly otherwise. It raises the bot's trade-size ceiling, its say in votes and its breeding odds."""
+        if self.replaying or not v.eq:
+            return
+        e = v.eq[-1]
+        if v.live_high is None:
+            v.live_high = e
+        if e > v.live_high and (edge is None or edge > 0):
+            v.power = min(10.0, v.power + (e / v.live_high - 1) * 40)  # a slow, earned climb
+            v.live_high = e
+        elif e < v.live_high * 0.98:
+            v.power = max(0.0, v.power - 0.02)
+
     def life(self, v):
         """Lifetime track record since the bot was created."""
         ret = v.eq[-1] / v.sim.start - 1 if v.eq and v.sim.start else 0.0
@@ -1252,7 +1429,9 @@ class Tournament:
             hold = self.hold_over(len(v.eq) - 1) if hasattr(self, "hold_curve") else self.hold_ret
             edge = None if hold is None else sc - hold
             behind = bool(o["beat_hold"] and edge is not None and edge <= 0)
-            failing = o["fail_drop"] > 0 and self.drawdown(v) * 100 > o["fail_drop"]
+            failing = (o["fail_drop"] > 0 and self.drawdown(v) * 100 > o["fail_drop"]) or self.health(v) < 0.1
+            self.update_power(v, None if self.hold_ret is None else sc - (self.hold_over(len(v.eq) - 1)
+                                                                          if hasattr(self, "hold_curve") else self.hold_ret))
             base = edge if (o["beat_hold"] and edge is not None and edge > 0) else sc
             proving = bool(o.get("prove_live", True)) and (
                 v.live_n < max(10, (v.eq.maxlen - 1) // 4) or (v.eq and v.live_eq0 and v.eq[-1] < v.live_eq0))
@@ -1264,6 +1443,8 @@ class Tournament:
                 status, w = "slowed", sc * cons ** 2
             if w > 0 and o.get("risk_adjusted", True):
                 w *= 0.5 + min(self.sortino(v), 5.0) / 2  # steady gains count for more than bumpy ones
+            if w > 0:
+                w *= 1 + v.power / 10  # proven power: a bigger say
             if w > 0 and o["regime_aware"]:
                 fit = self.mood_fit(v)
                 if fit is not None:
@@ -1277,7 +1458,7 @@ class Tournament:
         hi = max(1.0, o["winner_boost"] if o["trade_more"] else 2.0)
         for v in self.active:
             d = info[id(v)]
-            d["stake"] = 0.5 + (hi - 0.5) * d["weight"] / top
+            d["stake"] = 0.5 + (hi * (1 + v.power / 20) - 0.5) * d["weight"] / top  # power lifts the size ceiling
         for v in ranked[self.max_active:]:
             info[id(v)].update(status="standby", weight=0.0)
         self.slowed = sorted((v for v in self.vars if info[id(v)]["status"] == "slowed"),
@@ -1366,7 +1547,8 @@ class Tournament:
                      edge=d.get("edge"), behind=d.get("behind", False), proving=d.get("proving", False),
                      life=self.life(v), origin=v.origin,
                      risk=dict(v.risk), traits=dict(v.traits), uid=v.uid, parents=list(v.parents), gen=v.gen,
-                     classic=v.classic)
+                     classic=v.classic, vetoes=dict(v.vetoes), veto_stats={k: list(s) for k, s in v.veto_stats.items()},
+                     health=self.health(v), power=v.power)
                 for v, d in rows]
 
     def mutate(self, name, params, scale=0.25):
@@ -1448,7 +1630,7 @@ class Tournament:
             fam_n = {}
             for x in self.vars:
                 fam_n[x.name] = fam_n.get(x.name, 0) + 1
-            parent = self.rng.choices(self.active, weights=[self.info[id(v)]["weight"] / fam_n[v.name]
+            parent = self.rng.choices(self.active, weights=[self.info[id(v)]["weight"] / fam_n[v.name] * (1 + v.power / 10)
                                                             for v in self.active])[0]
         else:
             r = self.ranking()
@@ -1478,21 +1660,26 @@ class Tournament:
                 pick = self.rng.choice((parent, mate)).traits
                 if k in pick:
                     traits[k] = pick[k]
+            vt, vs = self.inherit_vetoes([parent, mate])
             child = self._new(parent.name, self.crossover(parent.name, parent.params, mate.params),
-                              self.rng.choice((parent.tf, mate.tf)), self.mutate_risk(risk), self.mutate_traits(traits))
+                              self.rng.choice((parent.tf, mate.tf)), self.mutate_risk(risk), self.mutate_traits(traits), vt)
+            child.veto_stats = vs
             self._register(child, [parent, mate], "bred")
             note = f"Bred {child.label} from two winners"
         else:
             scale = 0.35 if not self.active else 0.15 if len(self.active) >= 3 else 0.25  # bolder when nothing works
+            vt, vs = self.inherit_vetoes([parent])
             child = self._new(parent.name, self.mutate(parent.name, parent.params, scale), self.mutate_tf(parent.tf),
-                              self.mutate_risk(parent.risk), self.mutate_traits(parent.traits))
+                              self.mutate_risk(parent.risk), self.mutate_traits(parent.traits), vt)
+            child.veto_stats = vs
             self._register(child, [parent], "tweaked")
             note = f"Spawned {child.label} (tweaked from {parent.label})"
         self.replay(child, closes)
         self.vars.append(child)
         self.events.append(note)
 
-    def add_variant(self, name, params, closes=None, size=1.0, note="Added", tf=1, origin="added", risk=None, traits=None):
+    def add_variant(self, name, params, closes=None, size=1.0, note="Added", tf=1, origin="added", risk=None, traits=None,
+                    vetoes=None):
         """Adds a strategy with the given settings (clamped to sane bounds) and replays recent prices."""
         if name not in STRATS:
             return None
@@ -1505,7 +1692,7 @@ class Tournament:
                 val = dv
             p[k] = int(round(val)) if isinstance(dv, int) else round(val, 2)
         fix_params(name, p)
-        v = self._new(name, p, tf, risk, traits)
+        v = self._new(name, p, tf, risk, traits, vetoes)
         self._register(v, [], origin)
         v.size_mult = min(max(float(size), 0.25), 3.0)
         if closes:
@@ -1535,7 +1722,9 @@ class Tournament:
         risk = {k: self.rng.choice((pa.risk[k], pb.risk[k])) for k in RISK_BOUNDS}
         traits = {k: self.rng.choice((pa.traits, pb.traits))[k] for k in TRAITS
                   if k in self.rng.choice((pa.traits, pb.traits))}
-        child = self._new(pa.name, params, self.rng.choice((pa.tf, pb.tf)), self.mutate_risk(risk), self.mutate_traits(traits))
+        vt, vs = self.inherit_vetoes([pa, pb])
+        child = self._new(pa.name, params, self.rng.choice((pa.tf, pb.tf)), self.mutate_risk(risk), self.mutate_traits(traits), vt)
+        child.veto_stats = vs
         self._register(child, [pa, pb], "bred from your bots")
         if closes:
             self.replay(child, closes)
@@ -1577,7 +1766,8 @@ class Tournament:
             if v:
                 return v
         return self.add_variant(name, p, closes, note="Random new strategy:", tf=self.rng.choice(TIMEFRAMES),
-                                origin="random", risk=self.rand_risk(), traits=self.rand_traits(0.35))
+                                origin="random", risk=self.rand_risk(), traits=self.rand_traits(0.35),
+                                vetoes=self.rand_vetoes())
 
     def hall_of_fame_candidates(self, min_win_steps, min_trades):
         """Bots that have earned a place: enough time Winning, enough finished trades, and ahead of
@@ -1624,7 +1814,7 @@ class Tournament:
     _VFIELDS = ("name", "params", "tf", "risk", "traits", "size_mult", "uid", "parents", "gen", "origin", "royal",
                 "classic", "inducted", "strikes", "born_px", "age", "ntrades", "wins", "losses", "win_steps", "streak",
                 "peak", "maxdd", "mood_gain", "mood_n", "live_n", "live_eq0", "hi", "since", "entries", "sold_at",
-                "fee_guard")
+                "fee_guard", "rt_cost", "vetoes", "veto_stats", "lost_at", "power", "live_high")
 
     def to_state(self):
         """Everything needed to bring this farm back exactly as it is (plain data, JSON-ready)."""
@@ -1648,7 +1838,7 @@ class Tournament:
             try:
                 if d["name"] not in STRATS:
                     continue
-                v = self._new(d["name"], dict(d["params"]), d.get("tf", 1), d.get("risk"), d.get("traits"))
+                v = self._new(d["name"], dict(d["params"]), d.get("tf", 1), d.get("risk"), d.get("traits"), d.get("vetoes"))
                 for k in self._VFIELDS:
                     if k in d and k not in ("name", "params", "tf", "risk", "traits"):
                         setattr(v, k, d[k])
@@ -1661,6 +1851,9 @@ class Tournament:
                 v.sim.cost = {c: float(q) for c, q in (s.get("cost") or {}).items()}
                 v.sim.fees = float(s.get("fees", 0))
                 v.sim.tbars = deque(s.get("tbars", []))
+                v.vetoes = clean_vetoes(v.vetoes)
+                v.veto_stats = {k: list(s) for k, s in (v.veto_stats or {}).items() if k in v.vetoes}
+                v.lost_at = dict(v.lost_at or {})
                 v.mood_gain = dict(v.mood_gain or {})
                 v.mood_n = dict(v.mood_n or {})
                 vars_.append(v)
@@ -1741,8 +1934,9 @@ def replay_bot(v, closes, extra, start, start_cash, fee, pct, slip=0.0):
     """A frozen copy of bot v trading on its own from bar `start` to the end, exactly as it would in the
     tournament (strategy, pace, own stops and traits). Returns (equity curve, trade count)."""
     coins = list(closes)
-    b = Variant(v.name, dict(v.params), Sim(start_cash, fee, pct, slip=slip), 2, v.tf, dict(v.risk), dict(v.traits))
-    b.fee_guard = v.fee_guard
+    b = Variant(v.name, dict(v.params), Sim(start_cash, fee, pct, slip=slip), 2, v.tf, dict(v.risk), dict(v.traits),
+                dict(v.vetoes))
+    b.fee_guard, b.rt_cost = v.fee_guard, v.rt_cost
     L = min(len(x) for x in closes.values())
     eq, trades = [start_cash], 0
     for i in range(start, L):
@@ -1839,7 +2033,7 @@ def run_lab(closes, settings, train_frac=0.7, top_n=12, start_cash=1000.0, seed=
         else:
             verdict = "Failed"
         rows.append(dict(name=v.name, params=dict(v.params), tf=v.tf, size=v.size_mult, risk=dict(v.risk),
-                         traits=dict(v.traits),
+                         traits=dict(v.traits), vetoes=dict(v.vetoes),
                          train_ret=lf["ret"], train_edge=lf["edge"], train_status=info.get("status", ""),
                          test_ret=ret, test_edge=ret - test_hold, test_dd=dd, test_trades=tr, verdict=verdict,
                          passed=verdict == "Passed",
@@ -2085,8 +2279,10 @@ def describe_bot(b, bar_minutes=None):
             else f"every {b.get('tf', 1)} bar(s) of your chosen bar length")
     exits = risk_text(b.get("risk"))
     habits = traits_text(b.get("traits"))
+    nevers = vetoes_text(b.get("vetoes"))
     return (f"{b['name']}: {calc} {rule} It decides {pace}, on candles of that length."
             + (f" Own exits: {exits}." if exits else "") + (f" Habits: {habits}." if habits else "")
+            + (f" Never-rules: it {nevers}." if nevers else "")
             + " Each buy spends a fixed share of the starting money times its trade size; a sell closes the whole position.")
 
 
@@ -2097,7 +2293,11 @@ SCHEMA_NOTE = (
     "decisions, cool = decisions to wait after selling, trend = only buy above that many-bar average, minvol = minimum "
     "average move % per bar, rsicap = no buying above that RSI, confirm = signals in a row needed, entries = most buys "
     "per position, exit = 1 sells only through its own exits, moods = bitmask of allowed markets: 1 trending up, "
-    "2 trending down, 4 choppy, 8 quiet), `size` its trade-size multiplier. `stats` and `lifetime` are its results, "
+    "2 trending down, 4 choppy, 8 quiet), `vetoes` its never-rules (knife = no buying after that % drop over 10 "
+    "decisions, spike = no buying after a one-bar jump of that %, chase = no buying that % above the 20-decision "
+    "average, revenge = no re-buying a coin within that many decisions of a loss on it, thin = no buying under that "
+    "x normal volume, mktdown = no buying while BTC is down that % over 10 decisions, panic = no strategy selling "
+    "after a one-bar drop of that %), `size` its trade-size multiplier. `stats` and `lifetime` are its results, "
     "after fees. Signals use bar closes (some families also highs, lows and volume). Results were simulated with fees "
     "and spread; past results do not predict future ones.")
 
@@ -2111,7 +2311,7 @@ def export_bots(rows, app_version="", note=""):
         if r.get("stats") and "score" not in r:  # already a bot-file entry (Hall of Fame, Bot Lab)
             b = dict(name=r["name"], params=dict(r["params"]), size=round(float(r.get("size", 1.0)), 2),
                      tf=int(r.get("tf", 1)), risk=clean_risk(r.get("risk")), traits=clean_traits(r.get("traits")),
-                     stats=dict(r["stats"]),
+                     vetoes=clean_vetoes(r.get("vetoes")), stats=dict(r["stats"]),
                      notes=r.get("notes", note))
             if r.get("lifetime"):
                 b["lifetime"] = dict(r["lifetime"])
@@ -2119,7 +2319,7 @@ def export_bots(rows, app_version="", note=""):
             continue
         b = dict(
             name=r["name"], params=dict(r["params"]), size=round(float(r.get("size", 1.0)), 2), tf=int(r.get("tf", 1)),
-            risk=clean_risk(r.get("risk")), traits=clean_traits(r.get("traits")),
+            risk=clean_risk(r.get("risk")), traits=clean_traits(r.get("traits")), vetoes=clean_vetoes(r.get("vetoes")),
             stats=dict(recent_gain_pct=None if r.get("score") is None else round(r["score"] * 100, 2),
                        consistency_pct=None if r.get("cons") is None else int(r["cons"] * 100),
                        trades=int(r.get("trades", 0)), status=r.get("status", "")),
@@ -2370,7 +2570,8 @@ def read_bots_file(path):
         stats = d.get("stats") if isinstance(d.get("stats"), dict) else {}
         item = dict(name=d["name"], params=params, size=size, stats=stats, tf=clamp_tf(d.get("tf", 1)),
                     risk=clean_risk(d.get("risk") if isinstance(d.get("risk"), dict) else None),
-                    traits=clean_traits(d.get("traits") if isinstance(d.get("traits"), dict) else None))
+                    traits=clean_traits(d.get("traits") if isinstance(d.get("traits"), dict) else None),
+                    vetoes=clean_vetoes(d.get("vetoes") if isinstance(d.get("vetoes"), dict) else None))
         if isinstance(d.get("lifetime"), dict):
             item["lifetime"] = {k: v for k, v in d["lifetime"].items()
                                 if isinstance(v, (int, float, str)) or v is None}

@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.10.0
+**Never-rules, health and power**
+- Bots can now evolve **never-rules**: things they refuse to do. "No falling knives" (don't buy after a big drop),
+  "no spike buying", "no chasing" (don't buy far above the average), "no revenge trades" (don't jump back into a
+  coin right after losing on it), "no thin markets", "no buying into a sell-off" (BTC falling) and "no panic
+  selling". Up to 3 per bot.
+- **Every rule is graded by what would have happened**: when a rule blocks a trade, the farm follows that skipped
+  trade for a while and records whether skipping it saved money or cost money (fees included). Each rule builds a
+  score like "saved 4.2% over 12 vetoes".
+- **Good rules spread, bad rules die out**: children very likely keep their parents' proven rules, usually drop
+  rules that keep blocking winners, and inherit half of the evidence. New rules are tried now and then.
+- **Health** (HP bar) now reflects how the bot is doing right now plus how well its rules are working. A bot whose
+  health runs out rests.
+- **Power** (new PWR bar, 0 to 10) grows slowly, and only from real money made on fresh prices while beating just
+  holding, never from rules merely firing. Power raises a bot's trade-size ceiling, its say in the vote and its
+  chance to breed. It fades if the bot slips.
+- Never-rules and their scores show on each bot's detail card and in exported bot files (in plain English), and you
+  can pick never-rules in **Design an egg**. Settings > Wildcard switches the whole feature off.
+
 ## 1.9.6
 - **Picks up right where it left off.** The whole farm is now saved (every bot, its money and positions, its history,
   levels, traits, eggs and family tree), not just your account. When you open CBBF, your last session and its farm

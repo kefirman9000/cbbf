@@ -132,6 +132,8 @@ SETTING_GROUPS = [
         ("max_bots", "Farm size: most bots competing at once (14 to 200)", int),
         ("retire_hours", "Replace a strategy that hasn't been winning for this many hours (0 = never)", float),
         ("crossbreed", "New strategies can mix the settings of two winners (crossbreeding)", bool),
+        ("vetoes", "Never-rules: bots can evolve things they refuse to do (no falling knives, no chasing, no panic selling...). "
+                   "Each rule is graded by what the blocked trade would have done; good rules spread, bad ones die out", bool),
         ("classics", "Mix famous strategies into the eggs (golden cross, turtle breakout, RSI-2, MACD 12/26/9... plus a few "
                      "controversial ones). They hatch from silver eggs", bool),
         ("classic_rate", "...% of new eggs that are a famous strategy", float),
@@ -1403,7 +1405,7 @@ class App:
                     self.write(f"Skipped {friendly_label(d['name'], d['params'])}: you already have it.", "warn")
                     continue
                 if self.tourn.add_variant(d["name"], d["params"], closes, d["size"], note="Imported", tf=d.get("tf", 1),
-                                          risk=d.get("risk"), traits=d.get("traits"), origin="imported") is None:
+                                          risk=d.get("risk"), traits=d.get("traits"), vetoes=d.get("vetoes"), origin="imported") is None:
                     continue
                 added += 1
                 s = d.get("stats") or {}
@@ -1426,7 +1428,7 @@ class App:
         closes = {c: self.hist[c] for c in self.session_coins}
         for d in saved:
             self.tourn.add_variant(d["name"], d["params"], closes, d.get("size", 1.0), note="Loaded saved", tf=d.get("tf", 1),
-                                   risk=d.get("risk"), traits=d.get("traits"), origin="saved")
+                                   risk=d.get("risk"), traits=d.get("traits"), vetoes=d.get("vetoes"), origin="saved")
         self.flush_events()
         self.refresh_board()
 
@@ -2773,7 +2775,7 @@ class App:
                 for b in squad:
                     tourn.add_variant(b["name"], b["params"], hist, b.get("size", 1.0),
                                       note=f"{'Team' if roster == 'team' else 'Hall of Fame'}: {b.get('nickname') or E.bot_nickname(E.bot_key(b))}",
-                                      tf=b.get("tf", 1), risk=b.get("risk"), traits=b.get("traits"), origin="team")
+                                      tf=b.get("tf", 1), risk=b.get("risk"), traits=b.get("traits"), vetoes=b.get("vetoes"), origin="team")
                 locked = roster == "hof" or self.settings.get("team_locked", True)
                 if locked:
                     tourn.retire_steps, tourn.evolve_every = 0, 10 ** 9
@@ -2783,7 +2785,7 @@ class App:
             saved = [] if squad else E.load_strategies()
             for d in saved:
                 tourn.add_variant(d["name"], d["params"], hist, d.get("size", 1.0), note="Loaded saved", tf=d.get("tf", 1),
-                                  risk=d.get("risk"), traits=d.get("traits"), origin="saved")
+                                  risk=d.get("risk"), traits=d.get("traits"), vetoes=d.get("vetoes"), origin="saved")
             if saved:
                 self.q.put(("log", f"Loaded {len(saved)} saved strategies into the tournament."))
             if self.settings.get("hof_load", True) and not squad:
@@ -2791,7 +2793,7 @@ class App:
                 hof = [b for b in E.load_hof() if E.bot_key(b) not in have][:10]
                 for b in hof:
                     v = tourn.add_variant(b["name"], b["params"], hist, b.get("size", 1.0), note="Hall of Fame:",
-                                          tf=b.get("tf", 1), risk=b.get("risk"), traits=b.get("traits"), origin="hall of fame")
+                                          tf=b.get("tf", 1), risk=b.get("risk"), traits=b.get("traits"), vetoes=b.get("vetoes"), origin="hall of fame")
                     if v:
                         v.inducted = True
                 if hof:
@@ -4186,7 +4188,7 @@ class App:
             c.configure(scrollregion=(0, 0, W, 200))
             return
         big = f == "BEASTS"
-        cw, ch, g = (300, 168, 14) if big else (236, 150, 12)
+        cw, ch, g = (300, 180, 14) if big else (236, 160, 12)
         per = max(1, (W - g) // (cw + g))
         caught = self.library_keys()
         hofk = self.hof_keys()
@@ -4247,16 +4249,20 @@ class App:
                 self._bar(c, x + 10, by, cw - 10, "HATCH", prog, "#8b5cf6")
                 self._bar(c, x + 10, by + 13, cw - 10, "TRADES", min(1, len(v.sim.tbars) / max(1, self.tourn.min_trades)), "#a78bfa")
             else:
-                dd = self.tourn.drawdown(v) if v.eq else 0
-                hp = max(0.0, 1 - dd * 10)
+                hp = r.get("health", 1.0)
                 self._bar(c, x + 10, by, cw - 10, "XP", (xp - lo_xp) / max(1, hi_xp - lo_xp), "#a855f7")
                 self._bar(c, x + 10, by + 13, cw - 10, "HP", hp, GREEN if hp > 0.5 else "#f59e0b" if hp > 0.2 else RED)
+                self._bar(c, x + 10, by + 26, cw - 10, "PWR", r.get("power", 0) / 10, "#f97316")
             chips = [(pct_txt(r["score"]), GREEN if (r["score"] or 0) > 0 else RED if r["score"] else MUTED),
                      ("vs hold " + pct_txt(r.get("edge")), GREEN if (r.get("edge") or 0) > 0 else MUTED),
                      ("WR " + ("-" if lf["winrate"] is None else f"{lf['winrate'] * 100:.0f}%"), TEXT),
                      (f"{lf['trades']} trades", MUTED)]
             if t == "beast":
                 chips.insert(0, (f"{r['stake']:.1f}x size", gold))
+            if r.get("vetoes"):
+                good = sum(1 for k, s in (r.get("veto_stats") or {}).items() if s[0] >= 3 and s[1] > 0)
+                chips.append((f"{len(r['vetoes'])} never-rule{'s' if len(r['vetoes']) != 1 else ''}"
+                              + (f", {good} proven" if good else ""), "#38bdf8"))
             self._chips(c, x + 10, y + ch - 17, x + cw - 8, chips)
             self.grid_cards.append((x, y, x + cw, y + ch, v, r["status"], t, v.name))
         nrows = (len(items) + per - 1) // per
@@ -4475,6 +4481,24 @@ class App:
             var = tk.BooleanVar(value=bool(gm & (1 << i)) if gm else True)
             ttk.Checkbutton(mrow, text=m, variable=var).pack(side="left", padx=(6, 0))
             mood_vars.append(var)
+        row += 1
+        nbox = ttk.LabelFrame(f, text=f" Never-rules (up to {E.MAX_VETOES}), tick to use ", padding=8)
+        nbox.grid(row=row, column=0, columnspan=4, sticky="ew", pady=(10, 0))
+        given_v = (preset or {}).get("vetoes") or {}
+        vvars = {}
+        for r_, (k, spec) in enumerate(E.VETOES.items()):
+            on = tk.BooleanVar(value=k in given_v)
+            start = given_v.get(k, spec["lo"] + (spec["hi"] - spec["lo"]) / 3)
+            val = tk.StringVar(value=str(int(start) if k == "revenge" else round(start, 2)))
+            ttk.Checkbutton(nbox, text=spec["name"], variable=on).grid(row=r_ // 2, column=(r_ % 2) * 3, sticky="w")
+            ttk.Entry(nbox, textvariable=val, width=6).grid(row=r_ // 2, column=(r_ % 2) * 3 + 1, padx=4)
+            ttk.Label(nbox, text=f"{spec['lo']:g}-{spec['hi']:g}", foreground=MUTED).grid(row=r_ // 2, column=(r_ % 2) * 3 + 2,
+                                                                                          sticky="w", padx=(0, 12))
+            vvars[k] = (on, val)
+        ttk.Label(nbox, foreground=MUTED, wraplength=540, text=(
+            "Each never-rule blocks some trades. The farm checks what every blocked trade would have done and keeps "
+            "score: rules that save money are passed on to children, rules that keep blocking winners die out.")).grid(
+            row=(len(vvars) + 1) // 2, column=0, columnspan=6, sticky="w", pady=(4, 0))
         size = tk.StringVar(value=str((preset or {}).get("size", 1.0)))
         row += 1
         ttk.Label(f, text="Trade size (x normal)").grid(row=row, column=0, sticky="w", pady=(8, 0))
@@ -4500,9 +4524,12 @@ class App:
                 mask = sum(1 << i for i, v in enumerate(mood_vars) if v.get())
                 if 0 < mask < 15:
                     traits["moods"] = mask
+                vetoes = {k: float(val.get()) for k, (on, val) in vvars.items() if on.get()}
+                if len(vetoes) > E.MAX_VETOES:
+                    raise ValueError(f"pick at most {E.MAX_VETOES} never-rules")
                 entry = dict(name=n, params=params, tf=paces[pace.get()], size=min(max(float(size.get() or 1), 0.25), 3.0),
                              risk=E.clean_risk({"sl": float(sl.get() or 0), "tp": float(tp.get() or 0)}),
-                             traits=E.clean_traits(traits), stats={}, notes="designed by you")
+                             traits=E.clean_traits(traits), vetoes=E.clean_vetoes(vetoes), stats={}, notes="designed by you")
                 return entry
             except ValueError as ex:
                 messagebox.showerror("Design an egg", f"Please check the numbers: {ex}", parent=w)
@@ -4517,7 +4544,7 @@ class App:
                     return messagebox.showinfo("Design an egg", "Start the bot with Wildcard ticked first, or use "
                                                                 "'Save to Library' to keep it for later.", parent=w)
                 v = self.tourn.add_variant(entry["name"], entry["params"], {c: self.hist[c] for c in self.session_coins},
-                                           entry["size"], note="Designed egg:", tf=entry["tf"], risk=entry["risk"],
+                                           entry["size"], note="Designed egg:", tf=entry["tf"], risk=entry["risk"], vetoes=entry["vetoes"],
                                            traits=entry["traits"], origin="designed")
                 if v:
                     if len(self.tourn.vars) > self.tourn.cap:
@@ -5501,7 +5528,7 @@ class App:
         for b in entries:
             if E.bot_key(b) not in have and self.tourn.add_variant(
                     b["name"], b["params"], closes, b.get("size", 1.0), note="Added:", tf=b.get("tf", 1), risk=b.get("risk"),
-                    traits=b.get("traits"), origin="library"):
+                    traits=b.get("traits"), vetoes=b.get("vetoes"), origin="library"):
                 n += 1
         self.flush_events()
         self.refresh_board()
@@ -5703,7 +5730,7 @@ class App:
             if E.bot_key(b) in have:
                 continue
             if self.tourn.add_variant(b["name"], b["params"], closes, b.get("size", 1.0), note=f"{b.get('nickname')} joined:",
-                                      tf=b.get("tf", 1), risk=b.get("risk"), traits=b.get("traits"), origin="collection"):
+                                      tf=b.get("tf", 1), risk=b.get("risk"), traits=b.get("traits"), vetoes=b.get("vetoes"), origin="collection"):
                 n += 1
         self.flush_events()
         self.refresh_board()
@@ -5720,7 +5747,7 @@ class App:
         for b in bots:
             v = next((x for x in self.tourn.vars if x.key() == E.bot_key(b)), None) or self.tourn.add_variant(
                 b["name"], b["params"], closes, b.get("size", 1.0), note="Parent joined:", tf=b.get("tf", 1),
-                risk=b.get("risk"), traits=b.get("traits"), origin="library")
+                risk=b.get("risk"), traits=b.get("traits"), vetoes=b.get("vetoes"), origin="library")
             if v:
                 parents.append(v)
         if len(parents) != 2:
@@ -5780,7 +5807,7 @@ class App:
         info_lbls = {}
         for i, key in enumerate(("Status", "Recent gain", "vs holding (recent)", "Lifetime return", "Lifetime vs holding",
                                  "Win rate", "Trades", "Worst drop", "Time winning", "Best market", "Own stops",
-                                 "Family", "Traits", "Fees paid")):
+                                 "Family", "Traits", "Fees paid", "Health / power", "Never-rules")):
             ttk.Label(stats, text=key, foreground=MUTED).grid(row=i // 3, column=(i % 3) * 2, sticky="w", padx=(0, 6), pady=2)
             l = ttk.Label(stats, text="-", font=("", 10, "bold"), wraplength=230)
             l.grid(row=i // 3, column=(i % 3) * 2 + 1, sticky="w", padx=(0, 22), pady=2)
@@ -5812,6 +5839,8 @@ class App:
                     "Time winning": f"{hrs:.1f} h" if hrs >= 1 else f"{hrs * 60:.0f} min",
                     "Best market": MOOD_TEXT.get(lf["best_mood"], "not sure yet") if lf["best_mood"] else "not sure yet",
                     "Own stops": E.risk_text(v.risk) or "none", "Family": f"#{v.uid}, {fam}, generation {v.gen}",
+                    "Health / power": f"{self.tourn.health(v) * 100:.0f}% health, power {v.power:.1f} / 10",
+                    "Never-rules": E.vetoes_text(v.vetoes, v.veto_stats) or "none",
                     "Traits": (E.traits_text(v.traits) or "none yet") + (
                         "  |  " + next((cl["note"] for cl in E.CLASSICS if cl["title"] == v.classic), "") if v.classic else ""), "Fees paid": f"${v.sim.fees:,.2f}"}
             for k, l in info_lbls.items():
@@ -6021,7 +6050,7 @@ class App:
                 if E.bot_key(b) in have:
                     continue
                 v = self.tourn.add_variant(b["name"], b["params"], closes, b.get("size", 1.0), note="Hall of Fame:",
-                                           tf=b.get("tf", 1), risk=b.get("risk"), traits=b.get("traits"), origin="hall of fame")
+                                           tf=b.get("tf", 1), risk=b.get("risk"), traits=b.get("traits"), vetoes=b.get("vetoes"), origin="hall of fame")
                 if v:
                     v.inducted, n = True, n + 1
             self.flush_events()
@@ -6145,7 +6174,7 @@ class App:
             n = 0
             for r in picked():
                 if self.tourn.add_variant(r["name"], r["params"], closes, r.get("size", 1.0), note="From the Bot Lab:",
-                                          tf=r["tf"], risk=r.get("risk"), traits=r.get("traits"), origin="bot lab"):
+                                          tf=r["tf"], risk=r.get("risk"), traits=r.get("traits"), vetoes=r.get("vetoes"), origin="bot lab"):
                     n += 1
             self.flush_events()
             self.refresh_board()
