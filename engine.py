@@ -2451,9 +2451,27 @@ class Tournament:
                     hold_curve=list(getattr(self, "hold_curve", []))[-(self.W * 10 + 2):], bots=bots,
                     lineage={str(k): v for k, v in lineage.items()})
 
+    def align_coins(self, coins, last=None):
+        """Makes the farm trade exactly these coins (a safety net if they ever get out of step with the session).
+        Positions in dropped coins are closed at their last price. Returns the new coin list."""
+        last = dict(self.last_px, **(last or {}))
+        gone = [c for c in self.coins if c not in coins]
+        for v in self.vars:
+            for c in gone:
+                q = v.sim.pos.get(c, 0)
+                if q > 0 and last.get(c):
+                    v.sim.sell(c, last[c])
+                v.sim.pos.pop(c, None)
+                v.sim.cost.pop(c, None)
+                v.sim.last = None
+            if v.born_px:
+                v.born_px = {c: x for c, x in v.born_px.items() if c in coins}
+        self.coins = list(coins)
+        return self.coins
+
     def restore(self, st):
         """Replaces this farm's bots with a saved farm (from to_state). Returns True on success."""
-        if not isinstance(st, dict) or st.get("version") != 1 or list(st.get("coins") or []) != self.coins:
+        if not isinstance(st, dict) or st.get("version") != 1 or set(st.get("coins") or []) != set(self.coins):
             return False
         vars_ = []
         for d in st.get("bots", []):
