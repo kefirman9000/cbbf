@@ -460,7 +460,9 @@ DEFAULT_SETTINGS = {
     "hof_hours": 6.0,            # hours a strategy must spend Winning (in total) to get in
     "hof_min_trades": 4,         # and at least this many finished (sold) trades
     "hof_load": True,            # bring the best Hall of Fame bots back when Wildcard starts
-    "auto_catch": True,          # Hall of Fame bots also go into your Bot Collection
+    "auto_catch": True,          # long-term winners are saved to your Bot Library automatically
+    "auto_hof": False,           # ...and also put straight into the Hall of Fame (off: you choose who goes in)
+    "animations": "Full",        # Full, Light (slower, lighter) or Off
     "team_locked": True,         # trading with your team: keep exactly those bots (False = they may breed new ones)
     # Orders and costs
     "bot_stops": True,           # Wildcard: the account's safety stop / lock-in-profit follow what the winning bots learned
@@ -1104,6 +1106,15 @@ class Tournament:
         return sig, mult
 
     def board(self):
+        """Rows for the scoreboard / farm. Cached until the ratings change, so drawing never recomputes it."""
+        key = (id(self.info), self.n, len(self.vars))
+        if getattr(self, "_board_key", None) == key:
+            return self._board_rows
+        self._board_rows = self._board()
+        self._board_key = key
+        return self._board_rows
+
+    def _board(self):
         blank = dict(score=None, cons=None, stake=0.0, status="warming up", failing=False, edge=None, behind=False)
         order = {"active": 0, "slowed": 1, "standby": 2, "benched": 3, "warming up": 4}
         rows = [(v, self.info.get(id(v), blank)) for v in self.vars]
