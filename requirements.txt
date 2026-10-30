@@ -1,0 +1,2 @@
+coinbase-advanced-py>=1.7.0
+keyring>=24.0
