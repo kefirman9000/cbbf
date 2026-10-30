@@ -466,6 +466,7 @@ DEFAULT_SETTINGS = {
     "team_locked": True,         # trading with your team: keep exactly those bots (False = they may breed new ones)
     # Orders and costs
     "bot_stops": True,           # Wildcard: the account's safety stop / lock-in-profit follow what the winning bots learned
+    "fee_aware": True,           # don't sell for a profit smaller than the round-trip fees (losses and stops still sell)
     "max_trades_hour": 30,       # brake: most signal trades the account may make in an hour (0 = no limit)
     "trail_stop": 0.0,           # % trailing stop: sell if a coin falls this far from its high since buying (0 = off)
     "slippage": 0.05,            # % lost to the bid/ask spread and price movement on each market order (Practice)
@@ -545,6 +546,7 @@ class Sim:
     def __init__(self, cash, fee, pct, max_coin=None, slip=0.0):
         self.start, self.cash, self.fee, self.pct, self.max_coin = cash, cash, fee, pct, max_coin
         self.slip = slip      # spread + slippage: buys fill a bit higher, sells a bit lower
+        self.fees = 0.0       # total fees paid
         self.pos, self.cost = {}, {}
         self.tbars = deque()  # bar indices of recent trades
         self.last = None      # details of the trade just made (read and cleared by the Tournament)
@@ -557,6 +559,7 @@ class Sim:
             return False
         fill = px * (1 + self.slip)
         self.cash -= spend
+        self.fees += spend * self.fee
         qty = spend * (1 - self.fee) / fill
         self.pos[c] = self.pos.get(c, 0) + qty
         self.cost[c] = self.cost.get(c, 0) + spend
@@ -570,6 +573,7 @@ class Sim:
             return False
         fill = px * (1 - self.slip)
         proceeds = q * fill * (1 - self.fee)
+        self.fees += q * fill * self.fee
         self.cash += proceeds
         self.last = dict(side="sell", coin=c, qty=q, price=fill, usd=proceeds, pl=proceeds - self.cost.get(c, 0))
         self.pos[c], self.cost[c] = 0, 0
@@ -598,7 +602,7 @@ def tournament_opts(settings):
                 beat_hold=bool(settings.get("beat_hold", True)),
                 crossbreed=bool(settings.get("crossbreed", True)),
                 regime_aware=bool(settings.get("regime_aware", True)),
-                slip=slip)
+                slip=slip, fee_aware=bool(settings.get("fee_aware", True)))
 
 
 RISK_BOUNDS = {"sl": (0.5, 15.0), "tp": (0.5, 30.0)}  # a bot's own stop-loss / take-profit, % (0 = none)
@@ -710,6 +714,10 @@ def bot_step(v, closes, n, coins, extra=None):
                         s = None
             elif s == "sell" and tr.get("exit") and (v.risk["sl"] or v.risk["tp"] or tr.get("trail") or tr.get("maxhold")):
                 s = None  # this bot only leaves through its own exits
+            elif s == "sell" and v.fee_guard and sim.pos.get(c, 0) > 0:
+                gain = last[c] / (sim.cost[c] / sim.pos[c]) - 1
+                if 0 <= gain < v.fee_guard:
+                    s = None  # fee-aware: a profit this small would be eaten by the fees, so keep holding
             v.sig[c] = s
             sim.act(c, s, last[c], n)
         t = sim.last
@@ -732,6 +740,7 @@ class Variant:
         self.name, self.params, self.sim = name, params, sim
         self.risk = clean_risk(risk)
         self.traits = clean_traits(traits)
+        self.fee_guard = 0.0  # round-trip cost (fraction) when fee-aware: profits smaller than this aren't taken
         self.hi, self.since, self.entries, self.sold_at, self.run_sig = {}, {}, {}, {}, {}
         self.uid, self.parents, self.gen = 0, [], 0
         self.tf = clamp_tf(tf)  # decides once every tf bars, on tf-bar candles
@@ -792,7 +801,7 @@ class Tournament:
         self.family_cap = max(5, -(-self.cap // 4))
         self.retire_steps = max(0, int(retire_steps))  # decisions a bot may go without winning before it is replaced
         self.o = dict(trade_more=True, winner_boost=2.5, add_every=3, slow_every=6, fail_drop=3.0,
-                      beat_hold=True, crossbreed=True, regime_aware=True, slip=0.0)
+                      beat_hold=True, crossbreed=True, regime_aware=True, slip=0.0, fee_aware=True)
         self.o.update(opts or {})
         self.slowed, self.cool, self.add_cool, self.kind = [], {}, {}, {}
         self.rng = rng or random.Random()
@@ -823,8 +832,10 @@ class Tournament:
             self._register(v, [], "starter")
 
     def _new(self, name, params, tf=1, risk=None, traits=None):
-        return Variant(name, params, Sim(self.start_cash, self.fee, self.pct, slip=self.o.get("slip", 0.0)),
-                       self.W + 1, tf, risk, traits)
+        v = Variant(name, params, Sim(self.start_cash, self.fee, self.pct, slip=self.o.get("slip", 0.0)),
+                    self.W + 1, tf, risk, traits)
+        v.fee_guard = 2 * (self.fee + self.o.get("slip", 0.0)) if self.o.get("fee_aware", True) else 0.0
+        return v
 
     def rand_traits(self, chance=0.3):
         t = {}
@@ -1002,7 +1013,8 @@ class Tournament:
         closed = v.wins + v.losses
         return dict(ret=ret, hold=hold, edge=None if hold is None else ret - hold, trades=v.ntrades,
                     wins=v.wins, losses=v.losses, winrate=v.wins / closed if closed else None,
-                    maxdd=v.maxdd, age=v.age, win_steps=v.win_steps, streak=v.streak, best_mood=self.best_mood(v))
+                    maxdd=v.maxdd, age=v.age, win_steps=v.win_steps, streak=v.streak, best_mood=self.best_mood(v),
+                    fees=v.sim.fees)
 
     def _rate(self):
         info, o = {}, self.o
@@ -1396,6 +1408,7 @@ def replay_bot(v, closes, extra, start, start_cash, fee, pct, slip=0.0):
     tournament (strategy, pace, own stops and traits). Returns (equity curve, trade count)."""
     coins = list(closes)
     b = Variant(v.name, dict(v.params), Sim(start_cash, fee, pct, slip=slip), 2, v.tf, dict(v.risk), dict(v.traits))
+    b.fee_guard = v.fee_guard
     L = min(len(x) for x in closes.values())
     eq, trades = [start_cash], 0
     for i in range(start, L):
@@ -1728,7 +1741,8 @@ def lifetime_record(lf, bar_minutes=None):
     out = dict(return_pct=pct(lf.get("ret")), vs_holding_pct=pct(lf.get("edge")), win_rate_pct=pct(lf.get("winrate")),
                wins=lf.get("wins", 0), losses=lf.get("losses", 0), trades=lf.get("trades", 0),
                worst_drop_pct=pct(lf.get("maxdd")), decisions_alive=lf.get("age", 0),
-               decisions_winning=lf.get("win_steps", 0), best_market=lf.get("best_mood"))
+               decisions_winning=lf.get("win_steps", 0), best_market=lf.get("best_mood"),
+               fees_paid=round(float(lf.get("fees") or 0), 2))
     if bar_minutes:
         out["bar_minutes"] = bar_minutes
         out["hours_winning"] = round(lf.get("win_steps", 0) * float(bar_minutes) / 60, 2)
