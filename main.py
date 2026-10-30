@@ -101,11 +101,11 @@ def recolor(widget, mapping):
     for ch in widget.winfo_children():
         recolor(ch, mapping)
 SETTING_GROUPS = [
-    ("Basics", "Your account's money and safety rules. All % are of the money you started this session with "
-               "(the 'Practice money' / 'Money to trade with' box). Not sure? Pick a Risk style on the main screen "
-               "instead (Cautious, Balanced, Adventurous): it fills these five in for you. With Wildcard and "
-               "'Let the winning bots set stops' (Orders tab) on, the bots may use their own learned Safety stop and "
-               "Lock in profit; these numbers are then the fallback.", [
+    ("Basics", "Your account's money and safety rules, used for the trades your account makes (the bots' practice "
+               "trades follow their own rules). All % are of the money you started this session with. Not sure? Pick "
+               "a Risk style on the main screen (Cautious, Balanced, Adventurous): it fills in the first five for you. "
+               "In Wildcard, 'Let the winning bots set stops' (Orders tab) lets the winners' learned Safety stop and "
+               "Lock in profit take over; these numbers are then the fallback. Fees are always counted.", [
         ("trade_pct", "Trade size: each buy spends this % of your starting money. Example: 10 with $1,000 = $100 per buy "
                       "(winning bots can scale this up to their trade-size multiplier)", float),
         ("max_coin_pct", "Limit per coin: never have more than this % of your starting money in any single coin. "
@@ -114,6 +114,10 @@ SETTING_GROUPS = [
                       "Example: 5 = sell if a $100 position drops to $95 (0 = off)", float),
         ("take_profit", "Lock in profit: automatically sell a coin once it is up this % on what you paid. "
                         "Example: 10 = sell when a $100 position reaches $110 (0 = off)", float),
+        ("trail_stop", "Trailing stop: sell a coin if it falls this % from its highest price since you bought it. "
+                       "Example: 4 = a coin that rose to $120 is sold at $115.20 (0 = off)", float),
+        ("min_hold_min", "Minimum hold: keep a coin at least this many minutes before a strategy may sell it. "
+                         "Safety stops still sell at any time (0 = off)", float),
         ("daily_loss", "Daily loss limit: stop trading for the rest of the day if the account falls this % since "
                        "midnight. Open coins are kept, not sold (0 = off)", float),
     ]),
@@ -124,9 +128,12 @@ SETTING_GROUPS = [
         ("slow_every", "Shaky strategies may only trade every N decisions", int),
         ("fail_drop", "Stop a strategy at once if it falls this % from its peak (0 = off)", float),
         ("evolve_every", "Review and replace strategies every N decisions", int),
-        ("max_bots", "Most strategies competing at once (14 to 50)", int),
+        ("max_bots", "Farm size: most bots competing at once (14 to 200)", int),
         ("retire_hours", "Replace a strategy that hasn't been winning for this many hours (0 = never)", float),
         ("crossbreed", "New strategies can mix the settings of two winners (crossbreeding)", bool),
+        ("prove_live", "New bots must also make money on fresh live prices before they can be Winning (guards against luck)", bool),
+        ("risk_adjusted", "Rank winners by steady gains (gain per unit of downside), not just the biggest gain", bool),
+        ("long_holds", "Include slow, longer-holding bots from the start (not everything is a quick trade)", bool),
         ("regime_aware", "Favour strategies that do well in the current market mood (trending, choppy...)", bool),
         ("auto_coins", "Let the bot pick this many coins when Wildcard starts (0 = use the ticked coins)", int),
     ]),
@@ -143,7 +150,6 @@ SETTING_GROUPS = [
         ("order_type", "Order type", "order"),
         ("limit_wait", "Limit orders: seconds to wait for a fill", int),
         ("limit_fallback", "Limit orders: if nothing fills in time, use a market order instead", bool),
-        ("trail_stop", "Trailing stop: sell if a coin falls this % from its high since buying (0 = off)", float),
         ("max_trades_hour", "Brake: at most this many strategy trades per hour (0 = no limit). Safety stops always run", int),
         ("fee_aware", "Fee-aware: bots and the account don't sell for a profit too small to cover the round-trip fees "
                       "(losses, stops and Sell everything still sell)", bool),
@@ -157,6 +163,7 @@ SETTING_GROUPS = [
         ("bar_minutes", "How often strategies decide (15 sec is the fastest)", "bar"),
         ("refresh", "Check prices every N seconds (1 or more)", int),
         ("animations", "Animations (Light uses less computer power)", "anim"),
+        ("egg_colors", "Egg colours: by dragon type, or all purple (royal eggs from your own bots are always gold)", "eggs"),
         ("characters", "Dragons: themed by strategy (fire, ice, lightning, space; resting bots are skeletons) or classic (coloured by status)", "chars"),
     ]),
     ("Alerts", "Get a message on your phone when something happens. Leave blank to turn off.", [
@@ -178,6 +185,8 @@ STRAT_LABELS = {
     "Bollinger bands": "Buy low / sell high", "Dollar-cost averaging": "Steady buyer (DCA)",
     "Breakout": "Breakout chaser", "MACD": "Momentum shift", "Mean reversion": "Snap-back",
     "EMA crossover": "Quick trend (EMA)", "Stochastic": "Range bounce", "Trend + dip": "Dips in an uptrend",
+    "Supertrend": "Supertrend", "Ichimoku cross": "Cloud cross (Ichimoku)", "Rate of change": "Speed shift (ROC)",
+    "MA ribbon": "Trend ribbon",
     "Volume breakout": "Volume breakout", "VWAP snap-back": "VWAP snap-back", "ATR channel": "Range channel (ATR)",
 }
 STRAT_TIPS = {
@@ -197,13 +206,21 @@ STRAT_TIPS = {
     "Volume breakout": "Buys a breakout above the recent high only when trading volume is well above normal, "
                        "sells when the price breaks below the recent low.",
     "VWAP snap-back": "Buys when the price is well below its volume-weighted average price, sells when well above.",
+    "Supertrend": "Rides a trailing band a few typical bar-ranges away from the price; buys when the trend flips up, sells "
+                  "when it flips down.",
+    "Ichimoku cross": "Buys when the short-term midpoint of highs and lows crosses above the long-term one (with the price "
+                      "above it), sells on the opposite cross.",
+    "Rate of change": "Watches how fast the price is moving; buys when the speed turns up while rising, sells when it turns "
+                      "down while falling.",
+    "MA ribbon": "Buys when a fast, middle and slow average line up in order (a healthy uptrend), sells when the fast one "
+                 "drops below the middle one.",
     "ATR channel": "Buys a push above the average plus a few typical bar ranges (from highs and lows), sells a drop "
                    "below it.",
 }
 PARAM_NAMES = {"fast": "short average", "slow": "long average", "period": "lookback", "lo": "buy below",
                "hi": "sell above", "n": "lookback", "thr": "move needed %", "k": "band width", "every": "buy every N decisions",
                "signal": "signal smoothing", "min_gap": "smallest gap %", "trend": "trend lookback",
-               "vmult": "volume x normal", "m": "range multiple"}
+               "vmult": "volume x normal", "m": "range multiple", "mid": "middle average", "smooth": "smoothing"}
 REASON_TEXT = {"bot-test": "bot's own test trade", "signal": "strategy signal", "stop-loss": "safety stop", "take-profit": "locked in profit",
                "manual": "you sold by hand", "add-on": "adding to a winning strategy's position",
                "trailing-stop": "trailing stop (fell from its high)", "manual buy": "you bought by hand"}
@@ -359,7 +376,7 @@ def fmt_px(px):
     return f"${px:,.2f}" if px >= 1 else f"${px:,.6f}"
 
 
-def draw_egg(c, x, y, size, color, progress=0.0, phase=0, tags=()):
+def draw_egg(c, x, y, size, color, progress=0.0, phase=0, tags=(), royal=False):
     """A speckled dragon egg. It wobbles more and cracks open as it gets closer to hatching (progress 0..1)."""
     k = size / 40.0
     wob = math.sin(phase / 1.7) * (1 + 3 * progress) if phase else 0
@@ -375,6 +392,11 @@ def draw_egg(c, x, y, size, color, progress=0.0, phase=0, tags=()):
         c.create_line(*P(8, 26, 13, 22, 17, 27, 21, 23), fill="#57534e", width=max(1, 1.5 * k), tags=tags)
     if progress > 0.6:
         c.create_line(*P(21, 23, 25, 28, 29, 24, 33, 27), fill="#57534e", width=max(1, 1.5 * k), tags=tags)
+    if royal:  # royal egg: gold band and a little crown mark
+        c.create_line(*P(5, 30, 35, 30), fill="#facc15", width=max(1, 3 * k), tags=tags)
+        c.create_text(*P(20, 22), text="\u265b", fill="#a16207", font=("", max(7, int(9 * k)), "bold"), tags=tags)
+        if phase and phase % 10 < 3:
+            c.create_text(*P(33, 6), text="\u2726", fill="#fde047", font=("", max(6, int(7 * k))), tags=tags)
     if progress > 0.85:
         c.create_oval(*P(15, 14, 18, 17), fill="#111827", outline="", tags=tags)  # someone peeking out
         c.create_oval(*P(22, 14, 25, 17), fill="#111827", outline="", tags=tags)
@@ -454,6 +476,7 @@ FAMILY_THEME = {  # strategy family -> dragon type
     "RSI": "ice", "Stochastic": "ice", "Bollinger bands": "ice", "Mean reversion": "ice", "VWAP snap-back": "ice",
     "Breakout": "lightning", "Volume breakout": "lightning", "ATR channel": "lightning",
     "Trend + dip": "space", "Dollar-cost averaging": "space",
+    "Supertrend": "lightning", "Ichimoku cross": "space", "Rate of change": "fire", "MA ribbon": "fire",
 }
 THEME_NAMES = {"fire": "Fire dragon (trend follower)", "ice": "Ice dragon (buys dips)",
                "lightning": "Lightning dragon (breakouts)", "space": "Space dragon (dips in an uptrend)",
@@ -629,6 +652,7 @@ class App:
         self.curve_n = 0          # chart points added so far this session
         self.inducted = set()     # Hall of Fame keys added this session
         self.fees_paid = 0.0      # fees paid by the account this session
+        self.bought_at = {}       # coin -> time the current position was first bought (minimum hold)
         self.hx = {}              # coin -> {'h','l','v'} lined up with self.hist (highs, lows, volumes per bar)
         self.bar_hl = {}          # coin -> [high, low] of the ticks inside the bar being built
         self.cur_vol = {}         # coin -> latest volume per bar from Coinbase candles
@@ -642,7 +666,7 @@ class App:
             start_cash=self.start_cash, cash=self.cash, pos=self.pos, cost=self.cost,
             trades=self.trades[-5000:], shadow=self.shadow_trades[-1000:], curve=self.curve[-1500:], bench_units=self.bench_units,
             coins=self.session_coins, bar_n=self.bar_n, bar=self.session_bar, quote=self.quote, high=self.high,
-            fees_paid=self.fees_paid))
+            fees_paid=self.fees_paid, bought_at=self.bought_at))
 
     def load_state(self, s):
         self.start_cash, self.cash = s["start_cash"], s["cash"]
@@ -654,6 +678,7 @@ class App:
         self.quote = s.get("quote", "USD")
         self.high = {c: float(v) for c, v in (s.get("high") or {}).items() if isinstance(v, (int, float))}
         self.fees_paid = float(s.get("fees_paid", 0) or 0)
+        self.bought_at = {c: float(t) for c, t in (s.get("bought_at") or {}).items() if isinstance(t, (int, float))}
 
     def on_close(self):
         if self.running and not messagebox.askyesno(
@@ -958,7 +983,7 @@ class App:
         self.show_bots_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(trade_bar, text="Show every bot's test trades", variable=self.show_bots_var,
                         command=self.refresh_trades).pack(side="right", padx=8)
-        self.board.bind("<<TreeviewSelect>>", lambda e: (self.draw_chart(), self.grid_refresh()))
+        self.board.bind("<<TreeviewSelect>>", lambda e: self.soon(self._after_select))
         self.trade_tree = self.make_tree(
             t5, ("time", "mode", "side", "coin", "qty", "usd", "price", "pl", "who", "why"),
             (125, 55, 55, 55, 105, 80, 90, 80, 200, 170),
@@ -1206,27 +1231,68 @@ class App:
         return [v for v in self.tourn.vars if str(id(v)) in ids]
 
     def export_bots(self):
-        if not self.tourn:
-            return messagebox.showinfo("Export bots", "Start the bot with Wildcard ticked first.")
-        chosen = set(id(v) for v in self.selected_variants())
-        rows = self.tourn.board()
-        if chosen:
-            rows = [r for r in rows if id(r["v"]) in chosen]
-        else:
-            rows = [r for r in rows if r["status"] != "benched"] or rows
-        if not rows:
-            return messagebox.showinfo("Export bots", "There are no strategies to export yet.")
-        p = filedialog.asksaveasfilename(title="Export bots", defaultextension=".json", initialfile="my-bots.json",
-                                         filetypes=[("Bot file", "*.json")])
-        if not p:
-            return
-        try:
-            version = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "VERSION")).read().strip()
-        except Exception:
-            version = ""
-        rows = [dict(r, bar_minutes=self.session_bar) for r in rows]
-        E.save_bots_file(p, E.export_bots(rows, version))
-        self.write(f"Exported {len(rows)} bot{'s' if len(rows) != 1 else ''} to {p}")
+        """Export window: choose which bots (all, sections, Hall of Fame, Library or your selection)."""
+        w = tk.Toplevel(self.root)
+        w.title("Export bots")
+        w.resizable(False, False)
+        f = ttk.Frame(w, padding=16)
+        f.pack()
+        ttk.Label(f, text="Export bots", font=("", 12, "bold")).pack(anchor="w")
+        ttk.Label(f, foreground=MUTED, wraplength=440, text=(
+            "The file is plain JSON. Besides each bot's settings and results it spells out its rules in plain English "
+            "and explains every setting, so another app or an AI can read and rebuild it. No keys or balances are included.")
+        ).pack(anchor="w", pady=(2, 10))
+        board = self.tourn.board() if self.tourn else []
+        tiers = [(r, self.tier(r)) for r in board]
+        sel_ids = {id(v) for v in self.selected_variants()}
+        scopes = [
+            ("selected", f"The bots I selected ({len(sel_ids)})", [r for r in board if id(r["v"]) in sel_ids]),
+            ("all", f"All bots on the farm ({len(board)})", board),
+            ("beasts", f"BEASTS only ({sum(1 for _, t in tiers if t == 'beast')})", [r for r, t in tiers if t == "beast"]),
+            ("rising", f"Rising ({sum(1 for _, t in tiers if t == 'rising')})", [r for r, t in tiers if t == "rising"]),
+            ("eggs", f"Eggs ({sum(1 for _, t in tiers if t == 'egg')})", [r for r, t in tiers if t == "egg"]),
+            ("good", f"Everything that isn't resting ({sum(1 for r in board if r['status'] != 'benched')})",
+             [r for r in board if r["status"] != "benched"]),
+            ("hof", f"My Hall of Fame ({len(self.hof())})", self.hof()),
+            ("library", f"My Bot Library ({len(self.library())})", self.library()),
+        ]
+        first = next((k for k, _, it in scopes if it), "hof")
+        choice = tk.StringVar(value=first)
+        for key, label, items in scopes:
+            ttk.Radiobutton(f, text=label, value=key, variable=choice,
+                            state="normal" if items else "disabled").pack(anchor="w")
+        also_txt = tk.BooleanVar(value=bool(self.cfg.get("export_txt", False)))
+        ttk.Checkbutton(f, text="Also save a plain-text summary (.txt) next to it", variable=also_txt).pack(anchor="w", pady=(10, 0))
+
+        def go():
+            items = dict((k, it) for k, _, it in scopes)[choice.get()]
+            if not items:
+                return messagebox.showinfo("Export bots", "There are no bots in that group yet.", parent=w)
+            p = filedialog.asksaveasfilename(title="Export bots", defaultextension=".json", parent=w,
+                                             initialfile=f"cbbf-{choice.get()}-bots.json", filetypes=[("Bot file", "*.json")])
+            if not p:
+                return
+            rows = [dict(r, bar_minutes=self.session_bar) if "v" in r else r for r in items]
+            payload = E.export_bots(rows, self.version)
+            E.save_bots_file(p, payload)
+            self.cfg["export_txt"] = also_txt.get()
+            if also_txt.get():
+                txt = os.path.splitext(p)[0] + ".txt"
+                with open(txt, "w", encoding="utf-8") as fh:
+                    fh.write(f"CBBF bots, exported {payload['exported_at']}\n\n{payload['how_to_read']}\n\n")
+                    for n, b in enumerate(payload["bots"], 1):
+                        lt = b.get("lifetime") or {}
+                        fh.write(f"{n}. {E.bot_nickname(E.bot_key(b))}\n   {b['rules']}\n")
+                        if lt:
+                            fh.write(f"   Results: return {lt.get('return_pct')}%, vs holding {lt.get('vs_holding_pct')}%, "
+                                     f"win rate {lt.get('win_rate_pct')}%, fees ${lt.get('fees_paid', '-')}\n")
+                        fh.write("\n")
+            self.write(f"Exported {len(payload['bots'])} bots to {p}" + (" (+ .txt summary)" if also_txt.get() else ""))
+            w.destroy()
+        b = ttk.Frame(f)
+        b.pack(anchor="e", pady=(12, 0))
+        ttk.Button(b, text="Cancel", command=w.destroy).pack(side="left", padx=6)
+        ttk.Button(b, text="Export...", style="Accent.TButton", command=go).pack(side="left")
 
     def import_bots(self):
         if not self.tourn or not self.seeded:
@@ -2328,6 +2394,8 @@ class App:
                 status = "Stopped (dropped fast)"
             elif r["status"] == "slowed" and r.get("behind"):
                 status = "Shaky (not beating holding)"
+            elif r["status"] == "slowed" and r.get("proving"):
+                status = "Proving itself (live prices)"
             lf = r["life"]
             in_hof = r["v"].key() in hofk
             star = "\u2605 " if in_hof else ""
@@ -2476,7 +2544,7 @@ class App:
         hist, hx = {}, {}
         for c in coins:
             try:
-                d = E.fetch_ohlcv(c, gran, 600, self.quote)
+                d = E.fetch_ohlcv(c, gran, 2000, self.quote)  # enough for slow, long-holding bots too
                 hist[c], hx[c] = d["c"], dict(h=d["h"], l=d["l"], v=d["v"])
             except Exception as e:
                 hist[c], hx[c] = [], dict(h=[], l=[], v=[])
@@ -2823,7 +2891,7 @@ class App:
 
     def on_bar(self, prices):
         self.bar_n += 1
-        keep = min(6000, max(1000, int(1440 / self.session_bar) + 20))
+        keep = min(8000, max(2400, int(1440 / self.session_bar) + 20))
         for c in self.session_coins:
             h = self.hist.setdefault(c, [])
             x = self.hx.setdefault(c, dict(h=[], l=[], v=[]))
@@ -2869,6 +2937,9 @@ class App:
                     who = [n for n, v in zip(self.active, votes) if v == sig]
             if sig and not self.brake_ok():
                 sig = None
+            hold_min = float(self.settings.get("min_hold_min", 0) or 0)
+            if sig == "sell" and hold_min > 0 and c in self.bought_at and time.time() - self.bought_at[c] < hold_min * 60:
+                sig = None  # minimum hold time not reached yet
             if sig == "sell" and self.settings.get("fee_aware", True) and self.pos.get(c, 0) > 0:
                 fee, slip = E.cost_model(self.settings)
                 gain = prices[c] / (self.cost[c] / self.pos[c]) - 1
@@ -3073,8 +3144,10 @@ class App:
         self.trades.append(row)
         if side == "buy":
             self.high[c] = max(self.high.get(c, px), px)
+            self.bought_at.setdefault(c, time.time())
         elif self.pos.get(c, 0) <= 0:
             self.high.pop(c, None)
+            self.bought_at.pop(c, None)
         try:
             E.append_trade_csv(row)
         except OSError:
@@ -3609,11 +3682,28 @@ class App:
             Tip(l, self.SECTION_TIPS[key])
             self.grid_chips[key] = l
         ttk.Button(top, text="Catch!", style="Accent.TButton", command=self.catch_selected).pack(side="right")
+        eb = ttk.Button(top, text="+ Add eggs", style="Plain.TButton", command=self.add_eggs)
+        eb.pack(side="right", padx=(0, 6))
+        Tip(eb, "Hatch brand-new random bots now. They learn on recent prices and have to earn their place.")
+        self.farm_size = tk.StringVar(value=str(int(self.settings.get("max_bots", 30))))
+        fs = ttk.Spinbox(top, from_=14, to=200, increment=2, width=5, textvariable=self.farm_size, command=self.set_farm_size)
+        fs.pack(side="right", padx=(0, 6))
+        fs.bind("<Return>", lambda e: self.set_farm_size())
+        fs.bind("<FocusOut>", lambda e: self.set_farm_size())
+        tk.Label(top, text="Farm size", bg=BG, fg=MUTED, font=("", 8)).pack(side="right", padx=(0, 4))
+        Tip(fs, "Most bots on the farm at once (14 to 200). More bots explore more ideas but use more computer power; "
+                "the farm grows toward this number as it evolves, or press '+ Add eggs'.")
         self.farm_style = tk.StringVar(value=self.cfg.get("farm_style", "Dragons"))
         vb = ttk.Combobox(top, textvariable=self.farm_style, values=["Dragons", "Simple cards", "List"], state="readonly", width=12)
         vb.pack(side="right", padx=(0, 8))
         vb.bind("<<ComboboxSelected>>", lambda e: self.set_farm_style())
         tk.Label(top, text="View", bg=BG, fg=MUTED, font=("", 8)).pack(side="right", padx=(0, 4))
+        self.motion_var = tk.StringVar(value=self.settings.get("animations", "Full"))
+        mb = ttk.Combobox(top, textvariable=self.motion_var, values=["Full", "Light", "Off"], state="readonly", width=5)
+        mb.pack(side="right", padx=(0, 8))
+        mb.bind("<<ComboboxSelected>>", lambda e: self._set_motion())
+        tk.Label(top, text="Motion", bg=BG, fg=MUTED, font=("", 8)).pack(side="right", padx=(0, 4))
+        Tip(mb, "Full: smooth animation. Light: about 2 frames a second, uses very little computer power. Off: still pictures.")
         Tip(vb, "Dragons: animated cards. Simple cards: the same cards without animation. List: a plain table.")
         self.grid_sum = tk.Label(parent, text="", bg=BG, fg=MUTED, font=("", 9), anchor="w")
         self.grid_sum.pack(fill="x", padx=8)
@@ -3639,6 +3729,59 @@ class App:
         self.grid_cards, self.grid_hover, self.beasts_seen = [], None, set()
         self._grid_paint_chips()
         self.root.after(300, self.animate_all)
+
+    def _set_motion(self):
+        self.settings["animations"] = self.motion_var.get()
+        self.cfg["settings"] = self.settings
+        E.save_json(CONFIG_PATH, self.cfg)
+
+    def set_farm_size(self):
+        try:
+            n = int(float(self.farm_size.get()))
+        except ValueError:
+            return
+        n = min(max(n, 14), 200)
+        self.farm_size.set(str(n))
+        if n == int(self.settings.get("max_bots", 30)):
+            return
+        self.settings["max_bots"] = n
+        self.cfg["settings"] = self.settings
+        E.save_json(CONFIG_PATH, self.cfg)
+        if self.tourn:
+            self.tourn.cap = n
+            self.tourn.family_cap = max(5, -(-n // 4))
+            while len(self.tourn.vars) > n:  # shrink: let the weakest go
+                worst = [v for v, _ in reversed(self.tourn.ranking()) if v not in self.tourn.active] or \
+                        [v for v in self.tourn.vars if self.tourn.info.get(id(v), {}).get("status") == "warming up"]
+                if not worst:
+                    break
+                self.tourn._remove(worst[0], "farm made smaller")
+            self.tourn._rate()
+            self.refresh_board()
+        self.write(f"Farm size: up to {n} bots." + (" It grows toward this as it evolves, or press '+ Add eggs'." if self.tourn else ""))
+
+    def add_eggs(self):
+        if not self.tourn or not self.seeded:
+            return messagebox.showinfo("Add eggs", "Start the bot with 'Let the bot choose (Wildcard)' ticked first.")
+        room = self.tourn.cap - len(self.tourn.vars)
+        n = simpledialog.askinteger("Add eggs", f"How many new eggs? (room for {max(room, 0)} more; raise Farm size for more)",
+                                    initialvalue=max(1, min(5, room)) if room > 0 else 0, minvalue=0, maxvalue=200)
+        if not n:
+            return
+        if n > room:
+            self.tourn.cap = len(self.tourn.vars) + n
+            self.settings["max_bots"] = min(200, self.tourn.cap)
+            self.farm_size.set(str(self.settings["max_bots"]))
+            self.cfg["settings"] = self.settings
+            E.save_json(CONFIG_PATH, self.cfg)
+        closes = {c: self.hist[c] for c in self.session_coins}
+        made = 0
+        for _ in range(n):
+            if self.tourn.spawn_random(closes):
+                made += 1
+        self.flush_events()
+        self.refresh_board()
+        self.write(f"\u25d2 {made} new egg{'s' if made != 1 else ''} added to the farm.", "good")
 
     def set_farm_style(self):
         st = self.farm_style.get()
@@ -3807,7 +3950,8 @@ class App:
         self.grid_sum.config(text=(f"\u25d2 {gc['Eggs']} eggs   \u25b2 {gc['Rising']} rising   "
                                    f"\u265b {gc['BEASTS']} BEASTS   \u2605 {gc['Hall of Fame']} in the Hall of Fame"
                                    + (f"   |   generation {max(v.gen for v in self.tourn.vars)}" if self.tourn and self.tourn.vars else "")
-                                   + ("" if awake or not self.tourn else "   |   the farm is asleep (press Start)")))
+                                   + ("" if awake or not self.tourn else "   |   the farm is asleep (press Start)")
+                                   + "   |   goal: make money after fees, and more than just holding"))
         f = self.grid_filter.get()
         style = self.farm_style.get()
         if style == "List" and self.grid_list is not None:
@@ -3899,6 +4043,7 @@ class App:
             self.grid_cards.append((x, y, x + cw, y + ch, v, r["status"], t, v.name))
         nrows = (len(items) + per - 1) // per
         c.configure(scrollregion=(0, 0, W, nrows * (ch + g) + g))
+        c.tag_raise("anim")  # keep the animated layer on top so nothing flickers when the cards are redrawn
 
     def _hof_card(self, c, x, y, cw, ch, b, live):
         gold = "#f59e0b"
@@ -3931,6 +4076,14 @@ class App:
         if extras:
             c.create_text(x + 10, y + 124, anchor="w", fill=MUTED, font=("", 7), tags="card", text=extras[:48])
 
+    def egg_color(self, v):
+        if v.royal:
+            return "#f59e0b"  # royal egg: descends from bots you saved
+        if self.settings.get("egg_colors", "By dragon type") == "Purple":
+            return "#8b5cf6"
+        th = theme_for(v.name)
+        return THEMES[th]["body"] if th else "#8b5cf6"
+
     def _grid_anim_frame(self):
         c = self.grid
         c.delete("anim")
@@ -3949,7 +4102,8 @@ class App:
                 continue
             if t == "egg":
                 prog = min(1, len(v.eq) / max(1, self.tourn.W)) if self.tourn else 0
-                draw_egg(c, x0 + 20, y0 + 12, 40, "#8b5cf6", prog, ph if awake else 0, tags="anim")
+                draw_egg(c, x0 + 20, y0 + 12, 40, self.egg_color(v), prog, ph if awake else 0, tags="anim",
+                         royal=v.royal)
                 continue
             label, col = self.GRID_STATUS.get(st, ("?", MUTED))
             working = awake and st != "benched"
@@ -3972,6 +4126,10 @@ class App:
                 side = v.log[-1][2]
                 c.create_text(x0 + 66, y0 + 24, text="BUY!" if side == "buy" else "SELL!", tags="anim",
                               fill=GREEN if side == "buy" else "#f59e0b", font=("", 8, "bold"))
+        sel = set(self.board.selection())
+        for x0, y0, x1, y1, v, st, t, strat in self.grid_cards:
+            if v is not None and str(id(v)) in sel and not (y1 < top or y0 > bottom):
+                self.round_rect(c, x0 - 3, y0 - 3, x1 + 3, y1 + 3, 16, fill="", outline=TEXT, width=3, tags="anim")
         hv = self.grid_hover
         if hv is not None:
             x0, y0, x1, y1 = hv
@@ -4000,8 +4158,19 @@ class App:
                 self.board.selection_set(list(cur))
             else:
                 self.board.selection_set(iid)
-        self.grid_refresh()
+        self.soon(self._after_select)
+
+    def soon(self, fn, ms=40):
+        """Runs fn once a moment from now, however many times it is asked for meanwhile (keeps clicks snappy)."""
+        pend = self.__dict__.setdefault("_soon", {})
+        if fn.__name__ in pend:
+            return
+        pend[fn.__name__] = self.root.after(ms, lambda: (pend.pop(fn.__name__, None), fn()))
+
+    def _after_select(self):
         self.draw_chart()
+        if self.farm_style.get() != "Dragons":  # dragons show the selection on their own animated layer
+            self.grid_refresh()
 
     # ---------------- watchlist ----------------
     def build_watchlist(self, parent):
@@ -4895,7 +5064,9 @@ class App:
         if where == "library":
             m.add_command(label="Add to team", command=lambda: (E.set_team([E.bot_key(b) for b in entries], True), self.col_refresh()))
             m.add_command(label="Remove from team", command=lambda: (E.set_team([E.bot_key(b) for b in entries], False), self.col_refresh()))
-        m.add_command(label="Add to this run", command=lambda: self._add_entries_to_run(entries))
+        m.add_command(label="Add to farm (they compete and breed)", command=lambda: self._add_entries_to_run(entries))
+        if where == "library" and len(entries) == 2:
+            m.add_command(label="\u265b Breed these two", command=self._col_breed)
         m.add_separator()
         if where == "library":
             m.add_command(label="Release from Library", command=self._col_release)
@@ -4971,7 +5142,10 @@ class App:
                                "trades with just them."),
                               ("Remove from Hall of Fame", lambda: self.demote_keys([E.bot_key(b) for b in self._col_chosen()]),
                                "They stay in your Library."),
-                              ("Add to this run", self._col_add_run, "Drop the selected bots into the running tournament."),
+                              ("Add to farm", self._col_add_run, "Drop the selected bots onto the farm: they compete and "
+                               "breed, and their children hatch from royal eggs."),
+                              ("Breed pair", self._col_breed, "Select exactly two bots and breed a child from them right "
+                               "now. It starts as a royal egg on the farm."),
                               ("Export...", self._col_export, "Save the selected bots (or all) to a bot file to share."),
                               ("Release", self._col_release, "Remove the selected bots from your collection.")):
             b = ttk.Button(btns, text=txt, command=cmd, style="Accent.TButton" if txt == "Add to team" else "TButton")
@@ -5116,6 +5290,28 @@ class App:
         self.flush_events()
         self.refresh_board()
         self.write(f"Added {n} bots from your collection to this run." if n else "Those bots are already competing.")
+
+    def _col_breed(self):
+        bots = self._col_chosen()
+        if len(bots) != 2:
+            return messagebox.showinfo("Breed", "Select exactly two bots (Ctrl-click) to breed them.", parent=self.col_win)
+        if not self.tourn or not self.seeded:
+            return messagebox.showinfo("Breed", "Start the bot with Wildcard ticked first.", parent=self.col_win)
+        closes = {c: self.hist[c] for c in self.session_coins}
+        parents = []
+        for b in bots:
+            v = next((x for x in self.tourn.vars if x.key() == E.bot_key(b)), None) or self.tourn.add_variant(
+                b["name"], b["params"], closes, b.get("size", 1.0), note="Parent joined:", tf=b.get("tf", 1),
+                risk=b.get("risk"), traits=b.get("traits"), origin="library")
+            if v:
+                parents.append(v)
+        if len(parents) != 2:
+            return
+        child = self.tourn.breed_pair(parents[0], parents[1], closes)
+        self.flush_events()
+        self.refresh_board()
+        self.write(f"♛ A royal egg joined the farm: {E.bot_nickname(child.key())}, child of "
+                   f"{bots[0].get('nickname', '?')} and {bots[1].get('nickname', '?')}.", "good")
 
     def _col_export(self):
         bots = self._col_chosen(all_if_none=True)
@@ -5712,6 +5908,10 @@ class App:
                     var = tk.StringVar(value=BAR_LABELS.get(float(cur), "1 min"))
                     ttk.Combobox(f, textvariable=var, values=list(BAR_LABELS.values()), state="readonly", width=12).grid(
                         row=r, column=1, padx=(10, 0), sticky="w")
+                elif typ == "eggs":
+                    var = tk.StringVar(value=cur if cur in ("By dragon type", "Purple") else "By dragon type")
+                    ttk.Combobox(f, textvariable=var, values=["By dragon type", "Purple"], state="readonly", width=15).grid(
+                        row=r, column=1, padx=(10, 0), sticky="w")
                 elif typ == "chars":
                     var = tk.StringVar(value=cur if cur in ("Themed dragons", "Classic dragons") else "Themed dragons")
                     ttk.Combobox(f, textvariable=var, values=["Themed dragons", "Classic dragons"], state="readonly", width=15).grid(
@@ -5802,7 +6002,7 @@ class App:
                         new[k] = next(b for b, l in BAR_LABELS.items() if l == v)
                     elif typ == "order":
                         new[k] = next(o for o, l in ORDER_LABELS.items() if l == v)
-                    elif typ is str or typ in ("anim", "chars"):
+                    elif typ is str or typ in ("anim", "chars", "eggs"):
                         new[k] = v.strip()
                     else:
                         new[k] = typ(float(v)) if typ is int else float(v)
@@ -5814,7 +6014,7 @@ class App:
                 assert 0 < new["trade_pct"] <= 100 and new["refresh"] >= 1 and new["evolve_every"] >= 1 and 0 < new["max_coin_pct"] <= 100
                 assert new["bar_minutes"] in BAR_CHOICES and min(new["stop_loss"], new["take_profit"], new["daily_loss"]) >= 0
                 assert 1.0 <= new["winner_boost"] <= 3.0 and new["add_every"] >= 1 and new["slow_every"] >= 1 and new["fail_drop"] >= 0
-                assert 14 <= new["max_bots"] <= 50 and new["retire_hours"] >= 0 and 0 <= new["auto_coins"] <= 15
+                assert 14 <= new["max_bots"] <= 200 and new["retire_hours"] >= 0 and 0 <= new["auto_coins"] <= 15
                 assert new["hof_hours"] > 0 and new["hof_min_trades"] >= 0 and new["max_trades_hour"] >= 0
                 assert 0 <= new["trail_stop"] < 100 and 0 <= new["slippage"] < 5 and 0 <= new["maker_fee_pct"] < 5
                 assert 3 <= new["limit_wait"] <= 600 and 0 <= new["fee_pct"] < 5
@@ -5822,7 +6022,7 @@ class App:
                     assert E.fix_params(n, dict(p)) == p
             except Exception:
                 return messagebox.showerror("Settings", "One of the numbers isn't valid. Reminders: winner trade size must be "
-                                                        "between 1 and 3; most strategies must be 14 to 50; the bot can pick 0 to 15 "
+                                                        "between 1 and 3; farm size must be 14 to 200; the bot can pick 0 to 15 "
                                                         "coins; limit wait is 3 to 600 seconds; percentages can't be negative; "
                                                         "strategy numbers must stay in their normal range, short averages below "
                                                         "long ones and buy levels well below sell levels.", parent=w)
