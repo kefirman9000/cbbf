@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.11.0
+**Studies: several reasons to buy, several reasons not to**
+- Each bot can now weigh **several positive studies** (its main strategy plus up to 4 more strategies from any
+  family) and **several negative studies** (up to 3). Every study's most recent signal is its vote. The bot buys
+  when enough positive studies say buy, minus one for each negative study currently saying sell. "Enough" is its own
+  evolvable number (for example "2 of 3"). For example: Breakout + MACD + RSI as positives, needing 2 of 3, with
+  Supertrend and Momentum as negatives.
+- **Exit studies** (up to 3): the position is sold when any of them says sell, instead of the main strategy.
+- **Sizing**: trades can be sized to how wild the market is.
+- **Everything is graded**: buys held back by too little agreement and buys blocked by negative studies are
+  followed to see whether holding back saved or cost money, and that evidence decides whether the studies are passed
+  on. Studies are pooled from both parents when breeding, then kept, tweaked, swapped, dropped or newly added.
+- Each bot's card shows its full **rule stack** in five layers (market filter, positive studies, negative studies
+  and never-rules, sizing, exits); farm cards show its study counts; exports describe them; **Design an egg** lets you
+  pick several positive, negative and exit studies and how many must agree.
+
 ## 1.10.0
 **Never-rules, health and power**
 - Bots can now evolve **never-rules**: things they refuse to do. "No falling knives" (don't buy after a big drop),

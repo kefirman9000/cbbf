@@ -631,6 +631,7 @@ DEFAULT_SETTINGS = {
     "bot_stops": True,           # Wildcard: the account's safety stop / lock-in-profit follow what the winning bots learned
     "classics": True,            # mix famous strategies (golden cross, turtle, RSI-2...) into the eggs
     "classic_rate": 25,          # % of new eggs that are a famous strategy (when one isn't on the farm yet)
+    "layers": True,              # bots can evolve extra rule layers: a confirming strategy, an exit strategy, a sizing rule
     "vetoes": True,              # bots can evolve never-rules, each graded by what the blocked trade would have done
     "prove_live": True,          # a bot can only be Winning after it also made money on prices it hadn't seen yet
     "risk_adjusted": True,       # rank winners by gain per unit of downside swing, not raw gain
@@ -775,7 +776,7 @@ def tournament_opts(settings):
                 slip=slip, fee_aware=bool(settings.get("fee_aware", True)),
                 prove_live=bool(settings.get("prove_live", True)), risk_adjusted=bool(settings.get("risk_adjusted", True)),
                 classics=bool(settings.get("classics", True)), classic_rate=float(settings.get("classic_rate", 25)) / 100,
-                vetoes=bool(settings.get("vetoes", True)),
+                vetoes=bool(settings.get("vetoes", True)), layers=bool(settings.get("layers", True)),
                 long_holds=bool(settings.get("long_holds", True)))
 
 
@@ -925,10 +926,123 @@ def _grade_vetoes(v, closes, n):
         move = (closes[c][-1] / px - 1) * 100
         # a skipped buy saved money if the price fell (plus the fees it didn't pay); a skipped sell, if it rose
         saved = (-move + v.rt_cost * 100) if side == "buy" else move
-        st = v.veto_stats.setdefault(k, [0.0, 0.0])
+        st = (v.layer_stats if k in ("plus", "minus", "confirm") else v.veto_stats).setdefault(k, [0.0, 0.0])
         st[0] += 1
         st[1] += saved
     v.veto_wait = keep
+
+
+# ---- rule layers: several positive studies, several negative studies, several exit studies, and a sizing rule ----
+MAX_PLUS, MAX_MINUS, MAX_EXITS = 4, 3, 3
+
+
+def _clean_sub(d):
+    if not isinstance(d, dict) or d.get("name") not in STRATS or d.get("name") == "Dollar-cost averaging":
+        return None
+    spec, p = STRATS[d["name"]], {}
+    for k, dv in spec["params"].items():
+        lo, hi = spec["bounds"][k]
+        try:
+            val = min(max(float((d.get("params") or {}).get(k, dv)), lo), hi)
+        except (TypeError, ValueError):
+            val = dv
+        p[k] = int(round(val)) if isinstance(dv, int) else round(val, 2)
+    return dict(name=d["name"], params=fix_params(d["name"], p))
+
+
+def clean_layers(d):
+    """Validated rule layers:
+      plus  = extra positive studies (the main strategy always counts as one), up to 4
+      minus = negative studies: each one whose latest signal is a sell counts against buying, up to 3
+      exits = exit studies: the position is sold when any of them signals sell (instead of the main strategy), up to 3
+      need  = how many positive studies (main included) must currently be on 'buy', after negatives are subtracted
+      size  = {target}: trade size scaled to the market's swing"""
+    d = d if isinstance(d, dict) else {}
+    out = {}
+    plus = list(d.get("plus") or []) + ([d["confirm"]] if isinstance(d.get("confirm"), dict) else [])
+    exits = list(d.get("exits") or []) + ([d["exit"]] if isinstance(d.get("exit"), dict) else [])
+    for key, items, cap in (("plus", plus, MAX_PLUS), ("minus", d.get("minus") or [], MAX_MINUS), ("exits", exits, MAX_EXITS)):
+        subs = [x for x in (_clean_sub(i) for i in items if isinstance(i, dict)) if x][:cap]
+        if subs:
+            out[key] = subs
+    if out.get("plus") or out.get("minus"):
+        try:
+            need = int(d.get("need", 1 + (len(out.get("plus", [])) + 1) // 2 if "need" in d or d.get("plus") else 1))
+        except (TypeError, ValueError):
+            need = 1
+        out["need"] = min(max(need, 1), 1 + len(out.get("plus", [])))
+    sz = d.get("size")
+    if isinstance(sz, dict):
+        try:
+            out["size"] = dict(target=round(min(max(float(sz.get("target", 0.5)), 0.1), 3.0), 2))
+        except (TypeError, ValueError):
+            pass
+    return out
+
+
+def _sub_txt(s):
+    return f"{s['name']} ({'/'.join(f'{x:g}' for x in s['params'].values())})"
+
+
+def _stat_txt(st, what):
+    if st and st[0]:
+        return f" [{'saved' if st[1] >= 0 else 'cost'} {abs(st[1]):.1f}% over {int(st[0])} {what}]"
+    return ""
+
+
+def layers_text(L, stats=None):
+    stats = stats or {}
+    parts = []
+    if L.get("plus") or L.get("minus"):
+        n_pos = 1 + len(L.get("plus", []))
+        t = f"buys when at least {L.get('need', 1)} of {n_pos} positive studies say buy"
+        if L.get("plus"):
+            t += " (main strategy + " + ", ".join(_sub_txt(s) for s in L["plus"]) + ")"
+        if L.get("minus"):
+            t += "; each of these saying sell counts against it: " + ", ".join(_sub_txt(s) for s in L["minus"])
+        t += _stat_txt(stats.get("plus"), "buys held back by too little agreement")
+        t += _stat_txt(stats.get("minus"), "buys blocked by negative studies")
+        parts.append(t)
+    if L.get("exits"):
+        parts.append("sells when any of these says sell: " + ", ".join(_sub_txt(s) for s in L["exits"]))
+    if L.get("size"):
+        parts.append(f"sizes trades to the market's swing (aims for {L['size']['target']:g}% moves per decision)")
+    return "; ".join(parts)
+
+
+def rule_stack(v_or_entry):
+    """The bot's rules as five layers, in plain English (for cards and exports)."""
+    g = (lambda k, d=None: getattr(v_or_entry, k, d)) if not isinstance(v_or_entry, dict) else (lambda k, d=None: v_or_entry.get(k, d))
+    tr, L, ls = g("traits", {}) or {}, g("layers", {}) or {}, g("layer_stats", {}) or {}
+    market = [traits_text({k: tr[k]}) for k in ("moods", "minvol", "trend") if k in tr]
+    pos = [f"{g('name')} (main)"] + [_sub_txt(s) for s in L.get("plus", [])]
+    entry = [f"positive studies: {', '.join(pos)}" + (f"; needs {L.get('need', 1)} of {len(pos)} saying buy" if len(pos) > 1 or L.get("minus") else "")
+             + _stat_txt(ls.get("plus"), "held-back buys")]
+    entry += [traits_text({k: tr[k]}) for k in ("confirm", "rsicap", "cool", "entries") if k in tr]
+    neg = ([f"negative studies: {', '.join(_sub_txt(s) for s in L['minus'])} (each saying sell counts against buying)"
+            + _stat_txt(ls.get("minus"), "blocked buys")] if L.get("minus") else [])
+    nev = vetoes_text(g("vetoes", {}), g("veto_stats", {}))
+    sizing = [layers_text({"size": L["size"]})] if L.get("size") else ["flat size"]
+    exits = [x for x in (risk_text(g("risk", {})),) if x] + [traits_text({k: tr[k]}) for k in ("trail", "maxhold", "minhold", "exit") if k in tr] + \
+        ([f"exit studies: {', '.join(_sub_txt(s) for s in L['exits'])} (any saying sell)"] if L.get("exits") else [f"{g('name')} sell signals"])
+    return [("1. Market filter", ", ".join(market) or "trades in any market"),
+            ("2. Positive studies", "; ".join(entry)),
+            ("3. Negative studies", "; ".join(neg + ([f"never-rules: {nev}"] if nev else [])) or "none"),
+            ("4. Sizing", "; ".join(sizing)),
+            ("5. Exits", "; ".join(exits))]
+
+
+def _study_states(v, L, key, closes, c, n, xc):
+    """Updates and returns each study's latest signal ('buy' / 'sell' / None) for this coin. Studies are judged by
+    their most recent signal, so a crossover from a few decisions ago still counts as that study's opinion."""
+    out = []
+    for i, s in enumerate(L.get(key, [])):
+        sig = strat_signal(s["name"], closes[c], n, s["params"], v.tf, xc)
+        k = f"{key}{i}:{c}"
+        if sig:
+            v.conf_last[k] = sig
+        out.append((sig, v.conf_last.get(k)))
+    return out
 
 
 def bot_step(v, closes, n, coins, extra=None):
@@ -962,6 +1076,32 @@ def bot_step(v, closes, n, coins, extra=None):
                 v.sig[c] = None
                 continue
             s = strat_signal(v.name, closes[c], n, v.params, v.tf, (extra or {}).get(c))
+            L = v.layers
+            if L:
+                xc = (extra or {}).get(c)
+                if L.get("exits"):  # exit studies: any of them saying sell closes the position (not the main strategy)
+                    if s == "sell":
+                        s = None
+                    if any(fresh == "sell" for fresh, _ in _study_states(v, L, "exits", closes, c, n, xc)) and sim.pos.get(c, 0) > 0:
+                        s = "sell"
+                if L.get("plus") or L.get("minus"):
+                    if s:
+                        v.conf_last[f"main:{c}"] = s
+                    plus = _study_states(v, L, "plus", closes, c, n, xc)
+                    minus = _study_states(v, L, "minus", closes, c, n, xc)
+                    trigger = s == "buy" or any(fresh == "buy" for fresh, _ in plus)
+                    if trigger and sim.pos.get(c, 0) <= 0 or s == "buy":
+                        votes = (v.conf_last.get(f"main:{c}") == "buy") + sum(1 for _, st_ in plus if st_ == "buy")
+                        against = sum(1 for _, st_ in minus if st_ == "sell")
+                        if votes - against >= L.get("need", 1):
+                            if s != "sell":
+                                s = "buy"
+                        else:
+                            why = "minus" if votes >= L.get("need", 1) else "plus"
+                            if not any(w[0] == why and w[1] == c for w in v.veto_wait):
+                                v.veto_wait.append((why, c, "buy", last[c], n + 10 * v.tf))
+                            if s == "buy":
+                                s = None
             if tr.get("confirm"):
                 v.run_sig[c] = (s, v.run_sig.get(c, (None, 0))[1] + 1) if s and s == v.run_sig.get(c, (None, 0))[0] else (s, 1 if s else 0)
                 if s and v.run_sig[c][1] < tr["confirm"]:
@@ -999,7 +1139,13 @@ def bot_step(v, closes, n, coins, extra=None):
                         s = None
                         break
             v.sig[c] = s
-            sim.act(c, s, last[c], n)
+            if s == "buy" and v.layers.get("size"):  # sizing layer: smaller in wild markets, bigger in calm ones
+                ser = tail_series(closes[c], v.tf, 22)
+                swing = sum(abs(ser[i] / ser[i - 1] - 1) for i in range(1, len(ser))) / max(1, len(ser) - 1) * 100
+                mult = min(1.5, max(0.5, v.layers["size"]["target"] / swing)) if swing > 0 else 1.0
+                sim.buy(c, last[c], n, mult)
+            else:
+                sim.act(c, s, last[c], n)
         t = sim.last
         if t:
             if t["side"] == "buy":
@@ -1018,7 +1164,7 @@ def bot_step(v, closes, n, coins, extra=None):
 
 
 class Variant:
-    def __init__(self, name, params, sim, maxlen, tf=1, risk=None, traits=None, vetoes=None):
+    def __init__(self, name, params, sim, maxlen, tf=1, risk=None, traits=None, vetoes=None, layers=None):
         self.name, self.params, self.sim = name, params, sim
         self.risk = clean_risk(risk)
         self.traits = clean_traits(traits)
@@ -1028,6 +1174,9 @@ class Variant:
         self.veto_stats = {}  # rule -> [times it blocked a trade, total % saved (negative = cost)]
         self.veto_wait = []   # blocked trades waiting to be graded: (rule, coin, side, price, decision due)
         self.lost_at = {}
+        self.layers = clean_layers(layers)
+        self.layer_stats = {}  # "confirm" -> [buys it blocked, total % saved]
+        self.conf_last = {}
         self.power = 0.0      # 0..10: grows only with real money made on fresh prices while beating holding
         self.live_high = None
         self.hi, self.since, self.entries, self.sold_at, self.run_sig = {}, {}, {}, {}, {}
@@ -1054,13 +1203,15 @@ class Variant:
 
     @property
     def label(self):
-        rt = ", ".join(x for x in (risk_text(self.risk), traits_text(self.traits), vetoes_text(self.vetoes)) if x)
+        rt = ", ".join(x for x in (risk_text(self.risk), traits_text(self.traits), vetoes_text(self.vetoes),
+                                   layers_text(self.layers)) if x)
         return (f"{self.name} ({', '.join(f'{k}={v}' for k, v in self.params.items())})"
                 + (f" on {self.tf}-bar candles" if self.tf > 1 else "") + (f" [{rt}]" if rt else ""))
 
     def key(self):
         return (self.name, self.tf, tuple(sorted((k, round(float(v), 4)) for k, v in self.params.items())),
-                tuple(sorted(self.risk.items())), tuple(sorted(self.traits.items())), tuple(sorted(self.vetoes.items())))
+                tuple(sorted(self.risk.items())), tuple(sorted(self.traits.items())), tuple(sorted(self.vetoes.items())),
+                json.dumps(self.layers, sort_keys=True))
 
 
 def bot_key(d):
@@ -1068,7 +1219,8 @@ def bot_key(d):
             tuple(sorted((k, round(float(v), 4)) for k, v in d["params"].items())),
             tuple(sorted(clean_risk(d.get("risk")).items())),
             tuple(sorted(clean_traits(d.get("traits")).items())),
-            tuple(sorted(clean_vetoes(d.get("vetoes")).items())))
+            tuple(sorted(clean_vetoes(d.get("vetoes")).items())),
+            json.dumps(clean_layers(d.get("layers")), sort_keys=True))
 
 
 class Tournament:
@@ -1096,7 +1248,8 @@ class Tournament:
         self.retire_steps = max(0, int(retire_steps))  # decisions a bot may go without winning before it is replaced
         self.o = dict(trade_more=True, winner_boost=2.5, add_every=3, slow_every=6, fail_drop=3.0,
                       beat_hold=True, crossbreed=True, regime_aware=True, slip=0.0, fee_aware=True,
-                      prove_live=True, risk_adjusted=True, long_holds=True, classics=True, classic_rate=0.25, vetoes=True)
+                      prove_live=True, risk_adjusted=True, long_holds=True, classics=True, classic_rate=0.25, vetoes=True,
+                      layers=True)
         self.replaying = False
         self.o.update(opts or {})
         self.slowed, self.cool, self.add_cool, self.kind = [], {}, {}, {}
@@ -1127,7 +1280,8 @@ class Tournament:
         while len(self.vars) < min(self.cap, 24):  # a bigger, more varied field from the start
             name = self.rng.choice(WILDCARD_STRATS)
             self.vars.append(self._new(name, self._rand_params(name), tf=self.rng.choice(TIMEFRAMES),
-                                       risk=self.rand_risk(), traits=self.rand_traits(), vetoes=self.rand_vetoes()))
+                                       risk=self.rand_risk(), traits=self.rand_traits(), vetoes=self.rand_vetoes(),
+                                       layers=self.rand_layers()))
         del self.vars[max(self.cap, 14):]
         for v in self.vars:
             self._register(v, [], "classic" if v.classic else "starter")
@@ -1136,9 +1290,10 @@ class Tournament:
         """How many bars a bot is judged over: slow bots get a longer window so they make enough decisions in it."""
         return self.W * min(max(1, clamp_tf(tf) // 2), 10)
 
-    def _new(self, name, params, tf=1, risk=None, traits=None, vetoes=None):
+    def _new(self, name, params, tf=1, risk=None, traits=None, vetoes=None, layers=None):
         v = Variant(name, params, Sim(self.start_cash, self.fee, self.pct, slip=self.o.get("slip", 0.0)),
-                    self.window_for(tf) + 1, tf, risk, traits, vetoes if self.o.get("vetoes", True) else None)
+                    self.window_for(tf) + 1, tf, risk, traits, vetoes if self.o.get("vetoes", True) else None,
+                    layers if self.o.get("layers", True) else None)
         v.rt_cost = 2 * (self.fee + self.o.get("slip", 0.0))
         v.fee_guard = 2 * (self.fee + self.o.get("slip", 0.0)) if self.o.get("fee_aware", True) else 0.0
         return v
@@ -1152,6 +1307,76 @@ class Tournament:
                     v = self.rng.randint(1, 14)
                 t[k] = v
         return clean_traits(t)
+
+    def _rand_sub(self, avoid=None):
+        name = self.rng.choice([n for n in WILDCARD_STRATS if n != avoid] or WILDCARD_STRATS)
+        return dict(name=name, params=self._rand_params(name))
+
+    def rand_layers(self, chance=0.35):
+        """Extra rule layers for a new bot: a few positive studies, a few negative studies, exit studies, sizing."""
+        if not self.o.get("layers", True):
+            return {}
+        out = {}
+        if self.rng.random() < chance:
+            out["plus"] = [self._rand_sub() for _ in range(self.rng.randint(1, 3))]
+        if self.rng.random() < chance:
+            out["minus"] = [self._rand_sub() for _ in range(self.rng.randint(1, 2))]
+        if self.rng.random() < chance * 0.7:
+            out["exits"] = [self._rand_sub() for _ in range(self.rng.randint(1, 2))]
+        if out.get("plus") or out.get("minus"):
+            out["need"] = self.rng.randint(1, 1 + len(out.get("plus", [])))
+        if self.rng.random() < chance * 0.6:
+            out["size"] = dict(target=self.rng.uniform(0.15, 1.5))
+        return clean_layers(out)
+
+    def inherit_layers(self, parents, main_name):
+        """Studies are pooled from the parents; each is usually kept (sometimes tweaked or swapped for another
+        family), now and then dropped, and now and then a new one is tried. If negative studies have been costing
+        money by blocking winning buys, they are more likely to be dropped; if they've been saving money, kept."""
+        if not self.o.get("layers", True):
+            return {}, {}
+        out, stats = {}, {}
+        caps = {"plus": MAX_PLUS, "minus": MAX_MINUS, "exits": MAX_EXITS}
+        for key, cap in caps.items():
+            pool = []
+            for p in parents:
+                for s in p.layers.get(key, []):
+                    if all(json.dumps(s, sort_keys=True) != json.dumps(x, sort_keys=True) for x in pool):
+                        pool.append(json.loads(json.dumps(s)))
+            src_stats = [p.layer_stats.get(key) for p in parents if p.layer_stats.get(key)]
+            st = max(src_stats, key=lambda x: x[0]) if src_stats else None
+            bad = bool(st and st[0] >= 5 and st[1] < 0)
+            good = bool(st and st[0] >= 5 and st[1] > 0)
+            keep_p = 0.55 if bad else 0.92 if good else 0.8
+            kept = []
+            for s in pool:
+                if self.rng.random() > keep_p:
+                    continue
+                roll = self.rng.random()
+                if roll < 0.1:
+                    s = self._rand_sub(avoid=s["name"])
+                elif roll < 0.4:
+                    s["params"] = self.mutate(s["name"], s["params"], 0.2)
+                kept.append(s)
+            self.rng.shuffle(kept)
+            if len(kept) < cap and self.rng.random() < 0.12:
+                kept.append(self._rand_sub())
+            if kept:
+                out[key] = kept[:cap]
+                if st and not bad and key in ("plus", "minus"):
+                    stats[key] = [st[0] / 2, st[1] / 2]
+        needs = [p.layers.get("need") for p in parents if p.layers.get("need")]
+        if out.get("plus") or out.get("minus"):
+            need = self.rng.choice(needs) if needs else 1 + len(out.get("plus", [])) // 2
+            if self.rng.random() < 0.25:
+                need += self.rng.choice((-1, 1))
+            out["need"] = need
+        sizes = [p.layers["size"] for p in parents if p.layers.get("size")]
+        if sizes and self.rng.random() < 0.9:
+            out["size"] = dict(target=self.rng.choice(sizes)["target"] * (self.rng.uniform(0.8, 1.25) if self.rng.random() < 0.4 else 1))
+        elif not sizes and self.rng.random() < 0.06:
+            out["size"] = dict(target=self.rng.uniform(0.15, 1.5))
+        return clean_layers(out), stats
 
     def rand_vetoes(self, chance=0.35):
         if not self.o.get("vetoes", True) or self.rng.random() > chance:
@@ -1548,7 +1773,8 @@ class Tournament:
                      life=self.life(v), origin=v.origin,
                      risk=dict(v.risk), traits=dict(v.traits), uid=v.uid, parents=list(v.parents), gen=v.gen,
                      classic=v.classic, vetoes=dict(v.vetoes), veto_stats={k: list(s) for k, s in v.veto_stats.items()},
-                     health=self.health(v), power=v.power)
+                     health=self.health(v), power=v.power, layers=json.loads(json.dumps(v.layers)),
+                     layer_stats={k: list(s) for k, s in v.layer_stats.items()})
                 for v, d in rows]
 
     def mutate(self, name, params, scale=0.25):
@@ -1661,17 +1887,19 @@ class Tournament:
                 if k in pick:
                     traits[k] = pick[k]
             vt, vs = self.inherit_vetoes([parent, mate])
+            ly, ls = self.inherit_layers([parent, mate], parent.name)
             child = self._new(parent.name, self.crossover(parent.name, parent.params, mate.params),
-                              self.rng.choice((parent.tf, mate.tf)), self.mutate_risk(risk), self.mutate_traits(traits), vt)
-            child.veto_stats = vs
+                              self.rng.choice((parent.tf, mate.tf)), self.mutate_risk(risk), self.mutate_traits(traits), vt, ly)
+            child.veto_stats, child.layer_stats = vs, ls
             self._register(child, [parent, mate], "bred")
             note = f"Bred {child.label} from two winners"
         else:
             scale = 0.35 if not self.active else 0.15 if len(self.active) >= 3 else 0.25  # bolder when nothing works
             vt, vs = self.inherit_vetoes([parent])
+            ly, ls = self.inherit_layers([parent], parent.name)
             child = self._new(parent.name, self.mutate(parent.name, parent.params, scale), self.mutate_tf(parent.tf),
-                              self.mutate_risk(parent.risk), self.mutate_traits(parent.traits), vt)
-            child.veto_stats = vs
+                              self.mutate_risk(parent.risk), self.mutate_traits(parent.traits), vt, ly)
+            child.veto_stats, child.layer_stats = vs, ls
             self._register(child, [parent], "tweaked")
             note = f"Spawned {child.label} (tweaked from {parent.label})"
         self.replay(child, closes)
@@ -1679,7 +1907,7 @@ class Tournament:
         self.events.append(note)
 
     def add_variant(self, name, params, closes=None, size=1.0, note="Added", tf=1, origin="added", risk=None, traits=None,
-                    vetoes=None):
+                    vetoes=None, layers=None):
         """Adds a strategy with the given settings (clamped to sane bounds) and replays recent prices."""
         if name not in STRATS:
             return None
@@ -1692,7 +1920,7 @@ class Tournament:
                 val = dv
             p[k] = int(round(val)) if isinstance(dv, int) else round(val, 2)
         fix_params(name, p)
-        v = self._new(name, p, tf, risk, traits, vetoes)
+        v = self._new(name, p, tf, risk, traits, vetoes, layers)
         self._register(v, [], origin)
         v.size_mult = min(max(float(size), 0.25), 3.0)
         if closes:
@@ -1723,8 +1951,9 @@ class Tournament:
         traits = {k: self.rng.choice((pa.traits, pb.traits))[k] for k in TRAITS
                   if k in self.rng.choice((pa.traits, pb.traits))}
         vt, vs = self.inherit_vetoes([pa, pb])
-        child = self._new(pa.name, params, self.rng.choice((pa.tf, pb.tf)), self.mutate_risk(risk), self.mutate_traits(traits), vt)
-        child.veto_stats = vs
+        ly, ls = self.inherit_layers([pa, pb], pa.name)
+        child = self._new(pa.name, params, self.rng.choice((pa.tf, pb.tf)), self.mutate_risk(risk), self.mutate_traits(traits), vt, ly)
+        child.veto_stats, child.layer_stats = vs, ls
         self._register(child, [pa, pb], "bred from your bots")
         if closes:
             self.replay(child, closes)
@@ -1767,7 +1996,7 @@ class Tournament:
                 return v
         return self.add_variant(name, p, closes, note="Random new strategy:", tf=self.rng.choice(TIMEFRAMES),
                                 origin="random", risk=self.rand_risk(), traits=self.rand_traits(0.35),
-                                vetoes=self.rand_vetoes())
+                                vetoes=self.rand_vetoes(), layers=self.rand_layers())
 
     def hall_of_fame_candidates(self, min_win_steps, min_trades):
         """Bots that have earned a place: enough time Winning, enough finished trades, and ahead of
@@ -1814,7 +2043,8 @@ class Tournament:
     _VFIELDS = ("name", "params", "tf", "risk", "traits", "size_mult", "uid", "parents", "gen", "origin", "royal",
                 "classic", "inducted", "strikes", "born_px", "age", "ntrades", "wins", "losses", "win_steps", "streak",
                 "peak", "maxdd", "mood_gain", "mood_n", "live_n", "live_eq0", "hi", "since", "entries", "sold_at",
-                "fee_guard", "rt_cost", "vetoes", "veto_stats", "lost_at", "power", "live_high")
+                "fee_guard", "rt_cost", "vetoes", "veto_stats", "lost_at", "power", "live_high", "layers", "layer_stats",
+                "conf_last")
 
     def to_state(self):
         """Everything needed to bring this farm back exactly as it is (plain data, JSON-ready)."""
@@ -1838,7 +2068,8 @@ class Tournament:
             try:
                 if d["name"] not in STRATS:
                     continue
-                v = self._new(d["name"], dict(d["params"]), d.get("tf", 1), d.get("risk"), d.get("traits"), d.get("vetoes"))
+                v = self._new(d["name"], dict(d["params"]), d.get("tf", 1), d.get("risk"), d.get("traits"), d.get("vetoes"),
+                              d.get("layers"))
                 for k in self._VFIELDS:
                     if k in d and k not in ("name", "params", "tf", "risk", "traits"):
                         setattr(v, k, d[k])
@@ -1854,6 +2085,9 @@ class Tournament:
                 v.vetoes = clean_vetoes(v.vetoes)
                 v.veto_stats = {k: list(s) for k, s in (v.veto_stats or {}).items() if k in v.vetoes}
                 v.lost_at = dict(v.lost_at or {})
+                v.layers = clean_layers(v.layers)
+                v.layer_stats = {k: list(s) for k, s in (v.layer_stats or {}).items()}
+                v.conf_last = dict(v.conf_last or {})
                 v.mood_gain = dict(v.mood_gain or {})
                 v.mood_n = dict(v.mood_n or {})
                 vars_.append(v)
@@ -1935,7 +2169,7 @@ def replay_bot(v, closes, extra, start, start_cash, fee, pct, slip=0.0):
     tournament (strategy, pace, own stops and traits). Returns (equity curve, trade count)."""
     coins = list(closes)
     b = Variant(v.name, dict(v.params), Sim(start_cash, fee, pct, slip=slip), 2, v.tf, dict(v.risk), dict(v.traits),
-                dict(v.vetoes))
+                dict(v.vetoes), json.loads(json.dumps(v.layers)))
     b.fee_guard, b.rt_cost = v.fee_guard, v.rt_cost
     L = min(len(x) for x in closes.values())
     eq, trades = [start_cash], 0
@@ -2033,7 +2267,7 @@ def run_lab(closes, settings, train_frac=0.7, top_n=12, start_cash=1000.0, seed=
         else:
             verdict = "Failed"
         rows.append(dict(name=v.name, params=dict(v.params), tf=v.tf, size=v.size_mult, risk=dict(v.risk),
-                         traits=dict(v.traits), vetoes=dict(v.vetoes),
+                         traits=dict(v.traits), vetoes=dict(v.vetoes), layers=json.loads(json.dumps(v.layers)),
                          train_ret=lf["ret"], train_edge=lf["edge"], train_status=info.get("status", ""),
                          test_ret=ret, test_edge=ret - test_hold, test_dd=dd, test_trades=tr, verdict=verdict,
                          passed=verdict == "Passed",
@@ -2283,6 +2517,7 @@ def describe_bot(b, bar_minutes=None):
     return (f"{b['name']}: {calc} {rule} It decides {pace}, on candles of that length."
             + (f" Own exits: {exits}." if exits else "") + (f" Habits: {habits}." if habits else "")
             + (f" Never-rules: it {nevers}." if nevers else "")
+            + (f" Rule layers: {layers_text(b.get('layers') or {})}." if b.get("layers") else "")
             + " Each buy spends a fixed share of the starting money times its trade size; a sell closes the whole position.")
 
 
@@ -2297,7 +2532,12 @@ SCHEMA_NOTE = (
     "decisions, spike = no buying after a one-bar jump of that %, chase = no buying that % above the 20-decision "
     "average, revenge = no re-buying a coin within that many decisions of a loss on it, thin = no buying under that "
     "x normal volume, mktdown = no buying while BTC is down that % over 10 decisions, panic = no strategy selling "
-    "after a one-bar drop of that %), `size` its trade-size multiplier. `stats` and `lifetime` are its results, "
+    "after a one-bar drop of that %), `layers` extra rule layers (plus = extra positive studies: each study's most recent "
+    "signal is its vote, the main strategy is always one of them, and the bot buys when the number of positive studies "
+    "voting buy minus the number of `minus` (negative) studies whose latest signal is sell is at least `need`; a buy "
+    "is attempted when the main strategy or any positive study signals buy; exits = exit studies, any of which "
+    "signalling sell closes the position instead of the main strategy's own sells; size.target = trade size scaled so "
+    "target / average % move per decision, between 0.5x and 1.5x), `size` its trade-size multiplier. `stats` and `lifetime` are its results, "
     "after fees. Signals use bar closes (some families also highs, lows and volume). Results were simulated with fees "
     "and spread; past results do not predict future ones.")
 
@@ -2311,7 +2551,7 @@ def export_bots(rows, app_version="", note=""):
         if r.get("stats") and "score" not in r:  # already a bot-file entry (Hall of Fame, Bot Lab)
             b = dict(name=r["name"], params=dict(r["params"]), size=round(float(r.get("size", 1.0)), 2),
                      tf=int(r.get("tf", 1)), risk=clean_risk(r.get("risk")), traits=clean_traits(r.get("traits")),
-                     vetoes=clean_vetoes(r.get("vetoes")), stats=dict(r["stats"]),
+                     vetoes=clean_vetoes(r.get("vetoes")), layers=clean_layers(r.get("layers")), stats=dict(r["stats"]),
                      notes=r.get("notes", note))
             if r.get("lifetime"):
                 b["lifetime"] = dict(r["lifetime"])
@@ -2320,7 +2560,7 @@ def export_bots(rows, app_version="", note=""):
         b = dict(
             name=r["name"], params=dict(r["params"]), size=round(float(r.get("size", 1.0)), 2), tf=int(r.get("tf", 1)),
             risk=clean_risk(r.get("risk")), traits=clean_traits(r.get("traits")), vetoes=clean_vetoes(r.get("vetoes")),
-            stats=dict(recent_gain_pct=None if r.get("score") is None else round(r["score"] * 100, 2),
+            layers=clean_layers(r.get("layers")), stats=dict(recent_gain_pct=None if r.get("score") is None else round(r["score"] * 100, 2),
                        consistency_pct=None if r.get("cons") is None else int(r["cons"] * 100),
                        trades=int(r.get("trades", 0)), status=r.get("status", "")),
             notes=note)
@@ -2571,7 +2811,8 @@ def read_bots_file(path):
         item = dict(name=d["name"], params=params, size=size, stats=stats, tf=clamp_tf(d.get("tf", 1)),
                     risk=clean_risk(d.get("risk") if isinstance(d.get("risk"), dict) else None),
                     traits=clean_traits(d.get("traits") if isinstance(d.get("traits"), dict) else None),
-                    vetoes=clean_vetoes(d.get("vetoes") if isinstance(d.get("vetoes"), dict) else None))
+                    vetoes=clean_vetoes(d.get("vetoes") if isinstance(d.get("vetoes"), dict) else None),
+                    layers=clean_layers(d.get("layers")))
         if isinstance(d.get("lifetime"), dict):
             item["lifetime"] = {k: v for k, v in d["lifetime"].items()
                                 if isinstance(v, (int, float, str)) or v is None}
