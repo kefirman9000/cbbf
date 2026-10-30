@@ -1620,6 +1620,64 @@ class Tournament:
         e, self.events = self.events, []
         return e
 
+    # ---- saving and restoring the whole farm, so it carries on where it left off ----
+    _VFIELDS = ("name", "params", "tf", "risk", "traits", "size_mult", "uid", "parents", "gen", "origin", "royal",
+                "classic", "inducted", "strikes", "born_px", "age", "ntrades", "wins", "losses", "win_steps", "streak",
+                "peak", "maxdd", "mood_gain", "mood_n", "live_n", "live_eq0", "hi", "since", "entries", "sold_at",
+                "fee_guard")
+
+    def to_state(self):
+        """Everything needed to bring this farm back exactly as it is (plain data, JSON-ready)."""
+        bots = []
+        for v in self.vars:
+            d = {k: getattr(v, k) for k in self._VFIELDS}
+            d.update(eq=list(v.eq), eq_max=v.eq.maxlen, log=list(v.log), bad=getattr(v, "bad", 0),
+                     sim=dict(cash=v.sim.cash, pos=v.sim.pos, cost=v.sim.cost, fees=v.sim.fees, tbars=list(v.sim.tbars)))
+            bots.append(d)
+        lineage = dict(list(self.lineage.items())[-600:])
+        return dict(version=1, n=self.n, serial=self.serial, cap=self.cap, coins=self.coins, start_cash=self.start_cash,
+                    hold_curve=list(getattr(self, "hold_curve", []))[-(self.W * 10 + 2):], bots=bots,
+                    lineage={str(k): v for k, v in lineage.items()})
+
+    def restore(self, st):
+        """Replaces this farm's bots with a saved farm (from to_state). Returns True on success."""
+        if not isinstance(st, dict) or st.get("version") != 1 or list(st.get("coins") or []) != self.coins:
+            return False
+        vars_ = []
+        for d in st.get("bots", []):
+            try:
+                if d["name"] not in STRATS:
+                    continue
+                v = self._new(d["name"], dict(d["params"]), d.get("tf", 1), d.get("risk"), d.get("traits"))
+                for k in self._VFIELDS:
+                    if k in d and k not in ("name", "params", "tf", "risk", "traits"):
+                        setattr(v, k, d[k])
+                v.eq = deque(d.get("eq", []), maxlen=int(d.get("eq_max") or v.eq.maxlen))
+                v.log = deque([tuple(x) for x in d.get("log", [])], maxlen=300)
+                v.bad = d.get("bad", 0)
+                s = d.get("sim") or {}
+                v.sim.cash = float(s.get("cash", v.sim.cash))
+                v.sim.pos = {c: float(q) for c, q in (s.get("pos") or {}).items()}
+                v.sim.cost = {c: float(q) for c, q in (s.get("cost") or {}).items()}
+                v.sim.fees = float(s.get("fees", 0))
+                v.sim.tbars = deque(s.get("tbars", []))
+                v.mood_gain = dict(v.mood_gain or {})
+                v.mood_n = dict(v.mood_n or {})
+                vars_.append(v)
+            except (KeyError, TypeError, ValueError):
+                continue
+        if not vars_:
+            return False
+        self.vars = vars_
+        self.n = int(st.get("n", 0))
+        self.serial = max(int(st.get("serial", 0)), max(v.uid for v in vars_))
+        self.cap = max(self.cap, len(vars_))
+        self.lineage = {int(k): v for k, v in (st.get("lineage") or {}).items()}
+        hc = st.get("hold_curve") or [1.0]
+        self.hold_curve = deque(hc, maxlen=self.W * 10 + 2)
+        self._rate()
+        return True
+
 
 # ---------------- backtesting ----------------
 def simulate(closes, sigfn, start_cash, fee, pct, stop=0.0, take=0.0, warm=WARM, max_coin=None, slip=0.0, trail=0.0,
@@ -1954,6 +2012,10 @@ def save_json(path, obj):
 
 def state_path(live):
     return os.path.join(HOME_DIR, f"state-{'live' if live else 'paper'}.json")
+
+
+def farm_path(live):
+    return os.path.join(HOME_DIR, f"farm-{'live' if live else 'paper'}.json")
 
 
 def strategies_path():
