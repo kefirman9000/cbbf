@@ -226,18 +226,19 @@ def fetch_ohlcv(coin, gran_seconds, count, quote="USD", cache=True):
             rows[r[0]] = (float(r[4]), float(r[2]), float(r[1]), float(r[5]))
         end = start
         time.sleep(0.15)
-    keys = sorted(rows)[-count:]
+    every = sorted(rows)
+    keys = every[-count:]
     seq = [rows[t] for t in keys]
     if cache and seq:
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             tmp = path + ".tmp"
-            with open(tmp, "w") as f:
-                json.dump({str(t): rows[t] for t in keys}, f)
+            with open(tmp, "w") as f:  # keep up to 6,000 candles on disk, even when only a few were asked for
+                json.dump({str(t): rows[t] for t in every[-max(count, 6000):]}, f)
             os.replace(tmp, path)
         except OSError:
             pass
-    return dict(c=[r[0] for r in seq], h=[r[1] for r in seq], l=[r[2] for r in seq], v=[r[3] for r in seq])
+    return dict(c=[r[0] for r in seq], h=[r[1] for r in seq], l=[r[2] for r in seq], v=[r[3] for r in seq], t=keys)
 
 
 def latest_volume(coin, gran_seconds, quote="USD"):
@@ -677,6 +678,8 @@ DEFAULT_SETTINGS = {
     "tg_remote": False,          # control CBBF from Telegram: /status /pause /resume /report /kill
     "free_roam": True,           # when the farm is idle, it backtests its own bots and runs small training camps by itself
     "free_roam_running": False,  # ...also while the bot runs (uses a little more computer power and network)
+    "slow_trades_account": False,  # the slow farm (hourly candles) may also trade your account
+    "slow_size": 30,             # bots on the slow farm
     "coin_prefs": True,          # bots learn which coins they're bad at and skip them (re-checked in hindsight)
     "confidence_sizing": True,   # bots buy bigger when many of their studies agree, smaller on a close vote
     "twin_test": True,           # winners are re-run on an older stretch of prices; lucky ones count for less
@@ -840,7 +843,9 @@ def tournament_opts(settings):
                 adapt_exits=bool(settings.get("adapt_exits", True)), mut_memory=bool(settings.get("mut_memory", True)))
 
 
-RISK_BOUNDS = {"sl": (0.5, 15.0), "tp": (0.5, 30.0)}  # a bot's own stop-loss / take-profit, % (0 = none)
+RISK_BOUNDS = {"sl": (0.5, 30.0), "tp": (0.5, 100.0)}  # a bot's own stop-loss / take-profit, % (0 = none)
+FAST_RISK = {"sl": 15.0, "tp": 30.0}   # the usual farm evolves stops up to these
+SLOW_RISK = {"sl": 30.0, "tp": 100.0}  # the slow farm (hourly candles, holds of days to weeks) can go this wide
 
 
 def clean_risk(r):
@@ -1406,8 +1411,10 @@ class Tournament:
 
     def __init__(self, coins, start_cash, fee, pct, evolve_every=24, window=100,
                  min_trades=2, max_active=5, cap=14, params=None, rng=None, retire_after=3, opts=None,
-                 retire_steps=0):
+                 retire_steps=0, risk_caps=None):
         self.coins, self.start_cash, self.fee, self.pct = list(coins), start_cash, fee, pct
+        self.risk_caps = dict(risk_caps or (opts or {}).get("risk_caps") or FAST_RISK)
+        window = int((opts or {}).get("window", window))  # the slow farm judges over a different window
         self.evolve_every, self.W, self.min_trades = max(1, evolve_every), window, min_trades
         self.max_active, self.cap, self.retire_after = max_active, cap, retire_after
         self.family_cap = max(5, -(-self.cap // 4))
@@ -1710,19 +1717,21 @@ class Tournament:
         """About half of new random bots carry their own stop-loss and/or take-profit."""
         r = {}
         for k, (lo, hi) in RISK_BOUNDS.items():
+            hi = self.risk_caps.get(k, hi)
             r[k] = round(self.rng.uniform(lo, hi * 0.5), 2) if self.rng.random() < 0.5 else 0.0
         return r
 
     def mutate_risk(self, r):
         out = {}
         for k, (lo, hi) in RISK_BOUNDS.items():
+            hi = self.risk_caps.get(k, hi)
             v = float(r.get(k, 0) or 0)
             roll = self.rng.random()
             if roll < 0.1 * self.mut_bias("stops"):  # switch it on or off
                 v = 0.0 if v else self.rng.uniform(lo, hi * 0.5)
             elif v and roll < 0.45:
                 v *= self.rng.uniform(0.7, 1.3)
-            out[k] = v
+            out[k] = min(v, hi)
         return clean_risk(out)
 
     def mutate_tf(self, tf):

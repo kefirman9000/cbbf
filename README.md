@@ -42,6 +42,13 @@ A pulse strip above the farm shows births, retirements, the current season and t
 
 <p align="center"><img src="docs/screenshots/bloodlines.png" alt="Bloodlines" width="90%"></p>
 
+## The Slow farm
+A second farm of slow dragons lives next door. They think in hours and days instead of minutes, rest for days or
+weeks at a time, and aim for much bigger moments. They learn from months of the past before they join in, keep
+their own wallet, and never mix with the fast farm.
+
+<p align="center"><img src="docs/screenshots/slow-farm.png" alt="The Slow farm" width="100%"></p>
+
 ## A dragon's genes
 Every gene is inherited, mutated and crossbred, and every dragon carries a different mix:
 
