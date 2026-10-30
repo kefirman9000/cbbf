@@ -851,6 +851,10 @@ class App:
             return
         self.cfg["was_running"] = bool(self.running)  # closed while running: pick it up next time
         self.save_farm(force=True)
+        try:
+            self.slow_save()
+        except Exception:
+            pass
         self.running = False
         self.awake.off()
         try:
@@ -1107,8 +1111,9 @@ class App:
         nb = self.nb = ttk.Notebook(nbf)
         nb.pack(fill="both", expand=True, pady=(8, 0))
         nb.bind("<<NotebookTabChanged>>", lambda e: self.refresh_visible())
-        t0, t1, t2, t3, t4, t5, t6 = (ttk.Frame(nb) for _ in range(7))
+        t0, t1, t2, t3, t4, t5, t6, t7 = (ttk.Frame(nb) for _ in range(8))
         nb.add(t0, text="  \u25c6 Bot Farm  ")
+        nb.add(t7, text="  \u25c7 Slow farm  ")
         nb.add(t1, text="  Portfolio  ")
         nb.add(t6, text="  Watchlist  ")
         nb.add(t4, text="  Live prices  ")
@@ -1116,6 +1121,7 @@ class App:
         nb.add(t2, text="  Strategy scoreboard  ")
         nb.add(t3, text="  What the bot did  ")
         self.build_grid_tab(t0)
+        self.build_slow_tab(t7)
         self.build_portfolio(t1)
         self.build_watchlist(t6)
         tk.Label(t2, bg=CARD, fg=MUTED, justify="left", anchor="w", padx=8, pady=4, wraplength=700,
@@ -2280,7 +2286,7 @@ class App:
             tb.pack(side="left", padx=(4, 0))
             cv = tk.Canvas(pf, height=120, bg=CARD, highlightthickness=0)
             cv.pack(fill="both", expand=True)
-            cv.bind("<Configure>", lambda e: self.soon(self.draw_chart, 120))
+            cv.bind("<Configure>", lambda e: self.later(self.draw_chart, 180))
             cv.bind("<Motion>", lambda e, cv=cv: self.chart_hover(e, cv))
             cv.bind("<Leave>", lambda e: (self.hover.clear(), self.draw_chart()))
             for box in (vb, tb):
@@ -2453,7 +2459,7 @@ class App:
             self._bg_dirty = True
             return
         if self.moving():  # dragging the window: draw once it stops
-            return self.soon(self.draw_chart, 400)
+            return self.later(self.draw_chart, 300)
         try:
             self.update_view_choices()
         except Exception:
@@ -2711,6 +2717,8 @@ class App:
                                           f"change your balance). Your account made {len(self.trades)} trades{lt}.")
         else:
             self.activity_lbl.config(text="")
+        if self.moving():
+            return self.later(self.refresh_view, 300)
         self.refresh_prices()
         self.draw_chart()
         self.headline_lbl.config(text=self.headline())
@@ -4474,6 +4482,404 @@ class App:
                 pc.create_text(x + 4, H - 6, anchor="sw", text="the practice farm is here", fill="#f59e0b", font=("", 7, "bold"))
         paint()
 
+    # ================= Slow farm: hourly candles, holds of days to weeks =================
+    SLOW_GRAN = 3600   # one candle per hour
+    SLOW_HISTORY = 3000  # about four months of hourly candles to learn from
+
+    def slow_path(self):
+        return os.path.join(E.HOME_DIR, "farm-slow.json")
+
+    def build_slow_tab(self, parent):
+        self.slow = dict(t=None, wallet=None, curve=[], hist={}, hx={}, last_ts=0, busy=False, coins=[], status="")
+        top = tk.Frame(parent, bg=BG)
+        top.pack(fill="x", padx=8, pady=(8, 2))
+        self.slow_btn = ttk.Button(top, text="▶ Start the slow farm", style="Accent.TButton", command=self.slow_toggle)
+        self.slow_btn.pack(side="left")
+        tb = ttk.Button(top, text="⚔ Train it on the past", style="Plain.TButton", command=self.slow_train)
+        tb.pack(side="left", padx=6)
+        Tip(tb, "Sends the slow farm through its months of hourly history twice more (keeping what it learned), then "
+                "tests the best on the most recent weeks. Graduates join it.")
+        for txt, cmd in (("◉ Save selected to Library", self.slow_catch), ("★ Add selected to Hall of Fame", self.slow_hof),
+                         ("Reset slow farm", self.slow_reset)):
+            ttk.Button(top, text=txt, style="Plain.TButton", command=cmd).pack(side="left", padx=(0, 6))
+        self.slow_trade_var = tk.BooleanVar(value=bool(self.settings.get("slow_trades_account", False)))
+        cb = ttk.Checkbutton(top, text="Let it trade my account too", variable=self.slow_trade_var, command=self._slow_trade_setting)
+        cb.pack(side="right")
+        Tip(cb, "Off: the slow farm only uses its own pretend wallet. On: when its winners agree on a new hourly candle, "
+                "your account follows them too (while the bot is running), with the reason 'slow farm'.")
+        tk.Label(parent, bg=BG, fg=MUTED, anchor="w", justify="left", padx=10, wraplength=1000, text=(
+            "A second, separate farm of slow dragons. They decide on hourly candles, from every hour up to every two and a "
+            "half days, hold for days to weeks, and can aim for much bigger moves (targets up to 100%, stops up to 30%), so "
+            "fees matter far less. They learn from about four months of history first, then carry on with each new hour. "
+            "They never mix with your fast farm, and only trade your account if you tick the box.")).pack(fill="x")
+        self.slow_lbl = tk.Label(parent, text="", bg=CARD, fg=TEXT, anchor="w", justify="left", padx=10, pady=5, font=("", 9, "bold"))
+        self.slow_lbl.pack(fill="x", padx=8, pady=(6, 4))
+        self.slow_cv = tk.Canvas(parent, height=150, bg=CARD, highlightthickness=0)
+        self.slow_cv.pack(fill="x", padx=8)
+        self.slow_cv.bind("<Configure>", lambda e: self.later(self.slow_draw, 200))
+        box = tk.Frame(parent, bg=BG)
+        box.pack(fill="both", expand=True, padx=8, pady=(6, 6))
+        self.slow_tree = self.make_tree(box, ("name", "strategy", "pace", "status", "recent", "edge", "life", "trades", "holds", "stops"),
+                                        (130, 170, 90, 120, 70, 80, 80, 55, 90, 190),
+                                        ("Name", "Strategy", "Decides", "Status", "Recent", "vs holding", "Lifetime", "Trades",
+                                         "Typical hold", "Own stop / target"))
+        self.slow_tree.configure(selectmode="extended")
+        for tag, col in (("win", GREEN), ("shaky", "#f59e0b"), ("stopped", MUTED), ("learning", MUTED)):
+            self.slow_tree.tag_configure(tag, foreground=col)
+        if self.cfg.get("slow_on"):
+            self.root.after(6000, lambda: self.slow_start(quiet=True))
+        self.slow_refresh()
+
+    def _slow_trade_setting(self):
+        self.settings["slow_trades_account"] = bool(self.slow_trade_var.get())
+        self.cfg["settings"] = self.settings
+        E.save_json(CONFIG_PATH, self.cfg)
+
+    def slow_toggle(self):
+        if self.cfg.get("slow_on"):
+            self.cfg["slow_on"] = False
+            E.save_json(CONFIG_PATH, self.cfg)
+            self.slow_save()
+            self.write("◇ Slow farm paused. It keeps everything it learned.")
+            self.slow_refresh()
+        else:
+            self.slow_start()
+
+    def slow_coins(self):
+        return list(self.session_coins or [c for c, v in self.coin_vars.items() if v.get()] or ["BTC", "ETH"])
+
+    def slow_start(self, quiet=False):
+        """Loads (or hatches and warms up) the slow farm, then follows each new hourly candle."""
+        sl = self.slow
+        self.cfg["slow_on"] = True
+        E.save_json(CONFIG_PATH, self.cfg)
+        if sl["busy"]:
+            return
+        sl["busy"] = True
+        sl["status"] = "Loading hourly history..."
+        self.slow_refresh()
+        saved = E.load_json(self.slow_path(), {}) or {}
+        coins = list(saved.get("coins") or []) if sl["t"] is None and saved.get("farm") else (sl["coins"] or self.slow_coins())
+        quote = self.cur_quote()
+        fee, slip = E.cost_model(self.settings)
+        pct, cash = self.settings["trade_pct"] / 100, self.start_cash or 1000.0
+        opts = dict(E.tournament_opts(self.settings), risk_caps=dict(E.SLOW_RISK), window=72)
+        cap = int(self.settings.get("slow_size", 30))
+
+        def make():
+            return E.Tournament(coins, cash, fee, pct, 24, window=72, params=self.settings["params"], opts=opts, cap=cap,
+                                retire_steps=24 * 14, risk_caps=E.SLOW_RISK)
+
+        def work():
+            try:
+                hist, hx, ts = {}, {}, {}
+                for c in coins:
+                    d = E.fetch_ohlcv(c, self.SLOW_GRAN, self.SLOW_HISTORY, quote)
+                    n = len(d["c"])
+                    t = list(d.get("t") or [])
+                    if len(t) != n:  # older engine without candle times: assume one per hour up to now
+                        top = int(time.time()) // self.SLOW_GRAN * self.SLOW_GRAN
+                        t = [top - (n - 1 - i) * self.SLOW_GRAN for i in range(n)]
+                    done = [i for i, x in enumerate(t) if x + self.SLOW_GRAN <= time.time()]  # finished candles only
+                    k = (done[-1] + 1) if done else n
+                    hist[c], ts[c] = d["c"][:k], t[:k]
+                    hx[c] = {x: d[x][:k] for x in ("h", "l", "v")}
+                L = min(len(v) for v in hist.values())
+                hist = {c: v[-L:] for c, v in hist.items()}
+                hx = {c: {x: y[-L:] for x, y in d.items()} for c, d in hx.items()}
+                last_ts = min(ts[c][-1] for c in coins) if L else 0
+                t = sl["t"]
+                if t is None and saved.get("farm"):
+                    t = make()
+                    if not t.restore(saved["farm"]):
+                        t = None
+                    else:
+                        t.xfull = None
+                        self.q.put(("log", (f"◇ Slow farm: carrying on with its {len(t.vars)} bots.", "good")))
+                if t is None:
+                    self.q.put(("log", f"◇ Slow farm: hatching and warming up on {L} hours of history (this can take a minute)..."))
+                    sl["status"] = f"Warming up on {L} hours of history..."
+                    t = None
+                    if self.settings.get("multicore", True) and opts.get("islands", 1) > 1:
+                        t = E.warm_islands(coins, cash, fee, pct, 24, self.settings["params"], dict(opts), cap, 24 * 14, hist, hx)
+                        if t is not None:
+                            t.risk_caps = dict(E.SLOW_RISK)
+                            t.W = 72
+                    if t is None:
+                        t = make()
+                        t.warmup(hist, extra=hx)
+                    last_ts = min(ts[c][-1] for c in coins)
+                elif saved.get("last_ts") and saved["last_ts"] < last_ts:  # catch up on the hours it missed
+                    miss = [i for i, x in enumerate(ts[coins[0]][-L:]) if x > saved["last_ts"]]
+                    for i in miss:
+                        t.step({c: E.View(hist[c], i + 1) for c in coins}, E.slice_extra(hx, i + 1))
+                t.recording = False
+
+                def done_():
+                    sl.update(t=t, hist=hist, hx=hx, last_ts=last_ts, coins=coins, busy=False, status="")
+                    if sl["wallet"] is None:
+                        w = saved.get("wallet") or {}
+                        sl["wallet"] = E.Sim(cash, fee, pct, slip=slip)
+                        if w:
+                            sl["wallet"].cash = float(w.get("cash", cash))
+                            sl["wallet"].pos = {c: float(q) for c, q in (w.get("pos") or {}).items()}
+                            sl["wallet"].cost = {c: float(q) for c, q in (w.get("cost") or {}).items()}
+                        sl["curve"] = [tuple(x) for x in saved.get("curve") or []]
+                        sl["hold0"] = saved.get("hold0") or {c: hist[c][-1] for c in coins}
+                    self.slow_save()
+                    self.write(f"◇ Slow farm ready: {len(t.vars)} bots on {', '.join(coins)}, deciding on hourly candles.", "good")
+                    self.slow_refresh()
+                self.q.put(("call", done_))
+            except Exception as e:
+                def fail(e=e):
+                    sl.update(busy=False, status=f"Couldn't start: {e}")
+                    self.slow_refresh()
+                self.q.put(("call", fail))
+        threading.Thread(target=work, daemon=True).start()
+        if not getattr(self, "_slow_loop", None):
+            self._slow_loop = threading.Thread(target=self._slow_feed, daemon=True)
+            self._slow_loop.start()
+
+    def _slow_feed(self):
+        """Every few minutes: has a new hourly candle finished? Then the slow farm takes its next step."""
+        while True:
+            time.sleep(60 if self.slow.get("t") else 15)
+            sl = self.slow
+            if not self.cfg.get("slow_on") or sl["t"] is None or sl["busy"]:
+                continue
+            if time.time() < sl["last_ts"] + 2 * self.SLOW_GRAN + 20:
+                continue  # the next candle hasn't finished yet
+            try:
+                new = {}
+                for c in sl["coins"]:
+                    d = E.fetch_ohlcv(c, self.SLOW_GRAN, 60, self.cur_quote())
+                    t = list(d.get("t") or [])
+                    if len(t) != len(d["c"]):
+                        continue
+                    new[c] = [(t[i], d["c"][i], d["h"][i], d["l"][i], d["v"][i]) for i in range(len(t))
+                              if t[i] > sl["last_ts"] and t[i] + self.SLOW_GRAN <= time.time()]
+                if new and all(new.get(c) for c in sl["coins"]):
+                    k = min(len(new[c]) for c in sl["coins"])
+                    self.q.put(("call", lambda new=new, k=k: self._slow_step(new, k)))
+            except Exception:
+                pass
+
+    def _slow_step(self, new, k):
+        sl, t = self.slow, self.slow["t"]
+        if t is None:
+            return
+        for i in range(k):
+            for c in sl["coins"]:
+                ts, cl, hi, lo, vol = new[c][i]
+                sl["hist"][c].append(cl)
+                for x, val in (("h", hi), ("l", lo), ("v", vol)):
+                    sl["hx"][c][x].append(val)
+                del sl["hist"][c][:-6000]
+                for x in ("h", "l", "v"):
+                    del sl["hx"][c][x][:-6000]
+            sl["last_ts"] = new[sl["coins"][0]][i][0]
+            t.step({c: sl["hist"][c] for c in sl["coins"]}, {c: sl["hx"][c] for c in sl["coins"]})
+            px = {c: sl["hist"][c][-1] for c in sl["coins"]}
+            for c in sl["coins"]:
+                sig, mult = t.vote(c)
+                if sig:
+                    sl["wallet"].buy(c, px[c], 0, mult) if sig == "buy" else sl["wallet"].sell(c, px[c])
+                    if self.settings.get("slow_trades_account") and self.running and self.session and c in self.session_coins \
+                            and c not in self.pending:
+                        self.pending_detail[c] = "The slow farm's winners agreed on the new hourly candle."
+                        (self.buy(c, self.last.get(c, px[c]), "slow farm", mult) if sig == "buy"
+                         else self.sell(c, self.last.get(c, px[c]), "slow farm"))
+            sl["curve"].append((time.time(), sl["wallet"].equity(px)))
+        for e in t.pop_events()[-3:]:
+            self.write("◇ Slow farm: " + friendly_text(e[0].lower() + e[1:]))
+        self.slow_save()
+        self.slow_refresh()
+
+    def slow_save(self):
+        sl = self.slow
+        if sl.get("t") is None:
+            return
+        w = sl["wallet"]
+        try:
+            E.save_json(self.slow_path(), dict(coins=sl["coins"], last_ts=sl["last_ts"], farm=sl["t"].to_state(),
+                                              wallet=None if w is None else dict(cash=w.cash, pos=w.pos, cost=w.cost),
+                                              curve=sl["curve"][-3000:], hold0=sl.get("hold0")))
+        except OSError:
+            pass
+
+    def slow_reset(self):
+        if not messagebox.askyesno("Reset slow farm", "Clear the slow farm and its wallet? (Your Library and Hall of Fame are kept.)"):
+            return
+        self.slow.update(t=None, wallet=None, curve=[], hist={}, hx={}, last_ts=0, coins=[], status="")
+        try:
+            os.remove(self.slow_path())
+        except OSError:
+            pass
+        self.cfg["slow_on"] = False
+        E.save_json(CONFIG_PATH, self.cfg)
+        self.slow_refresh()
+        self.write("◇ Slow farm reset. Start it again to hatch a fresh one on your current coins.")
+
+    def _slow_selected(self):
+        t = self.slow.get("t")
+        if not t:
+            return []
+        ids = set(self.slow_tree.selection())
+        return [v for v in t.vars if str(id(v)) in ids]
+
+    def _slow_entries(self, vs):
+        t = self.slow["t"]
+        ids = {id(v) for v in vs}
+        rows = [dict(r, bar_minutes=60) for r in t.board() if id(r["v"]) in ids]
+        out = E.export_bots(rows, self.version, note="slow farm bot (decides on hourly candles)")["bots"]
+        return out
+
+    def slow_catch(self):
+        vs = self._slow_selected()
+        if not vs:
+            return messagebox.showinfo("Slow farm", "Select bots in the list first (Ctrl+click for several).")
+        self.catch_rows(self._slow_entries(vs), "slow farm")
+
+    def slow_hof(self):
+        vs = self._slow_selected()
+        if not vs:
+            return messagebox.showinfo("Slow farm", "Select bots in the list first.")
+        entries = self._slow_entries(vs)
+        self.catch_rows(entries, "slow farm")
+        E.induct(entries, self.version)
+        self.after_hof_change()
+        self.write(f"★ Added {len(entries)} slow-farm bot(s) to the Hall of Fame.", "good")
+
+    def slow_train(self):
+        sl = self.slow
+        if sl.get("t") is None or sl["busy"]:
+            return messagebox.showinfo("Slow farm", "Start the slow farm first (it needs its history loaded).")
+        sl["busy"] = True
+        sl["status"] = "Training on the past..."
+        self.slow_refresh()
+        hist = {c: list(v) for c, v in sl["hist"].items()}
+        hx = {c: {x: list(y) for x, y in d.items()} for c, d in sl["hx"].items()}
+        t = sl["t"]
+        seeds = [E._genes(v) for v in t.vars]
+        fee, slip = E.cost_model(self.settings)
+
+        def prog(done, total, text):
+            sl["status"] = f"Training on the past: {done * 100 // max(1, total)}% ({text})"
+
+        def work():
+            try:
+                res = E.train_farm(hist, hx, dict(E.tournament_opts(self.settings), risk_caps=dict(E.SLOW_RISK), window=72),
+                                   cap=len(t.vars), passes=2, exam_frac=0.2,
+                                   seed_genes=seeds, start_cash=t.start_cash, fee=fee, pct=t.pct, evolve=24,
+                                   params=self.settings["params"], retire_steps=24 * 14, progress=prog)
+
+                def done_():
+                    E.teach_from(t, res["tourn"])
+                    n = 0
+                    for r in res["results"]:
+                        if r["passed"] and len(t.vars) < t.cap + 6:
+                            g = r["genes"]
+                            v = t.add_variant(g["name"], g["params"], hist, 1.0, note="Slow farm graduate:", tf=g["tf"],
+                                              origin="training camp", risk=g["risk"], traits=g["traits"], vetoes=g["vetoes"],
+                                              layers=g["layers"])
+                            if v:
+                                v.layer_stats = {k: list(x) for k, x in r["layer_stats"].items()}
+                                n += 1
+                    t.cap = max(t.cap, len(t.vars))
+                    sl.update(busy=False, status="")
+                    self.slow_save()
+                    self.write(f"◇ Slow farm trained on {res['train_bars']} hours of history; "
+                               f"{sum(1 for r in res['results'] if r['passed'])} passed the exam, {n} joined it.", "good")
+                    self.slow_refresh()
+                self.q.put(("call", done_))
+            except Exception as e:
+                self.q.put(("call", lambda e=e: (sl.update(busy=False, status=f"Training stopped: {e}"), self.slow_refresh())))
+        threading.Thread(target=work, daemon=True).start()
+
+    def slow_refresh(self):
+        if not hasattr(self, "slow_tree"):
+            return
+        sl, t = self.slow, self.slow.get("t")
+        on = bool(self.cfg.get("slow_on"))
+        self.slow_btn.config(text="⏸ Pause the slow farm" if on and t else "▶ Start the slow farm")
+        try:
+            if "Slow farm" not in self.nb.tab(self.nb.select(), "text"):
+                return  # redrawn when you open the tab
+        except Exception:
+            pass
+        if sl.get("status"):
+            txt = sl["status"]
+        elif t is None:
+            txt = "Not started. Press Start: it hatches on your ticked coins and learns from about four months of hourly history."
+        else:
+            px = {c: sl["hist"][c][-1] for c in sl["coins"]}
+            w = sl["wallet"].equity(px) if sl["wallet"] else t.start_cash
+            h0 = sl.get("hold0") or px
+            hold = sum(px[c] / h0[c] for c in sl["coins"] if h0.get(c)) / len(sl["coins"]) - 1
+            nxt = max(0, int(sl["last_ts"] + 2 * self.SLOW_GRAN - time.time()))
+            txt = (f"{'Running' if on else 'Paused'}  |  {len(t.vars)} bots on {', '.join(sl['coins'])}  |  generation "
+                   f"{max((v.gen for v in t.vars), default=0)}  |  {len(t.active)} winning  |  last candle "
+                   f"{datetime.fromtimestamp(sl['last_ts']).strftime('%b %d %H:%M') if sl['last_ts'] else '-'}"
+                   + (f", next in about {nxt // 60} min" if on else "")
+                   + f"  |  its wallet ${w:,.2f} ({(w / t.start_cash - 1) * 100:+.1f}%, just holding {hold * 100:+.1f}%)")
+        self.slow_lbl.config(text=txt)
+        self.slow_draw()
+        tr = self.slow_tree
+        sel = tr.selection()
+        tr.delete(*tr.get_children())
+        if t is None:
+            return
+        for r in t.board():
+            v, lf = r["v"], r["life"]
+            holds = [b - a for a, b in self._hold_spans(v)]  # in hourly candles
+            typ = sum(holds) / len(holds) if holds else None
+            tr.insert("", "end", iid=str(id(v)), tags=(STATUS_TAG.get(r["status"], "learning"),), values=(
+                E.bot_nickname(v.key()), STRAT_LABELS.get(v.name, v.name), E.fmt_bar(v.tf * 60),
+                STATUS_TEXT.get(r["status"], r["status"]), pct_txt(r["score"]), pct_txt(r.get("edge")), pct_txt(lf["ret"]),
+                lf["trades"], "-" if typ is None else (f"{typ / 24:.1f} days" if typ >= 24 else f"{typ:.0f} h"),
+                E.risk_text(v.risk) or "none"))
+        keep = [i for i in sel if tr.exists(i)]
+        if keep:
+            tr.selection_set(keep)
+
+    @staticmethod
+    def _hold_spans(v):
+        """(bought, sold) decision numbers of the bot's recent round trips."""
+        out, open_ = [], {}
+        for n, c, side, _ in v.log:
+            if side == "buy":
+                open_.setdefault(c, n)
+            elif c in open_:
+                out.append((open_.pop(c), n))
+        return out[-20:]
+
+    def slow_draw(self):
+        cv, sl = self.slow_cv, self.slow
+        cv.delete("all")
+        W, H = cv.winfo_width(), cv.winfo_height()
+        pts = sl.get("curve") or []
+        t = sl.get("t")
+        if t is not None and len(pts) < 2:  # nothing live yet: show what its leader did over the history
+            lead = (t.active or [v for v, _ in t.ranking()] or [None])[0]
+            if lead is not None and len(lead.eq) > 2:
+                pts = [(i, x) for i, x in enumerate(lead.eq)]
+                cv.create_text(W - 10, 8, anchor="ne", fill=MUTED, font=("", 8),
+                               text=f"its leader {E.bot_nickname(lead.key())} over its scoring window (hours)")
+        if len(pts) < 2:
+            cv.create_text(W // 2, H // 2, fill=MUTED, text="Its wallet appears here as the slow farm trades.")
+            return
+        ys = [p[1] for p in pts]
+        lo, hi = min(ys), max(ys)
+        pad = (hi - lo) * 0.1 or 1
+        lo, hi = lo - pad, hi + pad
+        X = lambda i: 60 + i * (W - 70) / (len(pts) - 1)
+        Y = lambda y: H - 12 - (y - lo) / (hi - lo) * (H - 24)
+        for k in range(3):
+            yv = lo + (hi - lo) * k / 2
+            cv.create_line(60, Y(yv), W - 10, Y(yv), fill=LINE)
+            cv.create_text(54, Y(yv), text=f"{yv:,.0f}", anchor="e", fill=MUTED, font=("", 8))
+        cv.create_line(*[z for i, (_, y) in enumerate(pts) for z in (X(i), Y(y))], fill="#a78bfa", width=2)
+
     # ---------------- compare ----------------
     def compare_bots(self, a=None, b=None):
         if a is None or b is None:
@@ -4842,7 +5248,7 @@ class App:
             geo = (e.x, e.y, e.width, e.height)
             if geo != getattr(self, "_last_geo", None):
                 self._last_geo = geo
-                self._moving_until = time.time() + 0.35
+                self._moving_until = time.time() + 0.25
 
     def moving(self):
         return time.time() < getattr(self, "_moving_until", 0)
@@ -5969,7 +6375,7 @@ class App:
         ys.pack(side="right", fill="y")
         self.grid.pack(fill="both", expand=True, padx=(6, 0), pady=(2, 4))
         self.grid_list = None
-        self.grid.bind("<Configure>", lambda e: self.soon(self.grid_refresh, 120))
+        self.grid.bind("<Configure>", lambda e: self.later(self.grid_refresh, 180))
         self.grid.bind("<Button-1>", self._grid_click)
         self.grid.bind("<Double-1>", lambda e: (self._grid_click(e), self.bot_detail() if self.selected_variant() else None))
         self.grid.bind("<Motion>", self._grid_motion)
@@ -6268,6 +6674,8 @@ class App:
         """Draws the cards (the still parts). Dragons and eggs are animated separately by grid_animate."""
         if not hasattr(self, "grid"):
             return
+        if self.moving():  # resizing / dragging the window: draw once it settles
+            return self.later(self.grid_refresh, 250)
         c = self.grid
         W = max(c.winfo_width(), 200)
         items = self._grid_items()
@@ -6562,6 +6970,17 @@ class App:
             else:
                 self.board.selection_set(iid)
         self.soon(self._after_select)
+
+    def later(self, fn, ms=150):
+        """Runs fn once, ms after the LAST time it was asked for (resizing fires hundreds of events: draw once at the end)."""
+        pend = self.__dict__.setdefault("_later", {})
+        old = pend.pop(fn.__name__, None)
+        if old:
+            try:
+                self.root.after_cancel(old)
+            except Exception:
+                pass
+        pend[fn.__name__] = self.root.after(ms, lambda: (pend.pop(fn.__name__, None), fn()))
 
     def soon(self, fn, ms=40):
         """Runs fn once a moment from now, however many times it is asked for meanwhile (keeps clicks snappy)."""
@@ -6925,6 +7344,8 @@ class App:
             self.refresh_board()
         elif "Bot Farm" in tab:
             self.grid_refresh()
+        elif "Slow farm" in tab:
+            self.slow_refresh()
 
     # ---------------- watchlist ----------------
     def build_watchlist(self, parent):
@@ -7168,7 +7589,7 @@ class App:
         ttk.Button(btns, text="Sell...", style="Plain.TButton", command=lambda: self.trade_dialog("sell")).pack(side="left", padx=4)
         self.pf_alloc = tk.Canvas(parent, height=26, bg=CARD, highlightthickness=0)
         self.pf_alloc.pack(fill="x", padx=6, pady=(2, 4))
-        self.pf_alloc.bind("<Configure>", lambda e: self.soon(self.draw_alloc, 120))
+        self.pf_alloc.bind("<Configure>", lambda e: self.later(self.draw_alloc, 180))
         self.pf_stops = tk.Label(parent, text="", bg=CARD, fg=MUTED, anchor="w", font=("", 8))
         self.pf_stops.pack(fill="x", padx=8)
         self.show_watch = tk.BooleanVar(value=bool(self.cfg.get("pf_watch", True)))
@@ -7892,7 +8313,7 @@ class App:
         btns.pack(side="bottom", fill="x")
         ys.pack(side="right", fill="y")
         self.col_canvas.pack(fill="both", expand=True, padx=(12, 0))
-        self.col_canvas.bind("<Configure>", lambda e: self.soon(self.col_draw, 120))
+        self.col_canvas.bind("<Configure>", lambda e: self.later(self.col_draw, 180))
         self.col_canvas.bind("<Button-1>", self._col_click)
         self.col_canvas.bind("<Double-1>", lambda e: (self._col_click(e), self._col_team(None)))
         for btn in ("<Button-3>", "<Button-2>"):

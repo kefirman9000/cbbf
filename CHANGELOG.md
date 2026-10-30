@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.15.0
+**The Slow farm, and smooth window resizing**
+
+- **Slow farm** (new tab next to Bot Farm): a second, separate farm of slow dragons that decide on hourly candles,
+  from every hour up to every two and a half days. They hold for days to weeks and can evolve much wider targets
+  and stops (targets up to 100%, stops up to 30%), so fees matter far less. They learn from about four months of
+  hourly history first (on several cores), then carry on with each new hourly candle, and they keep going whether
+  or not the fast bot is running.
+  - Its own pretend wallet, its own scoring window (3 days) and its own evolution: it never mixes with the fast farm.
+  - **Train it on the past**: two more passes through its history, a final exam on the latest weeks, graduates join it.
+  - Save its bots to the Library or the Hall of Fame. The list shows how long each one typically holds.
+  - **Let it trade my account too** (off by default): when its winners agree on a new hourly candle, your account follows.
+  - It remembers everything between runs and catches up on the hours it missed while CBBF was closed.
+- **Smooth resizing**: dragging or resizing the window no longer redraws the farm, charts and tables over and over;
+  they wait until you let go and draw once. A burst of 60 resize events now causes 2 farm redraws.
+- The price history cache keeps up to 6,000 candles per coin and candle size.
+
 ## 1.14.0
 **Training camp, Free roam, and a snappier app**
 
