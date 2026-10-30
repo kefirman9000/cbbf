@@ -584,6 +584,7 @@ DEFAULT_SETTINGS = {
     "animations": "Full",        # Full, Light (slower, lighter) or Off
     "characters": "Themed dragons",  # or "Classic dragons" (coloured by status)
     "egg_colors": "By dragon type",  # or "Purple"
+    "auto_resume": True,         # resume the session that was running when the app closed
     "team_locked": True,         # trading with your team: keep exactly those bots (False = they may breed new ones)
     # Orders and costs
     "bot_stops": True,           # Wildcard: the account's safety stop / lock-in-profit follow what the winning bots learned
@@ -1006,7 +1007,7 @@ class Tournament:
         """Gives a bot its id and family-tree entry."""
         self.serial += 1
         v.uid, v.parents, v.origin = self.serial, [p.uid for p in parents], origin
-        v.royal = origin in ("hall of fame", "library", "team", "collection", "saved", "bred from your bots") or \
+        v.royal = origin in ("hall of fame", "library", "team", "collection", "saved", "bred from your bots", "designed") or \
             any(getattr(p, "royal", False) for p in parents)
         v.gen = 1 + max((p.gen for p in parents), default=-1) if parents else 0
         self.lineage[v.uid] = dict(uid=v.uid, label=v.label, name=v.name, tf=v.tf, parents=list(v.parents),
