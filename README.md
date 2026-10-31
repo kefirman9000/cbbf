@@ -127,6 +127,18 @@ Everything stays on your computer in `~/.cbbf/` (Windows: `C:\Users\<you>\.cbbf`
 
 CBBF is free and made in spare time. If your dragons have earned their keep and you'd like to help the farm grow, you can support it on **[GitHub Sponsors](https://github.com/sponsors/kefirman9000)**: every bit goes into new breeds, new tricks and more time to build them. Starring the repo helps too.
 
+## License and disclaimer
+
+Copyright © 2026 kefirman9000. All rights reserved. CBBF is free to use; see [LICENSE](LICENSE) for what is and isn't allowed.
+
+- **Not financial advice.** CBBF is a learning and experimentation tool. Nothing it shows is advice or a recommendation.
+- You can lose money. You alone are responsible for every action taken through your account. Always test in paper mode first and never use money you can't afford to lose.
+- Software can have bugs, connections can fail, and data can be late or wrong. Check your account directly.
+
+CBBF is provided **as is**, without warranty of any kind. Use it at your own risk; the author is not liable for any damage, data loss or other loss arising from its use.
+
+Found a security problem? Please report it privately; see [SECURITY.md](SECURITY.md).
+
 ---
 
 Past results never guarantee future ones, even for a Legendary dragon. Use at your own risk.
