@@ -123,6 +123,10 @@ dens grew, and get a **weekly report** of what it learned.
 ## Your data
 Everything stays on your computer in `~/.cbbf/` (Windows: `C:\Users\<you>\.cbbf`). **File > Open data folder** opens it.
 
+## Support the farm
+
+CBBF is free and made in spare time. If your dragons have earned their keep and you'd like to help the farm grow, you can support it on **[GitHub Sponsors](https://github.com/sponsors/kefirman9000)**: every bit goes into new breeds, new tricks and more time to build them. Starring the repo helps too.
+
 ---
 
 Past results never guarantee future ones, even for a Legendary dragon. Use at your own risk.
