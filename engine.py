@@ -1,7 +1,9 @@
 """Core logic for CBBF (Coinbase Bot Farm): strategies, simulation, wildcard tournament,
 historical candles and local storage. No GUI code lives here."""
+import bisect
 import csv
 import json
+import threading
 import os
 import importlib
 import importlib.util
@@ -239,6 +241,171 @@ def fetch_ohlcv(coin, gran_seconds, count, quote="USD", cache=True):
         except OSError:
             pass
     return dict(c=[r[0] for r in seq], h=[r[1] for r in seq], l=[r[2] for r in seq], v=[r[3] for r in seq], t=keys)
+
+
+# ---------------- deep history: any stretch back years, stored on disk by year ----------------
+HIST_START = datetime(2015, 7, 20, tzinfo=timezone.utc).timestamp()  # about when Coinbase's BTC-USD candles begin
+_PACE = {"calls": []}
+_PACE_LOCK = threading.Lock()
+CANDLES_PER_SEC = 6  # Coinbase allows about 10 public requests a second; stay well under it
+
+
+def _pace():
+    """Keeps history downloads under Coinbase's request limit, so long downloads slow down instead of failing."""
+    while True:
+        with _PACE_LOCK:
+            now = time.time()
+            calls = [t for t in _PACE["calls"] if now - t < 1.0]
+            _PACE["calls"] = calls
+            if len(calls) < CANDLES_PER_SEC:
+                calls.append(now)
+                return
+            wait = 1.0 - (now - calls[0]) + 0.01
+        time.sleep(min(max(wait, 0.01), 1.0))
+
+
+def _hist_path(coin, gran, year, quote="USD"):
+    if not re.fullmatch(r"[A-Z0-9]{1,12}", str(coin)) or not re.fullmatch(r"[A-Z]{2,6}", str(quote)):
+        raise ValueError(f"not a coin: {coin!r}")
+    return os.path.join(HOME_DIR, "history", f"{coin}-{quote}-{int(gran)}", f"{year}.json")
+
+
+def _load_shard(coin, gran, year, quote="USD"):
+    try:
+        with open(_hist_path(coin, gran, year, quote)) as f:
+            d = json.load(f)
+        return dict(spans=[tuple(x) for x in d.get("spans") or []],
+                    rows={int(t): tuple(r) for t, r in zip(d["t"], zip(d["c"], d["h"], d["l"], d["v"]))})
+    except (OSError, ValueError, KeyError, TypeError):
+        return dict(spans=[], rows={})
+
+
+def _save_shard(coin, gran, year, sh, quote="USD"):
+    p = _hist_path(coin, gran, year, quote)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    ts = sorted(sh["rows"])
+    rows = [sh["rows"][t] for t in ts]
+    tmp = p + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(dict(spans=sh["spans"], t=ts, c=[r[0] for r in rows], h=[r[1] for r in rows], l=[r[2] for r in rows],
+                       v=[r[3] for r in rows]), f, separators=(",", ":"))
+        n = f.tell()
+    os.replace(tmp, p)
+    note_write(p, n)
+
+
+def _merge_spans(spans):
+    out = []
+    for a, b in sorted(spans):
+        if out and a <= out[-1][1] + 1:
+            out[-1] = (out[-1][0], max(out[-1][1], b))
+        else:
+            out.append((a, b))
+    return out
+
+
+def _missing(spans, a, b):
+    out, cur = [], a
+    for s0, e0 in _merge_spans(spans):
+        if e0 <= cur:
+            continue
+        if s0 >= b:
+            break
+        if s0 > cur:
+            out.append((cur, s0))
+        cur = max(cur, e0)
+    if cur < b:
+        out.append((cur, b))
+    return [(x, y) for x, y in out if y - x > 60]
+
+
+def _iso(ts):
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def common_stretch(data):
+    """Lines several tickers up on the bar times they all have. -> (closes, extra)"""
+    keys = [c for c, d in data.items() if d.get("t")]
+    if not keys:
+        return {}, {}
+    shared = set(data[keys[0]]["t"])
+    for c in keys[1:]:
+        shared &= set(data[c]["t"])
+    ts = sorted(shared)
+    closes, extra = {}, {}
+    for c in keys:
+        d = data[c]
+        idx = {t: i for i, t in enumerate(d["t"])}
+        ii = [idx[t] for t in ts]
+        closes[c] = [d["c"][i] for i in ii]
+        extra[c] = {k: [d[k][i] for i in ii] for k in ("h", "l", "v")}
+        extra[c]["t"] = list(ts)
+    return closes, extra
+
+
+def _fetch_bars(coin, gran, a, b, quote="USD"):
+    """Coinbase candles between two times (300 per request, newest page first)."""
+    rows, end = {}, b
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+    while end > a:
+        start = max(a, end - gran * 300)
+        _pace()
+        url = (f"https://api.exchange.coinbase.com/products/{coin}-{quote}/candles?granularity={int(gran)}"
+               f"&start={datetime.fromtimestamp(start, timezone.utc).strftime(fmt)}"
+               f"&end={datetime.fromtimestamp(end, timezone.utc).strftime(fmt)}")
+        data = json.loads(http_get(url, 20, retries=3))
+        for r in data or []:  # [time, low, high, open, close, volume]
+            t = int(r[0])
+            if a <= t < b:
+                rows[t] = (float(r[4]), float(r[2]), float(r[1]), float(r[5]))
+        end = start
+    return rows
+
+
+def fetch_range(coin, gran, start, end, quote="USD", note=None):
+    """Candles between two dates, any time back to 2015: {'c','h','l','v','t'}. Stored on disk by year, so each
+    stretch is downloaded once; the newest couple of candles are always fetched fresh."""
+    start, end = max(float(start), HIST_START), min(float(end), time.time())
+    rows = {}
+    cut = time.time() - 2 * gran  # candles still forming aren't stored
+    y0, y1 = datetime.fromtimestamp(start, timezone.utc).year, datetime.fromtimestamp(end, timezone.utc).year
+    for y in range(y0, y1 + 1):
+        ya = datetime(y, 1, 1, tzinfo=timezone.utc).timestamp()
+        yb = datetime(y + 1, 1, 1, tzinfo=timezone.utc).timestamp()
+        a, b = max(start, ya), min(end, yb, cut)
+        if a >= b:
+            continue
+        sh = _load_shard(coin, gran, y, quote)
+        miss = _missing(sh["spans"], a, b)
+        for ma, mb in miss:
+            if note:
+                note(f"Downloading {coin} {datetime.fromtimestamp(ma).strftime('%b %Y')}"
+                     + (f" to {datetime.fromtimestamp(mb).strftime('%b %Y')}" if mb - ma > 40 * 86400 else ""))
+            sh["rows"].update(_fetch_bars(coin, gran, ma, mb, quote))
+            sh["spans"] = _merge_spans(sh["spans"] + [(int(ma), int(mb))])
+        if miss:
+            try:
+                _save_shard(coin, gran, y, sh, quote)
+            except OSError:
+                pass
+        rows.update({t: r for t, r in sh["rows"].items() if start <= t <= end})
+    if end > cut:
+        try:
+            rows.update(_fetch_bars(coin, gran, max(start, cut - gran), end + gran, quote))
+        except Exception:
+            pass
+    ts = sorted(rows)
+    seq = [rows[t] for t in ts]
+    return dict(c=[r[0] for r in seq], h=[r[1] for r in seq], l=[r[2] for r in seq], v=[r[3] for r in seq], t=ts)
+
+
+def bars_per_day(gran):
+    """Candles in one day (crypto trades around the clock)."""
+    return max(1, int(round(86400 / gran)))
+
+
+def regular_hours(t, gran):
+    return True  # crypto never closes
 
 
 def latest_volume(coin, gran_seconds, quote="USD"):
@@ -662,6 +829,8 @@ DEFAULT_SETTINGS = {
     "classics": True,            # mix famous strategies (golden cross, turtle, RSI-2...) into the eggs
     "classic_rate": 25,          # % of new eggs that are a famous strategy (when one isn't on the farm yet)
     "layers": True,              # bots can evolve extra rule layers: a confirming strategy, an exit strategy, a sizing rule
+    "ctx_tickers": ["BTC", "ETH", "SOL"],  # market context: coins the bots watch (never trade unless they're picked)
+    "ctx_studies": True,         # bots can evolve studies on the watched coins (BTC dropping = careful buying...)
     "htf_studies": True,         # bots can evolve a slower-timeframe study (the bigger trend) that must agree before buying
     "lead_study": True,          # bots can evolve a "Bitcoin leads" study: BTC's recent move votes on other coins
     "post_review": True,         # after losing trades the farm notes which never-rule would have helped, and tries those more
@@ -670,13 +839,13 @@ DEFAULT_SETTINGS = {
     "mut_memory": True,          # the farm remembers which kinds of change make winners and does more of those
     "multicore": True,           # warm up the islands on several processor cores at once
     "shadow_live": True,         # follow your Hall of Fame bots with pretend money in real time (Shadow Live)
-    "retest_nightly": True,      # once a day, re-backtest the Hall of Fame on the latest prices; stale ones get a RUSTY badge
+    "retest_nightly": False,     # once a day, re-backtest the Hall of Fame on the latest prices; stale ones get a RUSTY badge
     "graduation": True,          # before real money: check each Hall of Fame / team bot has earned it
     "grad_hours": 24.0,          # ...hours it must have spent Winning
     "trade_hours": "",           # account trades only in these hours, like "9-17" or "22-6" (empty = any time; stops always run)
     "weekdays_only": False,      # ...and only Monday to Friday
     "tg_remote": False,          # control CBBF from Telegram: /status /pause /resume /report /kill
-    "free_roam": True,           # when the farm is idle, it backtests its own bots and runs small training camps by itself
+    "free_roam": False,          # when the farm is idle, it backtests its own bots and runs small training camps by itself
     "free_roam_running": False,  # ...also while the bot runs (uses a little more computer power and network)
     "slow_trades_account": False,  # the slow farm (hourly candles) may also trade your account
     "slow_size": 30,             # bots on the slow farm
@@ -703,6 +872,7 @@ DEFAULT_SETTINGS = {
     "limit_wait": 20,            # seconds a limit order may wait for a fill
     "limit_fallback": True,      # if a limit order does not fill in time, use a market order instead
     # Alerts
+    "max_spread_pct": 1.0,       # LIVE: skip buying a coin when its bid/ask gap is wider than this % (0 = off)
     "alert_discord": "", "alert_tg_token": "", "alert_tg_chat": "",
     "alert_trades": True, "alert_hof": True, "alert_problems": True,
     # Coins
@@ -819,6 +989,143 @@ class Sim:
 
 
 # ---------------- wildcard tournament ----------------
+# ---------------- Economic calendar (release dates from FRED, the St. Louis Fed's free data service) ----------------
+# kind: (FRED release id, name, release hour and minute in New York)
+EVENT_KINDS = {
+    "cpi":    (10, "CPI inflation", 8, 30),
+    "jobs":   (50, "Jobs report", 8, 30),
+    "fomc":   (101, "Fed decision", 14, 0),
+    "gdp":    (53, "GDP", 8, 30),
+    "pce":    (54, "PCE inflation", 8, 30),
+    "retail": (9, "Retail sales", 8, 30),
+}
+BIG_EVENTS = ("cpi", "jobs", "fomc")
+_EVENTS = {"data": None, "mtime": 0}
+
+
+def _ny_offset(d):
+    """Hours New York is behind UTC on date d (daylight saving: 2nd Sunday of March to 1st Sunday of November)."""
+    def nth_sunday(y, m, nth):
+        first = datetime(y, m, 1)
+        return 1 + (6 - first.weekday()) % 7 + 7 * (nth - 1)
+    start = datetime(d.year, 3, nth_sunday(d.year, 3, 2))
+    end = datetime(d.year, 11, nth_sunday(d.year, 11, 1))
+    return 4 if start <= datetime(d.year, d.month, d.day) < end else 5
+
+
+def ny_time(date_str, hh, mm):
+    d = datetime.strptime(date_str, "%Y-%m-%d")
+    return d.replace(hour=hh, minute=mm, tzinfo=timezone.utc).timestamp() + _ny_offset(d) * 3600
+
+
+def _events_path():
+    return os.path.join(HOME_DIR, "cache", "events.json")
+
+
+def fetch_events(fred_key, start="2015-01-01"):
+    """Downloads past and scheduled release times for every EVENT_KINDS entry and saves them. -> {kind: [ts, ...]}"""
+    out, errs = {}, []
+    for kind, (rid, name, hh, mm) in EVENT_KINDS.items():
+        url = ("https://api.stlouisfed.org/fred/release/dates?file_type=json&include_release_dates_with_no_data=true"
+               f"&sort_order=asc&limit=10000&realtime_start={start}&release_id={rid}&api_key={urllib.parse.quote(fred_key.strip())}")
+        try:
+            d = json.loads(http_get(url, timeout=20, retries=2))
+            out[kind] = sorted({ny_time(r["date"], hh, mm) for r in d.get("release_dates") or [] if r.get("date")})
+        except Exception as e:
+            errs.append(f"{name}: {e}")
+    if not out:
+        raise RuntimeError("; ".join(errs) or "no release dates came back")
+    os.makedirs(os.path.dirname(_events_path()), exist_ok=True)
+    tmp = _events_path() + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(dict(fetched=time.time(), events=out), f)
+    os.replace(tmp, _events_path())
+    _EVENTS["data"] = None
+    return out, errs
+
+
+def events():
+    """{kind: [release times]} from the saved calendar ({} if it was never downloaded). Re-read when the file changes,
+    so worker processes see it too."""
+    try:
+        mt = os.path.getmtime(_events_path())
+    except OSError:
+        return {}
+    if _EVENTS["data"] is None or mt != _EVENTS["mtime"]:
+        try:
+            with open(_events_path()) as f:
+                _EVENTS["data"] = {k: v for k, v in (json.load(f).get("events") or {}).items() if k in EVENT_KINDS}
+        except (OSError, ValueError):
+            _EVENTS["data"] = {}
+        _EVENTS["mtime"] = mt
+    return _EVENTS["data"]
+
+
+def events_fetched():
+    try:
+        with open(_events_path()) as f:
+            return float(json.load(f).get("fetched") or 0)
+    except (OSError, ValueError):
+        return 0.0
+
+
+def next_event(ts, kinds=BIG_EVENTS):
+    """(kind, time) of the next release after ts, or (None, None)."""
+    best = (None, None)
+    ev = events()
+    for k in kinds:
+        lst = ev.get(k) or []
+        i = bisect.bisect_right(lst, ts)
+        if i < len(lst) and (best[1] is None or lst[i] < best[1]):
+            best = (k, lst[i])
+    return best
+
+
+def last_event(ts, kinds=BIG_EVENTS):
+    best = (None, None)
+    ev = events()
+    for k in kinds:
+        lst = ev.get(k) or []
+        i = bisect.bisect_right(lst, ts) - 1
+        if i >= 0 and (best[1] is None or lst[i] > best[1]):
+            best = (k, lst[i])
+    return best
+
+
+def upcoming_events(now=None, days=14):
+    now = now or time.time()
+    ev = events()
+    out = [(t, k) for k in EVENT_KINDS for t in ev.get(k) or [] if now - 3600 <= t <= now + days * 86400]
+    return sorted(out)
+
+
+def _bar_time(extra, c, sim=None):
+    t = ((extra or {}).get(c) or {}).get("t")
+    if t:
+        return t[-1]
+    return getattr(sim, "now", None) or time.time()
+
+
+def align_ctx(times, ctx_times, ctx_closes):
+    """A watched coin's prices lined up with another coin's bar times (each bar gets the latest known price)."""
+    out, j, last = [], 0, None
+    for t in times:
+        while j < len(ctx_times) and ctx_times[j] <= t:
+            last = ctx_closes[j]
+            j += 1
+        out.append(last if last is not None else (ctx_closes[0] if ctx_closes else 0.0))
+    return out
+
+
+def data_now(extra, coins):
+    """Time of the newest bar in this data (bar times travel with the highs/lows/volumes as 't')."""
+    for c in coins:
+        t = ((extra or {}).get(c) or {}).get("t")
+        if t is not None and len(t):
+            return t[-1]
+    return time.time()
+
+
 def tournament_opts(settings):
     """Picks the winner/shaky-strategy knobs out of the app settings."""
     fee, slip = cost_model(settings)
@@ -839,6 +1146,7 @@ def tournament_opts(settings):
                 twin_test=bool(settings.get("twin_test", True)), elders=bool(settings.get("elders", True)),
                 seasons=bool(settings.get("seasons", True)),
                 htf_studies=bool(settings.get("htf_studies", True)), lead_study=bool(settings.get("lead_study", True)),
+                ctx=[c for c in (settings.get("ctx_tickers") or []) if valid_coin(c)] if settings.get("ctx_studies", True) else [],
                 post_review=bool(settings.get("post_review", True)), islands=max(1, min(6, int(settings.get("islands", 3) or 1))),
                 adapt_exits=bool(settings.get("adapt_exits", True)), mut_memory=bool(settings.get("mut_memory", True)))
 
@@ -918,10 +1226,17 @@ VETOES = {
                     text=lambda x: f"never buys when volume is under {x:g}x normal"),
     "mktdown": dict(lo=0.3, hi=5.0, side="buy", name="No buying into a sell-off",
                     text=lambda x: f"never buys while the market (BTC) is down {x:g}%+ over 10 decisions"),
+    "preev":   dict(lo=2, hi=72, side="open", name="Quiet before big news",
+                    text=lambda x: f"never buys in the {x:g} hours before CPI, the jobs report or a Fed decision"),
+    "prefed":  dict(lo=2, hi=72, side="open", name="Quiet before the Fed",
+                    text=lambda x: f"never buys in the {x:g} hours before a Fed decision"),
+    "postev":  dict(lo=0.5, hi=24, side="open", name="Let the news settle",
+                    text=lambda x: f"never buys in the {x:g} hours after CPI, the jobs report or a Fed decision"),
     "panic":   dict(lo=0.5, hi=5.0, side="sell", name="No panic selling",
                     text=lambda x: f"never sells on its strategy right after a {x:g}%+ one-bar drop (stops still work)"),
 }
 MAX_VETOES = 3
+EVENT_VETOES = ("preev", "prefed", "postev")  # only grown once the economic calendar is downloaded
 
 
 def clean_vetoes(d):
@@ -970,8 +1285,17 @@ def _veto(v, k, x, c, closes, n, extra, coins):
             return False
         base = sum(vol[-L - 1:-1]) / L
         return base > 0 and vol[-1] < x * base
+    if k in ("preev", "prefed", "postev"):
+        if not events():
+            return False
+        now = _bar_time(extra, c, v.sim)
+        if k == "postev":
+            _, t = last_event(now)
+            return t is not None and now - t < x * 3600
+        _, t = next_event(now, ("fomc",) if k == "prefed" else BIG_EVENTS)
+        return t is not None and t - now < x * 3600
     if k == "mktdown":
-        ref = "BTC" if "BTC" in coins else None
+        ref = "SPY" if "SPY" in coins else ("BTC" if "BTC" in coins else None)
         if ref:
             q = closes[ref]
             return len(q) > L and (q[-1] / q[-1 - L] - 1) * 100 <= -x
@@ -995,7 +1319,8 @@ def _grade_vetoes(v, closes, n):
         if k == "coin":  # a skipped coin: if it would have won, its bad record fades
             cp = v.coin_pl.setdefault(c, [0, 0.0])
             cp[1] = cp[1] * 0.9 + max(0.0, -saved)  # bad records also fade slowly, so it re-tries the coin one day
-        st = (v.layer_stats if k in ("plus", "minus", "confirm", "coin", "htf", "lead") else v.veto_stats).setdefault(k, [0.0, 0.0])
+        st = (v.layer_stats if (k in ("plus", "minus", "confirm", "coin", "htf", "lead") or k.startswith("ctx:"))
+              else v.veto_stats).setdefault(k, [0.0, 0.0])
         st[0] += 1
         st[1] += saved
     v.veto_wait = keep
@@ -1003,6 +1328,40 @@ def _grade_vetoes(v, closes, n):
 
 # ---- rule layers: several positive studies, several negative studies, several exit studies, and a sizing rule ----
 MAX_PLUS, MAX_MINUS, MAX_EXITS = 4, 3, 3
+MAX_CTX = 3          # context studies per bot (on coins it watches but never trades)
+CTX_KEY = "__ctx__"  # where the watched coins' prices travel inside the extra data
+
+
+def ctx_text(e):
+    up = "for" if e["sign"] > 0 else "against"
+    down = "against" if e["sign"] > 0 else "for"
+    if e.get("kind") == "study":
+        return f"{e['sym']} {e['name']} buy votes {up} buying, sell votes {down}"
+    return f"{e['sym']} up {e['th']:g}%+ over {e['lb']} decisions votes {up} buying, down that much votes {down}"
+
+
+def _ctx_votes(v, L, extra, n):
+    """[(sym, vote)] from the bot's context studies: +1 for buying, -1 against, 0 no opinion (or no data)."""
+    out = []
+    ctx = (extra or {}).get(CTX_KEY) or {}
+    for i, e in enumerate(L.get("ctx", [])):
+        q = ctx.get(e["sym"])
+        vote = 0
+        if q is not None and len(q) > 5:
+            if e.get("kind") == "study":
+                sig = strat_signal(e["name"], q, n, e["params"], v.tf)
+                k = f"ctx{i}"
+                if sig:
+                    v.conf_last[k] = sig
+                st = v.conf_last.get(k)
+                vote = (1 if st == "buy" else -1 if st == "sell" else 0) * e["sign"]
+            else:
+                lb = e["lb"] * v.tf
+                if len(q) > lb and q[-1 - lb]:
+                    mv = (q[-1] / q[-1 - lb] - 1) * 100
+                    vote = (1 if mv >= e["th"] else -1 if mv <= -e["th"] else 0) * e["sign"]
+        out.append((e["sym"], vote))
+    return out
 HTF_MULTS = (3, 4, 6, 8, 12)  # a slower-timeframe study looks at candles this many times longer than the bot's own
 
 
@@ -1050,6 +1409,23 @@ def clean_layers(d):
             except (TypeError, ValueError):
                 sub["mult"] = 6
             out["htf"] = sub
+    cx = []
+    for e in (d.get("ctx") or [])[:MAX_CTX]:
+        if not isinstance(e, dict) or not valid_coin(e.get("sym", "")):
+            continue
+        sign = -1 if int(e.get("sign", 1) or 1) < 0 else 1
+        if e.get("kind") == "study":
+            sub = _clean_sub(e)
+            if sub:
+                cx.append(dict(sub, sym=e["sym"], kind="study", sign=sign))
+        else:
+            try:
+                cx.append(dict(sym=e["sym"], kind="move", sign=sign, lb=int(min(max(int(e.get("lb", 10)), 2), 60)),
+                               th=round(min(max(float(e.get("th", 1.0)), 0.1), 10.0), 2)))
+            except (TypeError, ValueError):
+                pass
+    if cx:
+        out["ctx"] = cx
     ld = d.get("lead")
     if isinstance(ld, dict):
         try:
@@ -1092,6 +1468,9 @@ def layers_text(L, stats=None):
     if L.get("htf"):
         parts.append(f"only buys when the bigger trend agrees: {_sub_txt(L['htf'])} on {L['htf']['mult']}x longer candles"
                      + _stat_txt(stats.get("htf"), "buys blocked by the bigger trend"))
+    if L.get("ctx"):
+        parts.append("watches the market: " + "; ".join(ctx_text(e) + _stat_txt(stats.get(f"ctx:{e['sym']}"), "trades it held back")
+                                                        for e in L["ctx"]))
     if L.get("lead"):
         parts.append(f"Bitcoin leads: BTC up {L['lead']['th']:g}%+ over {L['lead']['lb']} decisions votes for buying other "
                      f"coins, down that much votes against" + _stat_txt(stats.get("lead"), "buys blocked by Bitcoin"))
@@ -1110,6 +1489,8 @@ def rule_stack(v_or_entry):
     if L.get("htf"):
         market.append(f"bigger trend must agree ({_sub_txt(L['htf'])} on {L['htf']['mult']}x candles)"
                       + _stat_txt(ls.get("htf"), "blocked buys"))
+    if L.get("ctx"):
+        market.append("watches " + "; ".join(ctx_text(e) for e in L["ctx"]))
     if L.get("lead"):
         market.append(f"Bitcoin leads (BTC {L['lead']['th']:g}% over {L['lead']['lb']} decisions)")
     pos = [f"{g('name')} (main)"] + [_sub_txt(s) for s in L.get("plus", [])]
@@ -1203,15 +1584,18 @@ def bot_step(v, closes, n, coins, extra=None):
                     if len(q_) > lb:
                         mv = (q_[-1] / q_[-1 - lb] - 1) * 100
                         lead_v = 1 if mv >= L["lead"]["th"] else -1 if mv <= -L["lead"]["th"] else 0
-                if L.get("plus") or L.get("minus") or L.get("lead"):
+                ctx_v = _ctx_votes(v, L, extra, n) if L.get("ctx") else []
+                cpos = sum(1 for _, x in ctx_v if x > 0)
+                cneg = sum(1 for _, x in ctx_v if x < 0)
+                if L.get("plus") or L.get("minus") or L.get("lead") or L.get("ctx"):
                     if s:
                         v.conf_last[f"main:{c}"] = s
                     plus = _study_states(v, L, "plus", closes, c, n, xc)
                     minus = _study_states(v, L, "minus", closes, c, n, xc)
                     trigger = s == "buy" or any(fresh == "buy" for fresh, _ in plus)
                     if trigger and sim.pos.get(c, 0) <= 0 or s == "buy":
-                        votes = (v.conf_last.get(f"main:{c}") == "buy") + sum(1 for _, st_ in plus if st_ == "buy") + (lead_v > 0)
-                        against = sum(1 for _, st_ in minus if st_ == "sell") + (lead_v < 0)
+                        votes = (v.conf_last.get(f"main:{c}") == "buy") + sum(1 for _, st_ in plus if st_ == "buy") + (lead_v > 0) + cpos
+                        against = sum(1 for _, st_ in minus if st_ == "sell") + (lead_v < 0) + cneg
                         if votes - against >= L.get("need", 1):
                             if s != "sell":
                                 s = "buy"
@@ -1222,6 +1606,7 @@ def bot_step(v, closes, n, coins, extra=None):
                                     conf = min(1.6, 0.8 + 0.25 * margin) if (L.get("plus") or L.get("minus")) else 1.0
                         else:
                             why = ("lead" if lead_v < 0 and votes - against + 1 >= L.get("need", 1) else
+                                   f"ctx:{next(sy for sy, x in ctx_v if x < 0)}" if cneg and votes - against + cneg >= L.get("need", 1) else
                                    "minus" if votes >= L.get("need", 1) else "plus")
                             if not any(w[0] == why and w[1] == c for w in v.veto_wait):
                                 v.veto_wait.append((why, c, "buy", last[c], n + 10 * v.tf))
@@ -1267,7 +1652,8 @@ def bot_step(v, closes, n, coins, extra=None):
                     s = None  # fee-aware: a profit this small would be eaten by the fees, so keep holding
             if s and v.vetoes and (s == "buy" or sim.pos.get(c, 0) > 0):
                 for k, x in v.vetoes.items():
-                    if VETOES[k]["side"] == s and _veto(v, k, x, c, closes, n, extra, coins):
+                    if (VETOES[k]["side"] == s or (VETOES[k]["side"] == "open" and s == "buy")) and \
+                            _veto(v, k, x, c, closes, n, extra, coins):
                         if not any(w[0] == k and w[1] == c for w in v.veto_wait):  # one open what-if per rule and coin
                             v.veto_wait.append((k, c, s, last[c], n + 10 * v.tf))
                         s = None
@@ -1294,7 +1680,7 @@ def bot_step(v, closes, n, coins, extra=None):
         if t:
             if t["side"] == "buy":
                 if v.review and c not in v.entry_flags:  # which never-rules WOULD have blocked this buy (for the review)
-                    v.entry_flags[c] = [k for k, spec in VETOES.items() if spec["side"] == "buy" and k not in v.vetoes
+                    v.entry_flags[c] = [k for k, spec in VETOES.items() if spec["side"] in ("buy", "open") and k not in v.vetoes
                                         and _veto(v, k, (spec["lo"] + spec["hi"]) / 2, c, closes, n, extra, coins)]
                 v.entries[c] = v.entries.get(c, 0) + 1
                 v.since.setdefault(c, n)
@@ -1414,6 +1800,7 @@ class Tournament:
                  retire_steps=0, risk_caps=None):
         self.coins, self.start_cash, self.fee, self.pct = list(coins), start_cash, fee, pct
         self.risk_caps = dict(risk_caps or (opts or {}).get("risk_caps") or FAST_RISK)
+        self.ctx_syms = [c for c in ((opts or {}).get("ctx") or []) if c not in coins]
         window = int((opts or {}).get("window", window))  # the slow farm judges over a different window
         self.evolve_every, self.W, self.min_trades = max(1, evolve_every), window, min_trades
         self.max_active, self.cap, self.retire_after = max_active, cap, retire_after
@@ -1429,6 +1816,7 @@ class Tournament:
         self.rng = rng or random.Random()
         self.n = 0
         self.events = []
+        self.on_trade = None  # optional hook: fn(bot, ticker, trade, bar time), e.g. Free roam's live trade feed
         self.recording = False  # the app switches this on once live; history replays are never recorded
         self.shadow = []        # every bot's own pretend trades since the last pop_shadow()
         self.hold_ret = None    # what just holding the coins returned over the scoring window
@@ -1524,6 +1912,13 @@ class Tournament:
         w = [(self.review.get(k, [0, 0])[0] + 1) / (self.review.get(k, [0, 0])[1] + 1) for k in pool]
         return self.rng.choices(pool, weights=w)[0]
 
+    def rand_ctx(self):
+        sym = self.rng.choice(self.ctx_syms)
+        if self.rng.random() < 0.4:
+            return dict(self._rand_sub(), sym=sym, kind="study", sign=self.rng.choice((1, -1)))
+        return dict(sym=sym, kind="move", sign=self.rng.choice((1, -1)), lb=self.rng.randint(2, 30),
+                    th=round(self.rng.uniform(0.2, 3.0), 2))
+
     def rand_layers(self, chance=0.35):
         """Extra rule layers for a new bot: a few positive studies, a few negative studies, exit studies, sizing."""
         if not self.o.get("layers", True):
@@ -1531,6 +1926,8 @@ class Tournament:
         out = {}
         if self.o.get("htf_studies", True) and self.rng.random() < chance * 0.6:
             out["htf"] = dict(self._rand_sub(), mult=self.rng.choice(HTF_MULTS))
+        if self.ctx_syms and self.rng.random() < chance * 0.7:
+            out["ctx"] = [self.rand_ctx() for _ in range(self.rng.randint(1, 2))]
         if self.o.get("lead_study", True) and self.rng.random() < chance * 0.4:
             out["lead"] = dict(lb=self.rng.randint(4, 30), th=round(self.rng.uniform(0.3, 2.5), 2))
         if self.rng.random() < chance:
@@ -1587,6 +1984,37 @@ class Tournament:
             if self.rng.random() < 0.25:
                 need += self.rng.choice((-1, 1))
             out["need"] = need
+        if self.ctx_syms or any(p.layers.get("ctx") for p in parents):  # context studies, judged by their own evidence
+            pool, seen = [], set()
+            for p in parents:
+                for e in p.layers.get("ctx", []):
+                    k_ = json.dumps(e, sort_keys=True)
+                    if k_ not in seen:
+                        seen.add(k_)
+                        pool.append(json.loads(k_))
+            kept = []
+            for e in pool:
+                st = max((p.layer_stats.get(f"ctx:{e['sym']}") for p in parents if p.layer_stats.get(f"ctx:{e['sym']}")),
+                         key=lambda x: x[0], default=None)
+                bad, good = bool(st and st[0] >= 5 and st[1] < 0), bool(st and st[0] >= 5 and st[1] > 0)
+                if self.rng.random() > (0.55 if bad else 0.92 if good else 0.8):
+                    continue
+                roll = self.rng.random()
+                if roll < 0.06:
+                    e["sign"] = -e["sign"]
+                elif roll < 0.35:
+                    if e.get("kind") == "study":
+                        e["params"] = self.mutate(e["name"], e["params"], 0.2)
+                    else:
+                        e["lb"] = int(e["lb"] * self.rng.uniform(0.7, 1.4))
+                        e["th"] = e["th"] * self.rng.uniform(0.75, 1.3)
+                kept.append(e)
+                if st and not bad:
+                    stats[f"ctx:{e['sym']}"] = [st[0] / 2, st[1] / 2]
+            if self.ctx_syms and len(kept) < MAX_CTX and self.rng.random() < 0.1 * self.mut_bias("studies"):
+                kept.append(self.rand_ctx())
+            if kept:
+                out["ctx"] = kept[:MAX_CTX]
         for key, on in (("htf", self.o.get("htf_studies", True)), ("lead", self.o.get("lead_study", True))):
             if not on:
                 continue
@@ -1622,7 +2050,7 @@ class Tournament:
             return {}
         out = {}
         for _ in range(self.rng.randint(1, 2)):
-            k = self.review_pick([k for k in VETOES if k not in out])
+            k = self.review_pick([k for k in VETOES if k not in out and (k not in EVENT_VETOES or events())])
             out[k] = self.rng.uniform(VETOES[k]["lo"], VETOES[k]["hi"])
         return clean_vetoes(out)
 
@@ -1649,7 +2077,7 @@ class Tournament:
                 out[k] = x
                 stats[k] = [st[0] / 2, st[1] / 2]
         if len(out) < MAX_VETOES and self.rng.random() < 0.15 * self.mut_bias("rules"):
-            k = self.review_pick([k for k in VETOES if k not in out])
+            k = self.review_pick([k for k in VETOES if k not in out and (k not in EVENT_VETOES or events())])
             out[k] = self.rng.uniform(VETOES[k]["lo"], VETOES[k]["hi"])
         out = clean_vetoes(out)
         return out, {k: s for k, s in stats.items() if k in out}
@@ -1760,6 +2188,11 @@ class Tournament:
                         self.review.setdefault(k, [0, 0])[0 if t["pl"] <= 0 else 1] += 1
             if self.recording:
                 self.shadow.append(dict(t, name=v.name, params=dict(v.params), tf=v.tf, uid=v.uid))
+            if self.on_trade:
+                try:
+                    self.on_trade(v, c, t, data_now(x, [c]) if x else None)
+                except Exception:
+                    pass
         e = v.sim.equity(last)
         if not self.replaying:
             if v.live_eq0 is None:
@@ -2626,7 +3059,8 @@ def _bt_bot(g, coins, start_cash, fee, pct, slip, picky=True):
     return b
 
 
-def backtest_bot(g, closes, extra=None, start_cash=1000.0, fee=0.006, pct=0.1, slip=0.0005, segments=4, progress=None):
+def backtest_bot(g, closes, extra=None, start_cash=1000.0, fee=0.006, pct=0.1, slip=0.0005, segments=4, progress=None,
+                 on_trade=None):
     """Full backtest of one bot (its exact genes) on past prices. Returns a dict with:
     ret, hold, edge, maxdd, trades, winrate, sortino, eq (equity curve), hold_eq, marks [(bar, coin, side, price)],
     by_coin {coin: [trades, P/L $]}, by_mood {mood: [decisions, summed gain]}, layer_stats, veto_stats, coin_pl,
@@ -2649,6 +3083,9 @@ def backtest_bot(g, closes, extra=None, start_cash=1000.0, fee=0.006, pct=0.1, s
             mood = max(set(known), key=known.count) if known else "unknown"
         for c, t in bot_step(b, pre, i, coins, slice_extra(extra, i + 1) if extra else None):
             marks.append((i, c, t["side"], closes[c][i]))
+            if on_trade:
+                tt = ((extra or {}).get(c) or {}).get("t")
+                on_trade(c, t, tt[i] if tt and i < len(tt) else None)
             bc = by_coin.setdefault(c, [0, 0.0])
             bc[0] += 1
             if t["side"] == "sell" and t.get("pl") is not None:
@@ -2792,7 +3229,7 @@ def _fresh_money(t):
 
 
 def train_farm(closes, extra, opts, cap=40, passes=2, exam_frac=0.25, seed_genes=None, start_cash=1000.0, fee=0.006,
-               pct=0.1, evolve=24, params=None, retire_steps=0, progress=None, stop=None, seed=None):
+               pct=0.1, evolve=24, params=None, retire_steps=0, progress=None, stop=None, seed=None, on_trade=None):
     """Training camp: a whole farm lives through a stretch of history, `passes` times over, breeding and learning as it
     goes (bots keep their genes and lessons between passes, with fresh money each time). The last exam_frac of the
     history is held back: afterwards the best bots are frozen and sent through it as a final exam on prices they never
@@ -2805,8 +3242,11 @@ def train_farm(closes, extra, opts, cap=40, passes=2, exam_frac=0.25, seed_genes
         raise ValueError("not enough history: pick a longer stretch or smaller candles")
     train = {c: closes[c][:cut] for c in coins}
     tx = {c: {k: x[:cut] for k, x in extra[c].items()} for c in coins} if extra else None
+    if extra and extra.get(CTX_KEY):
+        tx[CTX_KEY] = {k: x[:cut] for k, x in extra[CTX_KEY].items()}
     t = Tournament(coins, start_cash, fee, pct, evolve, params=params, opts=opts, cap=cap, retire_steps=retire_steps,
                    rng=random.Random(seed))
+    t.on_trade = on_trade
     for g in seed_genes or []:
         if g.get("name") in STRATS:
             t.add_variant(g["name"], g.get("params") or {}, None, g.get("size", 1.0), note="Training seed:", tf=g.get("tf", 1),
@@ -3134,16 +3574,18 @@ def send_alert(settings, text):
     return problems
 
 
-def tg_updates(token, offset=None):
-    """New Telegram messages to your bot: ([(chat id, text)], next offset). Long-polls for up to 20 seconds."""
-    url = f"https://api.telegram.org/bot{token.strip()}/getUpdates?timeout=20" + (f"&offset={offset}" if offset else "")
-    data = json.loads(http_get(url, 30))
+def tg_updates(token, offset=None, timeout=20):
+    """New Telegram messages to your bot: ([(chat id, text, sent at, private chat?, sender id)], next offset)."""
+    url = f"https://api.telegram.org/bot{token.strip()}/getUpdates?timeout={int(timeout)}" + (f"&offset={offset}" if offset else "")
+    data = json.loads(http_get(url, timeout + 10))
     out, nxt = [], offset
     for u in data.get("result", []):
         nxt = u["update_id"] + 1
         m = u.get("message") or {}
         if m.get("text"):
-            out.append((m["chat"]["id"], m["text"]))
+            ch = m.get("chat") or {}
+            out.append((ch.get("id"), m["text"], float(m.get("date") or 0), ch.get("type") == "private",
+                        (m.get("from") or {}).get("id")))
     return out, nxt
 
 
@@ -3201,12 +3643,30 @@ def load_json(path, default=None):
         return default
 
 
+DISK_WRITES = {}  # what CBBF has written since it started: kind -> [times, bytes]
+DISK_T0 = time.time()
+
+
+def note_write(path, nbytes):
+    base = os.path.basename(path)
+    kind = ("Farm saves" if base.startswith("farm-") else "Session saves" if base.startswith("state-") else
+            "Price history" if os.sep + "history" + os.sep in path or os.sep + "cache" + os.sep in path else
+            "Slow farm" if "slow" in base else "Settings and other")
+    w = DISK_WRITES.setdefault(kind, [0, 0])
+    w[0] += 1
+    w[1] += nbytes
+
+
 def save_json(path, obj):
+    if os.path.basename(path) == "config.json":
+        obj = scrub_config(obj)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
         json.dump(obj, f)
+        n = f.tell()
     os.replace(tmp, path)
+    note_write(path, n)
 
 
 def state_path(live):
@@ -3841,6 +4301,105 @@ def explain_login_error(err, secret=""):
     if "403" in low or "permission" in low or "scope" in low:
         return f"The key works but is missing permissions. Give it View and Trade.\n\n(Technical detail: {err})"
     return str(err)
+
+
+# ---------------- other secrets: kept in the system keychain, never in config.json ----------------
+SECRET_SETTINGS = ("alert_tg_token", "alert_discord")   # inside cfg["settings"]
+SECRET_CFG = ("fred_key",)                              # at the top of cfg
+
+
+def secret_set(name, value):
+    """Stores a secret in the system keychain (Windows Credential Manager / macOS Keychain). False if unavailable."""
+    try:
+        import keyring
+        if value:
+            keyring.set_password(KEYRING_SERVICE, name, str(value))
+        else:
+            try:
+                keyring.delete_password(KEYRING_SERVICE, name)
+            except Exception:
+                pass
+        return True
+    except Exception:
+        return False
+
+
+def secret_get(name):
+    try:
+        import keyring
+        return keyring.get_password(KEYRING_SERVICE, name) or ""
+    except Exception:
+        return ""
+
+
+def keychain_ok():
+    try:
+        import keyring
+        keyring.get_password(KEYRING_SERVICE, "_probe")
+        return True
+    except Exception:
+        return False
+
+
+def scrub_config(cfg):
+    """A copy of the config with its secrets moved to the keychain (if it works) and blanked."""
+    if not isinstance(cfg, dict) or not keychain_ok():
+        return cfg
+    out = dict(cfg)
+    st = dict(out.get("settings") or {})
+    for k in SECRET_SETTINGS:  # an emptied field removes the stored secret too
+        if k in st and secret_set(k, st.get(k) or ""):
+            st[k] = ""
+    for k in SECRET_CFG:
+        if k in out and secret_set(k, out.get(k) or ""):
+            out[k] = ""
+    if "settings" in out:
+        out["settings"] = st
+    return out
+
+
+def fill_secrets(cfg):
+    """Puts the keychain's secrets back into a freshly loaded config (in memory only)."""
+    st = cfg.setdefault("settings", {}) if isinstance(cfg.get("settings"), dict) or "settings" not in cfg else cfg["settings"]
+    for k in SECRET_SETTINGS:
+        if not st.get(k):
+            v = secret_get(k)
+            if v:
+                st[k] = v
+    for k in SECRET_CFG:
+        if not cfg.get(k):
+            v = secret_get(k)
+            if v:
+                cfg[k] = v
+    return cfg
+
+
+_REDACT = [
+    (re.compile(r"(api_key=)[A-Za-z0-9]+"), r"\1[hidden]"),
+    (re.compile(r"(api\.telegram\.org/bot)[^/\s]+"), r"\1[hidden]"),
+    (re.compile(r"(discord(?:app)?\.com/api/webhooks/)\S+"), r"\1[hidden]"),
+    (re.compile(r"organizations/[0-9a-f-]{20,}/apiKeys/[0-9a-f-]{20,}"), "[hidden key]"),
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"), "[hidden private key]"),
+    (re.compile(r"\b\d{8,10}:[A-Za-z0-9_-]{30,}\b"), "[hidden token]"),
+]
+
+
+def redact(text):
+    """Removes anything that looks like a key, token or webhook from text going into logs."""
+    text = str(text)
+    for rx, sub in _REDACT:
+        text = rx.sub(sub, text)
+    return text
+
+
+def private_dir(path):
+    """Makes the data folder readable by you only (Mac / Linux; Windows user folders already are)."""
+    try:
+        if os.name == "posix":
+            os.makedirs(path, exist_ok=True)
+            os.chmod(path, 0o700)
+    except OSError:
+        pass
 
 
 def keyring_available():

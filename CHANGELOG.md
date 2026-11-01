@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.16.0
+**Everything new from the options farm, made for crypto**
+
+- **Watched coins (market context)**: coins the bots watch but don't trade (BTC, ETH and SOL by default). Bots can
+  evolve up to 3 rules on them ("BTC dropping fast votes against buying"), each graded by what the trades it held back
+  would have done. Card on the left, and Insights > Market context shows what they learned.
+- **Economic calendar**: CPI, jobs reports, Fed decisions and more, from FRED (free key). Bots can grow news-day
+  never-rules ("quiet before big news", "quiet before the Fed", "let the news settle"), graded everywhere they learn.
+- **History back to 2015**: Backtest and Training camp take any stretch, from 1 day to "Since 2015", most recent or
+  starting on a date you pick (try 2020-03-01, 2022-05-01 or 2022-11-01). Coinbase history downloads once, stored by
+  year, and downloads pace themselves under Coinbase's limits.
+- **Backtest screen, cleaned up**: result tiles, a verdict, a fixed-size chart with dates, shaded walk-forward parts,
+  news days marked, a hover readout that doesn't move anything, and the details in their own scrolling box.
+- **Free roam you can watch**: it roams anywhere back to 2015, with an IN SESSION banner, a live trades list, problems
+  shown on screen, and results sorted best to worst with a "what the results do" explanation. It only studies while
+  it's switched on, stops at once when switched off, and always starts off. Nothing else learns in the background
+  either (the nightly Hall of Fame retest is off unless you turn it on).
+- **Safety**: a sell never asks for more of a coin than Coinbase shows as available, so coins you hold yourself are
+  never touched. A thin-market filter skips LIVE buys when a coin's bid/ask gap is too wide (default 1%).
+- **Security**: Telegram, Discord and FRED keys move to the system keychain, logs blank out anything that looks like a
+  key, the data folder is private, backups never contain keys, restoring a backup only restores CBBF's data files, the
+  Telegram remote only obeys fresh messages from your own private chat. Tools > System > Security shows it all.
+- **Streamlined**: one Learning window (Backtest, Hall of Fame test, Training camp, Free roam; Bot Lab is retired),
+  Insights, System (security, disk use, diagnostics), Family (tree and bloodlines) and Help windows with tabs; one
+  Reset window; five main tabs instead of eight (Markets = watchlist + live prices, Trades = trades + what the bot did +
+  scoreboard); shorter menus; Settings open on an "Everyday" page with the rest under "Show advanced settings".
+- **Disk use** (Tools > System): what CBBF stores and has written; routine saves are spaced out.
+
 ## 1.15.0
 **The Slow farm, and smooth window resizing**
 

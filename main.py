@@ -31,12 +31,15 @@ except ImportError as _e:
     _stay_open(f"Could not load engine.py ({_e}).\nExtract the whole zip first (right-click > Extract All), "
                "then run main.py from the extracted folder. main.py and engine.py must sit side by side.")
 
+import bisect
 import csv
 import io
 import json
 import math
 import os
 import queue
+import re
+import webbrowser
 import shutil
 import subprocess
 import threading
@@ -121,6 +124,8 @@ SETTING_GROUPS = [
                          "Safety stops still sell at any time (0 = off)", float),
         ("daily_loss", "Daily loss limit: stop trading for the rest of the day if the account falls this % since "
                        "midnight. Open coins are kept, not sold (0 = off). The TODAY tile shows how close you are", float),
+        ("max_spread_pct", "Thin-market filter: LIVE buys skip a coin when the gap between its bid and ask is wider than "
+                           "this % of its price (thin coins fill badly). Example: 1 (0 = off)", float),
         ("bot_allowance", "Allowance per bot: the most of your starting money that one bot's buy votes may have tied up "
                           "at once. Stops one bad dragon draining the account. Example: 25 with $1,000 = $250 per bot (0 = no limit)", float),
     ]),
@@ -153,7 +158,8 @@ SETTING_GROUPS = [
         (None, "Rules a bot can grow", "head"),
         ("layers", "Studies: several reasons to buy, several reasons not to, exit studies and sizing", bool),
         ("htf_studies", "Bigger-trend study: a slower timeframe must agree before buying", bool),
-        ("lead_study", "Bitcoin leads: BTC's recent move votes on other coins", bool),
+        ("ctx_studies", "Market context: bots can grow studies on the watched coins below (e.g. BTC dropping fast = no new buys)", bool),
+        ("ctx_tickers", "Coins the bots WATCH but never trade, separated by commas (BTC leads most of the market)", "tickers"),
         ("vetoes", "Never-rules: things a bot refuses to do, each graded in hindsight", bool),
         ("adapt_exits", "Adaptive stops: wider in wild markets, tighter in calm ones", bool),
         ("confidence_sizing", "Confidence sizing: bigger when its studies clearly agree", bool),
@@ -162,10 +168,6 @@ SETTING_GROUPS = [
         ("coin_prefs", "Favourite coins: skip coins it keeps losing on (re-checked in hindsight)", bool),
         ("post_review", "Post-trade review: losing trades teach which never-rules to try next", bool),
         ("multicore", "Learn on several processor cores at once at the start (faster warm-up)", bool),
-        (None, "Free roam (self-study)", "head"),
-        ("free_roam", "Free roam: while idle, the farm backtests its own bots on random stretches of history and runs "
-                      "small training camps, saving every lesson", bool),
-        ("free_roam_running", "...also while the bot is running (uses a bit more computer power)", bool),
     ]),
     ("Library & Hall of Fame", "The Bot Library keeps every bot you save, plus long-term winners the farm saves for you. "
                                "The Hall of Fame holds only the bots you promote yourself (right-click a bot).", [
@@ -663,10 +665,18 @@ class App:
         self.session = False
         self.logging_in = False
         self.migrated = E.migrate_home()  # first start after the rename: bring the old data folder across
+        E.private_dir(E.HOME_DIR)
         self.cfg = E.load_json(CONFIG_PATH, {})
+        E.fill_secrets(self.cfg)
+        self.cfg["roam_on"] = False  # Free roam always starts OFF: it only studies after you switch it on
         apply_theme(root, bool(self.cfg.get("dark", True)))
         self.dark_var = tk.BooleanVar(value=DARK)
         self.settings = E.merge_settings(self.cfg.get("settings"))
+        if not self.cfg.get("bg_learning_off"):  # 1.16: nothing learns by itself any more (Free roam only when ON)
+            self.settings["retest_nightly"] = False
+            self.cfg["bg_learning_off"] = True
+            self.cfg["settings"] = self.settings
+            E.save_json(CONFIG_PATH, self.cfg)
         CHARACTER_MODE["mode"] = self.settings.get("characters", "Themed dragons")
         if not self.cfg.get("live_feel_v1"):  # one-time move to the faster defaults (1-minute bars, 2-second prices)
             self.settings["bar_minutes"], self.settings["refresh"] = 1, 2
@@ -688,6 +698,8 @@ class App:
         root.after(400, self.auto_login)
         root.after(700, self.maybe_welcome)
         root.after(4000, self.start_tg_remote)
+        if self.cfg.get("fred_key") and time.time() - E.events_fetched() > 7 * 86400:
+            root.after(6000, lambda: self.fetch_calendar(quiet=True))
         root.after(20000, self.start_free_roam)
         root.after(1500, self.maybe_setup)
         root.after(4000, self.auto_check_update)
@@ -738,6 +750,7 @@ class App:
         self.hx = {}              # coin -> {'h','l','v'} lined up with self.hist (highs, lows, volumes per bar)
         self.bar_hl = {}          # coin -> [high, low] of the ticks inside the bar being built
         self.cur_vol = {}         # coin -> latest volume per bar from Coinbase candles
+        self.ctx_hist = {}        # watched coin -> prices lined up with the session's bars (watched, never traded)
         self.tick_px = {}         # coin -> deque of (time, price) for the tick chart
         self.brake_note = 0.0
 
@@ -745,10 +758,10 @@ class App:
         if not self.session:
             return
         if not force:
-            if time.time() - getattr(self, "_saved_at", 0) < 5:
+            if time.time() - getattr(self, "_saved_at", 0) < 30:  # routine saves at most every 30 s (trades save at once)
                 if not getattr(self, "_save_pending", False):
                     self._save_pending = True
-                    self.root.after(5000, lambda: (setattr(self, "_save_pending", False), self.save_state()))
+                    self.root.after(30000, lambda: (setattr(self, "_save_pending", False), self.save_state()))
                 return
         self._saved_at = time.time()
         E.save_json(E.state_path(self.live), dict(
@@ -766,8 +779,9 @@ class App:
         where it left off. Done every 20 decisions and whenever the bot stops, switches mode or the app closes."""
         if not (self.session and self.tourn and self.seeded):
             return
-        if not force and self.bar_n % 20:
-            return
+        if not force and (self.bar_n % 20 or time.time() - getattr(self, "_farm_saved", 0) < 300):
+            return  # routine farm saves: every 20 decisions, and never more than once every 5 minutes
+        self._farm_saved = time.time()
         try:
             E.save_json(E.farm_path(self.live), dict(coins=self.session_coins, bar=self.session_bar,
                                                       saved_at=time.time(), farm=self.tourn.to_state()))
@@ -989,6 +1003,33 @@ class App:
         Tip(ab, "Wildcard only: when you press Start, the bot scouts Coinbase and trades the busiest coins that are "
                 "actually moving (no stablecoins). How many: Settings > Wildcard.")
 
+        # --- market context card: coins the bots watch but never trade
+        f, c = self.card(left, "MARKET CONTEXT (WATCHED)")
+        f.pack(fill="x", pady=(0, 8))
+        self.ctx_box = tk.Frame(c, bg=CARD)
+        self.ctx_box.pack(fill="x")
+        crow2 = tk.Frame(c, bg=CARD)
+        crow2.pack(fill="x", pady=(4, 0))
+        ttk.Button(crow2, text="What they learned...", style="Plain.TButton", command=self.open_context).pack(side="left")
+        ttk.Button(crow2, text="Edit", style="Plain.TButton", command=self.edit_context).pack(side="left", padx=(4, 0))
+        Tip(self.ctx_box, "The bots watch these coins without trading them, and can evolve studies on them: for example "
+                          "'when BTC drops fast, don't buy altcoins' or 'when ETH trends up, favour buying'. Every such "
+                          "study is graded by what the trades it held back would have done.")
+        self.ctx_labels = {}
+        self.root.after(200, self.ctx_card_build)
+
+        # --- upcoming news card: the economic calendar
+        f, c = self.card(left, "UPCOMING NEWS")
+        f.pack(fill="x", pady=(0, 8))
+        self.news_box = tk.Frame(c, bg=CARD)
+        self.news_box.pack(fill="x")
+        nrow = tk.Frame(c, bg=CARD)
+        nrow.pack(fill="x", pady=(4, 0))
+        ttk.Button(nrow, text="Calendar...", style="Plain.TButton", command=self.open_calendar).pack(side="left")
+        Tip(self.news_box, "Big scheduled news: CPI, the jobs report, Fed decisions and more. Bots can grow never-rules "
+                           "around them ('stay out the day before CPI'), graded by what the trades they skipped would have done.")
+        self.root.after(300, self.news_card_refresh)
+
         # --- strategy card
         f, c = self.card(left, "STRATEGY")
         f.pack(fill="x", pady=(0, 8))
@@ -1050,7 +1091,7 @@ class App:
         Tip(self.new_btn, "Start a fresh session instead of continuing the saved one. Your trade history stays in the "
                           "Trades tab and trades.csv.")
         self.reset_btn = ttk.Button(left, text="Reset \u25be", style="Plain.TButton")
-        self.reset_btn.configure(command=lambda: self.reset_menu(self.reset_btn))
+        self.reset_btn.configure(command=self.open_reset)
         self.reset_btn.pack(fill="x", pady=(0, 4))
         Tip(self.reset_btn, "Start over: reset the practice account (cash and trades), the farm (fresh eggs), or both. "
                             "Your Library and Hall of Fame are always kept.")
@@ -1111,15 +1152,28 @@ class App:
         nb = self.nb = ttk.Notebook(nbf)
         nb.pack(fill="both", expand=True, pady=(8, 0))
         nb.bind("<<NotebookTabChanged>>", lambda e: self.refresh_visible())
-        t0, t1, t2, t3, t4, t5, t6, t7 = (ttk.Frame(nb) for _ in range(8))
+        t0, t1, t7, tm, tt = (ttk.Frame(nb) for _ in range(5))
         nb.add(t0, text="  \u25c6 Bot Farm  ")
         nb.add(t7, text="  \u25c7 Slow farm  ")
         nb.add(t1, text="  Portfolio  ")
-        nb.add(t6, text="  Watchlist  ")
-        nb.add(t4, text="  Live prices  ")
-        nb.add(t5, text="  Trades  ")
-        nb.add(t2, text="  Strategy scoreboard  ")
-        nb.add(t3, text="  What the bot did  ")
+        nb.add(tm, text="  Markets  ")
+        nb.add(tt, text="  Trades  ")
+        # Markets = watchlist + live prices; Trades = trades + what the bot did + the strategy scoreboard
+        self.subnb = {}
+        for outer, names in ((tm, ("Watchlist", "Live prices")), (tt, ("Trades", "What the bot did", "Strategy scoreboard"))):
+            sn = ttk.Notebook(outer)
+            sn.pack(fill="both", expand=True, pady=(4, 0))
+            sn.bind("<<NotebookTabChanged>>", lambda e: self.refresh_visible())
+            self.subnb[nb.tab(outer, "text").strip()] = sn
+            fr = []
+            for nm in names:
+                f_ = ttk.Frame(sn)
+                sn.add(f_, text=f"  {nm}  ")
+                fr.append(f_)
+            if outer is tm:
+                t6, t4 = fr
+            else:
+                t5, t3, t2 = fr
         self.build_grid_tab(t0)
         self.build_slow_tab(t7)
         self.build_portfolio(t1)
@@ -1149,10 +1203,7 @@ class App:
                 ("Catch!", self.catch_selected, "Catch the selected bots for your Bot Collection. They get a name, a rarity "
                  "and a level, and you can trade with your favourite team later."),
                 ("Library...", self.open_collection, "Your saved bots (the Bot Library): rarities, levels, your team, and who is in the Hall of Fame. (Ctrl+B)"),
-                ("Family tree...", self.open_family, "Which bot was bred or tweaked from which, including ones that died out."),
-                ("Bot Lab...", self.open_lab,
-                 "Evolve bots on months of past prices, then test them on prices they never saw. Only the ones that "
-                 "pass are worth keeping. (Ctrl+L)"))):
+                ("Family...", self.open_family, "Which bot was bred or tweaked from which, as a list and as drawn bloodlines."))):
             sb = ttk.Button(bar2 if i < 6 else bar3, text=txt, style="Accent.TButton" if txt == "Catch!" else "Plain.TButton",
                             command=cmd)
             sb.pack(side="left", padx=(0, 4))
@@ -1204,7 +1255,7 @@ class App:
         self.refresh_trades()
         self.update_status()
         self.refresh_view()
-        for seq, fn in (("<Control-Return>", self.toggle), ("<Control-l>", self.open_lab), ("<Control-h>", self.open_hof),
+        for seq, fn in (("<Control-Return>", self.toggle), ("<Control-l>", self.open_learning), ("<Control-h>", self.open_hof),
                         ("<Control-k>", self.open_coin_browser), ("<Control-b>", self.open_collection), ("<Control-e>", self.open_designer), ("<Control-comma>", self.open_settings),
                         ("<F5>", self.refresh_trades)):
             root.bind_all(seq, lambda e, f=fn: (f(), "break")[1])
@@ -1216,54 +1267,45 @@ class App:
         m.add_command(label="Export trades CSV...", command=self.export_csv)
         m.add_command(label="Export bots...", command=self.export_bots)
         m.add_command(label="Import bots...", command=self.import_bots)
-        m.add_command(label="Open data folder", command=self.open_data_folder)
         m.add_command(label="Back up everything...", command=self.backup_all)
         m.add_command(label="Restore from a backup...", command=self.restore_all)
-        pm = tk.Menu(m, tearoff=0, postcommand=lambda: self.fill_profiles(pm))
-        m.add_cascade(label="Settings profiles", menu=pm)
-        m.add_command(label="Reset session", command=self.reset)
+        m.add_command(label="Open data folder", command=self.open_data_folder)
         m.add_separator()
-        m.add_checkbutton(label="Dark mode", variable=self.dark_var, command=lambda: self.set_dark(self.dark_var.get()))
-        self.compact_var = tk.BooleanVar(value=bool(self.cfg.get("compact", False)))
-        m.add_checkbutton(label="Compact top bar", variable=self.compact_var, command=self.toggle_compact)
+        m.add_command(label="Reset...", command=self.open_reset)
         m.add_command(label="Quit", command=self.on_close)
         bar.add_cascade(label="File", menu=m)
         m = tk.Menu(bar, tearoff=0)
         m.add_command(label="Log in to Coinbase...", command=self.open_login)
         m.add_command(label="Log out", command=self.logout)
-        bar.add_cascade(label="Account", menu=m)
-        m = tk.Menu(bar, tearoff=0)
-        m.add_command(label="Backtest...", command=self.backtest)
-        m.add_command(label="Bot Lab...", command=self.open_lab, accelerator="Ctrl+L")
-        m.add_command(label="Hall of Fame...", command=self.open_hof, accelerator="Ctrl+H")
-        m.add_command(label="Bot family tree...", command=self.open_family)
-        m.add_command(label="Weekly report now...", command=self.show_report)
-        m.add_command(label="Training camp (a whole farm through history)...", command=self.open_training)
-        m.add_command(label="Free roam (the farm learns from the past by itself)...", command=self.open_roam)
-        m.add_command(label="Backtest a bot...", command=lambda: self.open_backtest(None))
-        m.add_command(label="Backtest the Hall of Fame...", command=self.backtest_hof)
-        m.add_command(label="Compare two bots...", command=lambda: self.compare_bots())
-        m.add_command(label="Bloodlines (drawn family tree)...", command=self.open_bloodlines)
-        m.add_command(label="Farm replay...", command=self.open_replay)
-        m.add_command(label="Design an egg...", command=self.open_designer, accelerator="Ctrl+E")
-        m.add_command(label="Bot Library...", command=self.open_collection, accelerator="Ctrl+B")
-        m.add_command(label="Browse Coinbase coins...", command=self.open_coin_browser, accelerator="Ctrl+K")
-        m.add_command(label="Settings...", command=self.open_settings, accelerator="Ctrl+,")
-        m.add_command(label="Install add-ons (setup)...", command=self.open_setup)
+        m.add_separator()
         m.add_command(label="Sell everything now", command=self.sell_all)
         m.add_command(label="KILL SWITCH (stop, cancel, sell all, lock Live)", command=self.kill_switch)
+        bar.add_cascade(label="Account", menu=m)
+        m = tk.Menu(bar, tearoff=0)
+        m.add_command(label="Learning: backtests, Training camp, Free roam...", command=self.open_learning, accelerator="Ctrl+L")
+        m.add_command(label="Insights: market context, calendar, report, replay...", command=self.open_insights)
+        m.add_separator()
+        m.add_command(label="Bot Library...", command=self.open_collection, accelerator="Ctrl+B")
+        m.add_command(label="Hall of Fame...", command=self.open_hof, accelerator="Ctrl+H")
+        m.add_command(label="Family (tree and bloodlines)...", command=self.open_family)
+        m.add_command(label="Compare two bots...", command=lambda: self.compare_bots())
+        m.add_command(label="Design an egg...", command=self.open_designer, accelerator="Ctrl+E")
+        m.add_command(label="Browse Coinbase coins...", command=self.open_coin_browser, accelerator="Ctrl+K")
+        m.add_separator()
+        m.add_command(label="Settings...", command=self.open_settings, accelerator="Ctrl+,")
+        pm = tk.Menu(m, tearoff=0, postcommand=lambda: self.fill_profiles(pm))
+        m.add_cascade(label="Settings profiles", menu=pm)
+        m.add_checkbutton(label="Dark mode", variable=self.dark_var, command=lambda: self.set_dark(self.dark_var.get()))
+        self.compact_var = tk.BooleanVar(value=bool(self.cfg.get("compact", False)))
+        m.add_checkbutton(label="Compact top bar", variable=self.compact_var, command=self.toggle_compact)
+        m.add_command(label="System: security, disk use, diagnostics...", command=self.open_system)
+        m.add_command(label="Install add-ons (setup)...", command=self.open_setup)
         m.add_separator()
         m.add_command(label="Check for updates", command=self.check_update)
         m.add_command(label="Undo last update", command=self.undo_update)
         bar.add_cascade(label="Tools", menu=m)
         m = tk.Menu(bar, tearoff=0)
-        m.add_command(label="Welcome screen", command=self.show_welcome)
-        m.add_command(label="Take the tour", command=self.start_tour)
-        m.add_command(label="How this works", command=self.show_guide)
-        m.add_command(label="What do these words mean?", command=self.show_glossary)
-        m.add_command(label="Keyboard shortcuts", command=self.show_shortcuts)
-        m.add_separator()
-        m.add_command(label="Diagnostics (copy for support)...", command=self.show_diagnostics)
+        m.add_command(label="Help...", command=self.open_help)
         bar.add_cascade(label="Help", menu=m)
         self.root.config(menu=bar)
 
@@ -2024,7 +2066,7 @@ class App:
             if os.path.exists(path) and os.path.getsize(path) > 1_000_000:
                 os.replace(path, path + ".old")
             with open(path, "a", encoding="utf-8") as f:
-                f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S}  {msg}\n")
+                f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S}  {E.redact(msg)}\n")
         except Exception:
             pass
         self.log.config(state="normal")
@@ -2077,16 +2119,20 @@ class App:
         self.write("Notifications muted." if self.cfg["muted"] else "Notifications on.")
 
     # ---------------- help / welcome ----------------
-    def info_window(self, title, text):
-        w = tk.Toplevel(self.root)
-        w.title(title)
-        t = tk.Text(w, width=78, height=24, wrap="word", padx=12, pady=10, relief="flat")
+    def info_window(self, title, text, parent=None):
+        if parent is None:
+            w = tk.Toplevel(self.root)
+            w.title(title)
+        else:
+            w = parent
+        t = tk.Text(w, width=78, height=24, wrap="word", padx=14, pady=12, relief="flat", bg=CARD, fg=TEXT, font=("", 10))
         t.insert("1.0", text)
         t.config(state="disabled")
-        t.pack(padx=6, pady=6)
-        ttk.Button(w, text="Close", command=w.destroy).pack(pady=(0, 8))
+        t.pack(fill="both", expand=True, padx=6, pady=6)
 
-    def show_guide(self):
+    def show_guide(self, parent=None):
+        if parent is None:
+            return self.open_hub("help", 'How this works')
         self.info_window("How this works", (
             "THE SHORT VERSION\n"
             "The bot watches crypto prices and buys or sells automatically using strategies. "
@@ -2110,9 +2156,11 @@ class App:
             "permissions only), and type LIVE to confirm. Start with a small amount.\n\n"
             "HONEST WARNING\n"
             "No strategy wins reliably, and fees eat into frequent trading. If the blue line stays below the "
-            "gray line, the bot isn't beating simply holding. Use Tools > Backtest to check on real history."))
+            "gray line, the bot isn't beating simply holding. Use Tools > Learning to test bots on real history."), parent=parent)
 
-    def show_glossary(self):
+    def show_glossary(self, parent=None):
+        if parent is None:
+            return self.open_hub("help", 'Words')
         self.info_window("What do these words mean?", (
             "Practice mode: pretend money, nothing real happens.\n"
             "Live mode: real money on your Coinbase account.\n"
@@ -2134,7 +2182,7 @@ class App:
             "Buy & hold: the gray line. What you'd have if you bought once and did nothing.\n"
             "Backtest: replays a strategy on past prices to see how it would have done. Past results don't "
             "predict the future.\n"
-            "Drawdown: the biggest drop from a peak, a measure of how bumpy the ride was."))
+            "Drawdown: the biggest drop from a peak, a measure of how bumpy the ride was."), parent=parent)
 
     def maybe_welcome(self):
         if not self.cfg.get("welcomed"):
@@ -2709,7 +2757,7 @@ class App:
             self.verdict_lbl.config(text=f"The bot is ahead of just holding by ${gap:,.2f}.", fg=GREEN)
         else:
             self.verdict_lbl.config(text=f"The bot is behind just holding by ${-gap:,.2f}. That's common, "
-                                         f"check the Backtest in the Tools menu.", fg=RED)
+                                         f"test the bots under Tools > Learning.", fg=RED)
         if self.session:
             last = self.trades[-1] if self.trades else None
             lt = (f" (last: {last['side'].upper()} {last['coin']} at {str(last.get('time', ''))[11:16]})" if last else "")
@@ -2719,6 +2767,7 @@ class App:
             self.activity_lbl.config(text="")
         if self.moving():
             return self.later(self.refresh_view, 300)
+        self.ctx_card_refresh()
         self.refresh_prices()
         self.draw_chart()
         self.headline_lbl.config(text=self.headline())
@@ -2728,7 +2777,7 @@ class App:
             self._bg_dirty = True
             return
         try:
-            on_board = self.nb.tab(self.nb.select(), "text").strip() == "Strategy scoreboard"
+            on_board = self.cur_tab() == "Strategy scoreboard"
         except Exception:
             on_board = True
         if self.tourn and not on_board:
@@ -2889,35 +2938,307 @@ class App:
         self.refresh_view()
         return True
 
-    def reset_menu(self, widget):
-        m = self._menu()
-        acct = "LIVE session tracking" if self.live else "practice account"
-        m.add_command(label=f"Reset the {acct} (cash, positions, trades)...", command=lambda: self.reset_account())
-        m.add_command(label="Reset the farm (fresh eggs; Library and Hall of Fame kept)...", command=lambda: self.reset_farm())
-        m.add_command(label="Reset both...", command=lambda: self.reset_account(both=True))
-        try:
-            m.tk_popup(widget.winfo_rootx(), widget.winfo_rooty() + widget.winfo_height())
-        finally:
-            m.grab_release()
+    def open_disk(self, parent=None):
+        """What OBF keeps on disk and how much it has written since it started."""
+        if parent is None:  # it lives as a tab in the system window
+            return self.open_hub('system', 'Disk use')
+        w = parent
+        w.configure(bg=BG)
+        tk.Label(w, bg=BG, fg=MUTED, justify="left", anchor="w", wraplength=690, padx=12, pady=8, text=(
+            "Everything CBBF keeps is in one folder (File > Open data folder). It only writes when something changes: your "
+            "account and farm are saved as they trade (routine saves at most every 30 seconds and 5 minutes), and price "
+            "history is saved once when a backtest, Training camp or Free roam first downloads it. Nothing learns or "
+            "downloads in the background unless you switch it on. For scale: a modern SSD is rated for hundreds of "
+            "terabytes of writes, so even a busy day of trading is a tiny fraction of that.")).pack(fill="x")
+        tk.Label(w, text="STORED ON DISK", bg=BG, fg=ACCENT, font=("", 8, "bold"), anchor="w", padx=12).pack(fill="x")
+        f1 = tk.Frame(w, bg=BG, padx=12)
+        f1.pack(fill="x")
+        t1 = self.make_tree(f1, ("who", "size", "files"), (360, 140, 120), ("What", "Size", "Files"))
+        t1.configure(height=7)
+        tk.Label(w, text="WRITTEN SINCE OBF STARTED", bg=BG, fg=ACCENT, font=("", 8, "bold"), anchor="w",
+                 padx=12).pack(fill="x", pady=(10, 0))
+        f2 = tk.Frame(w, bg=BG, padx=12)
+        f2.pack(fill="x")
+        t2 = self.make_tree(f2, ("who", "n", "size", "rate"), (260, 100, 120, 160), ("What", "Times", "Written", "Per hour"))
+        t2.configure(height=5)
+        bb = tk.Frame(w, bg=BG, padx=12, pady=10)
+        bb.pack(side="bottom", fill="x")
 
-    def reset_account(self, both=False):
-        what = "the farm AND the " + ("LIVE session tracking" if self.live else "practice account") if both else \
-            ("the LIVE session tracking" if self.live else "the practice account")
-        msg = f"Reset {what}?"
-        if not self.live:
+        def mb(b):
+            return f"{b / 1e6:,.1f} MB" if b >= 1e5 else f"{b / 1e3:,.0f} KB"
+
+        def walk(sub):
+            n = b = 0
+            for r_, _, fs in os.walk(os.path.join(E.HOME_DIR, sub)):
+                for f_ in fs:
+                    n += 1
+                    try:
+                        b += os.path.getsize(os.path.join(r_, f_))
+                    except OSError:
+                        pass
+            return n, b
+
+        def fill():
+            t1.delete(*t1.get_children())
+            groups = {"Farms (your bots and their memory)": [], "Bot Library and Hall of Fame": [],
+                      "Sessions, settings, logs, trades": []}
             try:
-                msg += f"\n\nYou start again with ${float(self.cash_var.get()):,.2f} of pretend money (change it under ACCOUNT)."
-            except ValueError:
+                for f_ in os.listdir(E.HOME_DIR):
+                    p_ = os.path.join(E.HOME_DIR, f_)
+                    if os.path.isfile(p_):
+                        k = ("Farms (your bots and their memory)" if f_.startswith("farm-") else
+                             "Bot Library and Hall of Fame" if any(x in f_.lower() for x in ("library", "hof", "hall", "collection"))
+                             else "Sessions, settings, logs, trades")
+                        groups[k].append(os.path.getsize(p_))
+            except OSError:
                 pass
-        if self.live and any(q > 0 for q in self.pos.values()):
-            msg += "\n\nLive coins the app bought stay on your Coinbase account but won't be tracked."
-        msg += "\nYour Library and Hall of Fame are kept."
-        if not messagebox.askyesno("Reset", msg):
-            return
-        if both:
-            self.reset_farm(ask=False)
-        self.reset(ask=False)
-        self.write(f"Reset {what}. Press Start to begin again.", "good")
+            for k, v in groups.items():
+                t1.insert("", "end", values=(k, mb(sum(v)), len(v)))
+            for lab, sub in (("Price history (downloaded once, by year)", "history"), ("Recent prices and calendar", "cache")):
+                n, b = walk(sub)
+                if n:
+                    t1.insert("", "end", values=(lab, mb(b), n))
+            t2.delete(*t2.get_children())
+            hrs = max(1 / 60, (time.time() - E.DISK_T0) / 3600)
+            for k, (n, b) in sorted(E.DISK_WRITES.items(), key=lambda kv: -kv[1][1]):
+                t2.insert("", "end", values=(k, n, mb(b), mb(b / hrs) if hrs >= 0.25 else "after 15 min"))
+            if w.winfo_exists():
+                w.after(5000, fill)
+
+        def clear(sub, what):
+            if not messagebox.askyesno("Disk use", f"Delete the {what}? It's downloaded again when it's needed.", parent=w):
+                return
+            if sub == "cache":  # keep the economic calendar
+                for f_ in os.listdir(os.path.join(E.HOME_DIR, sub)) if os.path.isdir(os.path.join(E.HOME_DIR, sub)) else []:
+                    if f_ != "events.json":
+                        try:
+                            os.remove(os.path.join(E.HOME_DIR, sub, f_))
+                        except OSError:
+                            pass
+            else:
+                shutil.rmtree(os.path.join(E.HOME_DIR, sub), ignore_errors=True)
+            self.write(f"Deleted the {what}.")
+        ttk.Button(bb, text="Delete downloaded history", command=lambda: clear("history", "downloaded price history")).pack(side="left")
+        ttk.Button(bb, text="Delete price cache", command=lambda: clear("cache", "recent price cache")).pack(side="left", padx=6)
+        ttk.Button(bb, text="Close", command=lambda: w.winfo_toplevel().destroy()).pack(side="right")
+        fill()
+
+    # ---------------- economic calendar ----------------
+    def security_items(self):
+        """[(ok: True / False / None for info, title, detail)] describing how CBBF is locked down right now."""
+        out = []
+        kc = E.keychain_ok()
+        out.append((True, "No open ports", "CBBF never listens for connections. It only makes outgoing, encrypted (HTTPS) "
+                    "connections: Coinbase for prices and orders, GitHub for updates, FRED for the calendar, Telegram or "
+                    "Discord if you turned on alerts or the phone remote."))
+        out.append((kc, "Keys kept in your system keychain" if kc else "System keychain not available",
+                    "Your Coinbase key, Telegram token, Discord webhook and FRED key are stored in Windows Credential "
+                    "Manager / macOS Keychain, not in CBBF's files, backups or exports." if kc else
+                    "Install the 'keyring' package (Tools > Install add-ons) so keys aren't saved in plain files."))
+        try:
+            raw = open(CONFIG_PATH, encoding="utf-8").read()
+            leak = [k for k in E.SECRET_SETTINGS + E.SECRET_CFG if re.search(rf'"{k}":\s*"[^"]+"', raw)]
+        except OSError:
+            leak = []
+        if leak:
+            out.append((False, "Some keys are still in config.json", ", ".join(leak) + ": they move to the keychain the "
+                        "next time settings are saved (or the keychain isn't available)."))
+        out.append((True, "Logs hide keys", "Anything that looks like a key, token or webhook is blanked before it's "
+                    "written to activity.log or crash.log."))
+        if os.name == "posix":
+            try:
+                mode = os.stat(E.HOME_DIR).st_mode & 0o777
+                out.append((mode & 0o077 == 0, "Data folder private" if mode & 0o077 == 0 else "Data folder readable by others",
+                            f"{E.HOME_DIR} (permissions {oct(mode)})"))
+            except OSError:
+                pass
+        else:
+            out.append((True, "Data folder in your user profile", f"{E.HOME_DIR}: other Windows users can't open it."))
+        out.append((True, "Selling lock", "A sell never asks for more of a coin than Coinbase says you have available, and "
+                    "CBBF only sells what it bought, so coins you hold yourself are left alone. Spot trading only: nothing "
+                    "is borrowed, so you can't lose more than what you put in. LIVE needs you at the computer typing LIVE; "
+                    "the kill switch locks it again."))
+        mx = float(self.settings.get("max_spread_pct", 0) or 0)
+        out.append((bool(mx), "Thin-market filter" + ("" if mx else " is OFF"),
+                    f"LIVE buys skip coins whose bid/ask gap is wider than {mx:g}% (Settings)." if mx else
+                    "Turn it on in Settings so LIVE buys skip thin coins that would fill badly."))
+        if self.settings.get("tg_remote"):
+            out.append((None, "Telegram phone remote is ON", "Only your own private chat with your bot is obeyed, only "
+                        "messages under 2 minutes old, and anything sent while CBBF was closed is ignored. It can pause, "
+                        "report and kill, never start LIVE. Keep the bot token secret: anyone with it could read the chat."))
+        else:
+            out.append((True, "Telegram phone remote is off", "No commands are accepted from outside this computer."))
+        out.append((None, "Updates", f"Only when you click Update, from github.com/{UPDATE_REPO} over HTTPS; only CBBF's own "
+                    "files are replaced, each must compile first, and the old version is backed up. Anyone who can push "
+                    "to that GitHub repository can ship an update, so keep two-factor sign-in on your GitHub account."))
+        out.append((None, "Your Coinbase account", "Turn on two-factor sign-in at Coinbase. Give the API key 'View' and "
+                    "'Trade' only, never 'Transfer', so a stolen key can't move money out. You can revoke it any time."))
+        return out
+
+    def open_security(self, parent=None):
+        if parent is None:  # it lives as a tab in the system window
+            return self.open_hub('system', 'Security')
+        w = parent
+        w.configure(bg=BG)
+        tk.Label(w, text="Security check", bg=BG, fg=TEXT, font=("", 14, "bold"), anchor="w", padx=14, pady=10).pack(fill="x")
+        t = tk.Text(w, bg=BG, fg=TEXT, relief="flat", wrap="word", padx=14, font=("", 10), highlightthickness=0)
+        t.pack(fill="both", expand=True)
+        t.tag_configure("ok", foreground=GREEN, font=("", 11, "bold"))
+        t.tag_configure("bad", foreground=RED, font=("", 11, "bold"))
+        t.tag_configure("info", foreground=ACCENT, font=("", 11, "bold"))
+        t.tag_configure("d", foreground=MUTED, lmargin1=26, lmargin2=26, spacing3=8)
+        for ok, title, detail in self.security_items():
+            mark, tag = ("OK   ", "ok") if ok else ("NOTE ", "info") if ok is None else ("FIX  ", "bad")
+            t.insert("end", mark + title + "\n", tag)
+            t.insert("end", detail + "\n", "d")
+        t.config(state="disabled")
+        ttk.Button(w, text="Close", command=lambda: w.winfo_toplevel().destroy()).pack(side="bottom", anchor="e", padx=14, pady=10)
+
+    # ---------------- disk use ----------------
+
+    # ---------------- combined windows (hubs): related tools as tabs of one window ----------------
+    HUB_SPEC = {
+        "learning": ("Learning", ("Backtest a bot", "Hall of Fame test", "Training camp", "Free roam"), (1180, 900)),
+        "insights": ("Insights", ("Market context", "Economic calendar", "Weekly report", "Farm replay"), (1000, 720)),
+        "system": ("System", ("Security", "Disk use", "Diagnostics"), (820, 700)),
+        "family": ("Family", ("Family tree", "Bloodlines"), (1120, 680)),
+        "help": ("Help", ("How this works", "Words", "Shortcuts"), (820, 640)),
+    }
+    HUB_REBUILD = {"Market context", "Weekly report", "Security", "Diagnostics", "Hall of Fame test", "Family tree",
+                   "Bloodlines", "Farm replay"}  # light tabs that show fresh data each time they're opened
+
+    def _hub_builders(self):
+        return {"Backtest a bot": lambda f, v=None: self.open_backtest(v, parent=f),
+                "Hall of Fame test": lambda f: self.backtest_hof(parent=f),
+                "Training camp": lambda f: self.open_training(parent=f),
+                "Free roam": lambda f: self.open_roam(parent=f),
+                "Market context": lambda f: self.open_context(parent=f),
+                "Economic calendar": lambda f: self.open_calendar(parent=f),
+                "Weekly report": lambda f: self.show_report(parent=f),
+                "Farm replay": lambda f: self.open_replay(parent=f),
+                "Security": lambda f: self.open_security(parent=f),
+                "Disk use": lambda f: self.open_disk(parent=f),
+                "Diagnostics": lambda f: self.show_diagnostics(parent=f),
+                "Family tree": lambda f: self.open_family(parent=f),
+                "Bloodlines": lambda f: self.open_bloodlines(parent=f),
+                "How this works": lambda f: self.show_guide(parent=f),
+                "Words": lambda f: self.show_glossary(parent=f),
+                "Shortcuts": lambda f: self.show_shortcuts(parent=f)}
+
+    def open_hub(self, key, tab=None, **kw):
+        """Opens (or brings forward) one of the combined windows, on the given tab."""
+        hubs = self.__dict__.setdefault("_hubs", {})
+        h = hubs.get(key)
+        if h is None or not h["w"].winfo_exists():
+            title, tabs, (W, H) = self.HUB_SPEC[key]
+            w = tk.Toplevel(self.root)
+            w.title(title)
+            w.geometry(f"{min(W, self.root.winfo_screenwidth() - 40)}x{min(H, self.root.winfo_screenheight() - 80)}")
+            w.minsize(760, 520)
+            w.configure(bg=BG)
+            if key == "help":
+                hb = tk.Frame(w, bg=BG, padx=10, pady=6)
+                hb.pack(fill="x")
+                ttk.Button(hb, text="Take the tour", style="Plain.TButton", command=self.start_tour).pack(side="left")
+                ttk.Button(hb, text="Welcome screen", style="Plain.TButton", command=self.show_welcome).pack(side="left", padx=6)
+            nb = ttk.Notebook(w)
+            nb.pack(fill="both", expand=True, padx=8, pady=8)
+            frames, built = {}, {}
+            for t in tabs:
+                f = tk.Frame(nb, bg=BG)
+                nb.add(f, text=f"  {t}  ")
+                frames[t] = f
+            h = hubs[key] = dict(w=w, nb=nb, frames=frames, built=built, kw={})
+
+            def on_tab(_=None, h=h):
+                try:
+                    t = nb.tab(nb.select(), "text").strip()
+                except tk.TclError:
+                    return
+                if not built.get(t) or (t in self.HUB_REBUILD and built.get(t) != "fresh"):
+                    self._hub_build(h, t)
+                for o in built:
+                    if o != t and built[o] == "fresh":
+                        built[o] = True  # rebuild light tabs next time they're opened
+            nb.bind("<<NotebookTabChanged>>", on_tab)
+        if tab:
+            if kw:
+                h["kw"][tab] = kw
+                if h["built"].get(tab):
+                    self._hub_build(h, tab)
+            h["nb"].select(h["frames"][tab])
+        try:
+            h["w"].deiconify()
+            h["w"].lift()
+            h["w"].focus_force()
+        except tk.TclError:
+            pass
+        return h["w"]
+
+    def _hub_build(self, h, t):
+        f = h["frames"][t]
+        for c in f.winfo_children():
+            c.destroy()
+        h["built"][t] = "fresh"
+        try:
+            self._hub_builders()[t](f, **h["kw"].pop(t, {}))
+        except Exception:
+            note = self._record_error(f"opening {t}")
+            tk.Label(f, text=f"Couldn't open {t}. " + (note or ""), bg=BG, fg=RED, wraplength=700, justify="left").pack(padx=20, pady=20)
+
+    def _nothing(self, parent, title, msg):
+        """'Nothing to show yet', as a note in the tab (or a message box when opened on its own)."""
+        if parent is None:
+            return messagebox.showinfo(title, msg)
+        tk.Label(parent, text=msg, bg=BG, fg=MUTED, wraplength=700, justify="left", font=("", 11)).pack(padx=30, pady=40, anchor="w")
+
+    def open_learning(self, tab="Backtest a bot"):
+        return self.open_hub("learning", tab)
+
+    def open_insights(self, tab="Market context"):
+        return self.open_hub("insights", tab)
+
+    def open_system(self, tab="Security"):
+        return self.open_hub("system", tab)
+
+    def open_help(self, tab="How this works"):
+        return self.open_hub("help", tab)
+
+    def open_reset(self):
+        """One Reset window: tick what to clear."""
+        w = tk.Toplevel(self.root)
+        w.title("Reset")
+        w.resizable(False, False)
+        f = ttk.Frame(w, padding=16)
+        f.pack()
+        ttk.Label(f, text="What should be reset?", font=("", 12, "bold")).pack(anchor="w")
+        acct = tk.BooleanVar(value=True)
+        farm = tk.BooleanVar(value=False)
+        what = "LIVE session tracking" if self.live else "practice account"
+        ttk.Checkbutton(f, text=f"The {what}: cash, contracts and trades"
+                                + ("" if self.live else " (you start again with the practice money on the left)"),
+                        variable=acct).pack(anchor="w", pady=(10, 0))
+        ttk.Checkbutton(f, text="The farm: every bot goes, fresh eggs hatch at the next Start", variable=farm).pack(anchor="w", pady=(4, 0))
+        ttk.Label(f, foreground=MUTED, wraplength=460, justify="left", text=(
+            "Your Library, Hall of Fame, settings and downloaded history are always kept."
+            + ("\nLIVE contracts stay in your broker account but won't be tracked by OBF any more."
+               if self.live and any(q > 0 for q in self.pos.values()) else ""))).pack(anchor="w", pady=(10, 0))
+
+        def go():
+            if not acct.get() and not farm.get():
+                return w.destroy()
+            w.destroy()
+            if farm.get():
+                self.reset_farm(ask=False)
+            if acct.get():
+                self.reset(ask=False)
+            self.write("Reset " + " and ".join(x for x, on in ((what, acct.get()), ("the farm", farm.get())) if on)
+                       + ". Press Start to begin again.", "good")
+        b = ttk.Frame(f)
+        b.pack(fill="x", pady=(14, 0))
+        ttk.Button(b, text="Cancel", command=w.destroy).pack(side="right")
+        ttk.Button(b, text="Reset", style="Accent.TButton", command=go).pack(side="right", padx=6)
+
 
     def reset_farm(self, ask=True):
         if ask and not messagebox.askyesno("Reset the farm", "Clear every bot on the farm and hatch a fresh one next time you "
@@ -2987,15 +3308,25 @@ class App:
         for c in coins:
             try:
                 d = E.fetch_ohlcv(c, gran, 2000, self.quote)  # enough for slow, long-holding bots too
-                hist[c], hx[c] = d["c"], dict(h=d["h"], l=d["l"], v=d["v"])
+                hist[c], hx[c] = d["c"], dict(h=d["h"], l=d["l"], v=d["v"], t=list(d.get("t") or []))
             except Exception as e:
-                hist[c], hx[c] = [], dict(h=[], l=[], v=[])
+                hist[c], hx[c] = [], dict(h=[], l=[], v=[], t=[])
                 self.q.put(("log", f"History unavailable for {c}: {e}"))
         L = min(len(v) for v in hist.values())
         hist = {c: v[-L:] if L else [] for c, v in hist.items()}
         hx = {c: {k: v[-L:] if L else [] for k, v in d.items()} for c, d in hx.items()}
         if bar_min < 1:  # scale 1-minute volume to the shorter bar so volume strategies compare like with like
             hx = {c: dict(d, v=[x * bar_min for x in d["v"]]) for c, d in hx.items()}
+        ctx = {}
+        if L and self.settings.get("ctx_studies", True):
+            try:
+                ctx = self.add_ctx({coins[0]: hx[coins[0]]}, gran, 2000, self.quote).get(E.CTX_KEY) or {}
+            except Exception:
+                ctx = {}
+        self.ctx_pending = {k: list(v_) for k, v_ in ctx.items()}
+        hx_all = dict(hx)
+        if ctx:
+            hx_all[E.CTX_KEY] = ctx
         tourn = None
         restored = getattr(self, "_restored_farm", None)
         self._restored_farm = None
@@ -3012,14 +3343,14 @@ class App:
             if self.settings.get("multicore", True) and L > E.WARM and opts.get("islands", 1) > 1:
                 self.q.put(("log", f"Warming up {opts['islands']} islands on several processor cores..."))
                 tourn = E.warm_islands(coins, self.start_cash, fee, pct, evolve, self.settings["params"], opts,
-                                       int(self.settings["max_bots"]), self.retire_steps(bar_min), hist, hx,
+                                       int(self.settings["max_bots"]), self.retire_steps(bar_min), hist, hx_all,
                                        log=lambda m: self.q.put(("log", m)))
             if tourn is None:
                 tourn = E.Tournament(coins, self.start_cash, fee, pct, evolve, params=self.settings["params"],
                                      opts=opts, cap=int(self.settings["max_bots"]),
                                      retire_steps=self.retire_steps(bar_min))
                 if L > E.WARM:
-                    tourn.warmup(hist, extra=hx)
+                    tourn.warmup(hist, extra=hx_all)
             roster = self.roster("live" if self.live else "paper")
             squad = (E.team() if roster == "team" else self.hof()[:max(14, int(self.settings["max_bots"]))]
                      if roster == "hof" else [])
@@ -3068,7 +3399,7 @@ class App:
                                       opts=E.tournament_opts(self.settings), cap=int(self.settings["max_bots"]),
                                       retire_steps=self.retire_steps(bar_min))
                          if wild else None)
-                self.q.put(("seed", ({c: [] for c in coins}, tourn, {c: dict(h=[], l=[], v=[]) for c in coins})))
+                self.q.put(("seed", ({c: [] for c in coins}, tourn, {c: dict(h=[], l=[], v=[], t=[]) for c in coins})))
         down_since, last_warn = None, 0.0
         batch_ok, last_vol = True, 0.0
         gran = E.candle_gran(bar_min)
@@ -3078,7 +3409,7 @@ class App:
                 t_req = time.time()
                 if batch_ok:  # one request for every coin
                     try:
-                        prices = E.spot_many(coins, self.quote)
+                        prices = E.spot_many(coins + [x for x in self.ctx_list(coins) if x not in coins], self.quote)
                     except Exception:
                         prices = {}
                     if not prices:
@@ -3096,7 +3427,7 @@ class App:
                         if fails >= 2:  # the connection is down, don't wait on every remaining coin
                             break
                 now = time.time()
-                self.q.put(("net", (len(prices), len(coins), now - t_req)))
+                self.q.put(("net", (sum(1 for c in coins if c in prices), len(coins), now - t_req)))
                 if prices and now - last_vol >= max(60.0, bar_min * 60):  # real trading volume for volume strategies
                     last_vol = now
                     vols = {}
@@ -3111,7 +3442,7 @@ class App:
                             pass
                     if vols:
                         self.q.put(("vols", vols))
-                if len(prices) == len(coins):
+                if all(c in prices for c in coins):
                     if down_since is not None:
                         mins = (now - down_since) / 60
                         self.q.put(("log", (f"Coinbase prices are back after {mins:.0f} min." if mins >= 1
@@ -3180,7 +3511,7 @@ class App:
             try:
                 os.makedirs(E.HOME_DIR, exist_ok=True)
                 with open(os.path.join(E.HOME_DIR, "crash.log"), "a") as f:
-                    f.write(f"\n--- {datetime.now():%Y-%m-%d %H:%M:%S} ({where}) ---\n{text}")
+                    f.write(f"\n--- {datetime.now():%Y-%m-%d %H:%M:%S} ({where}) ---\n{E.redact(text)}")
             except OSError:
                 pass
             return f"Internal error while {where}: {last}. The bot kept running (details in crash.log)."
@@ -3219,10 +3550,11 @@ class App:
             info.append("(not found)")
         return "\n".join(info)
 
-    def show_diagnostics(self):
+    def show_diagnostics(self, parent=None):
+        if parent is None:  # it lives as a tab in the system window
+            return self.open_hub('system', 'Diagnostics')
         text = self.diagnostics_text()
-        w = tk.Toplevel(self.root)
-        w.title("Diagnostics")
+        w = parent
         t = tk.Text(w, width=100, height=32, wrap="none", padx=8, pady=6)
         t.insert("1.0", text)
         t.pack(fill="both", expand=True, padx=6, pady=6)
@@ -3233,7 +3565,6 @@ class App:
             btn.config(text="Copied")
         btn = ttk.Button(w, text="Copy all", command=copy)
         btn.pack(pady=(0, 8))
-        copy()
 
     def on_cb_error(self, exc, val, tb):
         import traceback
@@ -3266,6 +3597,7 @@ class App:
             self.write(*data) if isinstance(data, tuple) else self.write(data)
         elif kind == "seed":
             self.hist, self.tourn = data[0], data[1]
+            self.ctx_hist = dict(getattr(self, "ctx_pending", {}) or {})
             self.hx = data[2] if len(data) > 2 else {c: dict(h=[], l=[], v=[]) for c in self.hist}
             if self.tourn:
                 self.tourn.recording = True  # history is loaded; from now on bot trades are listed
@@ -3295,8 +3627,6 @@ class App:
             self.on_fill(*data)
         elif kind == "fail":
             self.on_fail(*data)
-        elif kind == "bt":
-            self.show_backtest(*data)
         elif kind == "call":  # run a small UI update that a background thread asked for
             data()
         elif kind == "watch":
@@ -3307,8 +3637,6 @@ class App:
             self.cur_vol.update(data)
         elif kind == "unfilled":
             self.on_unfilled(*data)
-        elif kind == "lab":
-            self.on_lab_msg(*data)
         elif kind == "scouted":
             self.on_scouted(*data)
         elif kind == "update":
@@ -3355,7 +3683,7 @@ class App:
         keep = min(8000, max(2400, int(1440 / self.session_bar) + 20))
         for c in self.session_coins:
             h = self.hist.setdefault(c, [])
-            x = self.hx.setdefault(c, dict(h=[], l=[], v=[]))
+            x = self.hx.setdefault(c, dict(h=[], l=[], v=[], t=[]))
             if len(x["h"]) != len(h):  # line the extra data up with the closes (older sessions had none)
                 x["h"] = list(h)
                 x["l"] = list(h)
@@ -3365,15 +3693,26 @@ class App:
             x["h"].append(max(hi, prices[c]))
             x["l"].append(min(lo, prices[c]))
             x["v"].append(float(self.cur_vol.get(c, 0.0)))
+            if len(x.get("t", [])) != len(h) - 1:  # bar times line up with the closes (older sessions had none)
+                now_ = time.time()
+                x["t"] = [now_ - (len(h) - 1 - i_) * self.session_bar * 60 for i_ in range(len(h) - 1)]
+            x["t"].append(time.time())
             del h[:-keep]
-            for k in ("h", "l", "v"):
+            for k in ("h", "l", "v", "t"):
                 del x[k][:-keep]
+        for sym in list(self.ctx_hist):  # the watched coins move along with every bar
+            q = self.ctx_hist[sym]
+            px = prices.get(sym) or self.last.get(sym) or (q[-1] if q else None)
+            if px:
+                q.append(px)
+                L = len(self.hist[self.session_coins[0]]) if self.session_coins else len(q)
+                del q[:-L]
         if self.wild and self.tourn and set(self.tourn.coins) != set(self.session_coins):
             fixed = self.tourn.align_coins(self.session_coins, {c: self.hist[c][-1] for c in self.session_coins if self.hist.get(c)})
             self.write(f"The farm's coins were out of step with the session; it now trades {', '.join(fixed)}.", "warn")
         if self.wild and self.tourn:
             self.save_farm()
-            self.tourn.step({c: self.hist[c] for c in self.session_coins}, {c: self.hx[c] for c in self.session_coins})
+            self.tourn.step({c: self.hist[c] for c in self.session_coins}, self.extra_now())
             self.collect_shadow()
             for fn in (self.shadow_live_step, self.record_farm, self.maybe_retest):
                 try:
@@ -3638,8 +3977,94 @@ class App:
         self.write("Retesting the Hall of Fame on the latest prices...")
 
     # ---------------- backtest a bot ----------------
-    BT_LENGTHS = (("1 day", 1440), ("3 days", 4320), ("1 week", 10080), ("2 weeks", 20160), ("30 days", 43200))
-    BT_CANDLES = (("1 min", 60), ("5 min", 300), ("15 min", 900), ("1 hr", 3600))
+    # history lengths in calendar days, and candle sizes, shared by Backtest and Training camp
+    PERIODS = (("1 day", 1), ("3 days", 3), ("1 week", 7), ("2 weeks", 14), ("1 month", 30), ("3 months", 91),
+               ("6 months", 182), ("1 year", 365), ("2 years", 730), ("5 years", 1826), ("Since 2015", 4200))
+    CANDLES = (("1 min", 60), ("5 min", 300), ("15 min", 900), ("1 hr", 3600), ("6 hr", 21600), ("1 day", 86400))
+    BT_MAX = 25000  # candles per coin a backtest will chew through
+
+    def period_bounds(self, length, when, from_date):
+        """(start, end) timestamps for a period picker: the most recent N days, or N days from a date."""
+        days = dict(self.PERIODS)[length]
+        if when == "Most recent" or not from_date.strip():
+            end = time.time()
+            return max(E.HIST_START, end - days * 86400), end
+        try:
+            st = datetime.strptime(from_date.strip(), "%Y-%m-%d").timestamp()
+        except ValueError:
+            raise ValueError("Write the start date like 2020-03-02.")
+        st = max(st, E.HIST_START)
+        return st, min(time.time(), st + days * 86400)
+
+    @staticmethod
+    def est_candles(start, end, gran):
+        return int((end - start) / 86400 * E.bars_per_day(gran))
+
+    def load_stretch(self, coins, gran, start, end, note=None, max_bars=None):
+        """Past prices for these coins between two dates, lined up bar by bar, with the watched coins.
+        -> (closes, extra, info)"""
+        data = {}
+        for c in coins:
+            if note:
+                note(f"Loading {c}...")
+            d = E.fetch_range(c, gran, start, end, self.quote, note=note)
+            if len(d["c"]) < 60:
+                raise RuntimeError(f"Not enough {c} history in that period ({len(d['c'])} candles). "
+                                   f"It may not have traded then, or pick a longer period or smaller candles.")
+            data[c] = d
+        closes, extra = E.common_stretch(data)
+        L = len(next(iter(closes.values()))) if closes else 0
+        if L < 60:
+            raise RuntimeError("These coins share too few candles in that period.")
+        trimmed = bool(max_bars and L > max_bars)
+        if trimmed:
+            closes = {c: x[-max_bars:] for c, x in closes.items()}
+            extra = {c: {k: x[-max_bars:] for k, x in d.items()} for c, d in extra.items()}
+        if note:
+            note("Loading the watched coins...")
+        self.add_ctx(extra, gran, 0, self.quote)
+        t = next(iter(extra.values()))["t"]
+        return closes, extra, dict(start=t[0], end=t[-1], bars=len(t), trimmed=trimmed)
+
+    def period_picker(self, parent, prefix, default_len="1 month", default_candle="15 min"):
+        """History length + candles + 'most recent' or 'starting on'. -> dict of tk variables."""
+        c = self.cfg
+        v = dict(length=tk.StringVar(value=c.get(prefix + "_period", default_len)),
+                 candle=tk.StringVar(value=c.get(prefix + "_candles", default_candle)),
+                 when=tk.StringVar(value=c.get(prefix + "_when", "Most recent")),
+                 date=tk.StringVar(value=c.get(prefix + "_from", "2022-01-03")))
+        if v["length"].get() not in dict(self.PERIODS):
+            v["length"].set(default_len)
+        if v["candle"].get() not in dict(self.CANDLES):
+            v["candle"].set(default_candle)
+        ttk.Label(parent, text="History").grid(row=0, column=0, sticky="w")
+        ttk.Combobox(parent, textvariable=v["length"], values=[x[0] for x in self.PERIODS], state="readonly",
+                     width=10).grid(row=1, column=0, sticky="w", padx=(0, 12))
+        ttk.Label(parent, text="Candles").grid(row=0, column=1, sticky="w")
+        ttk.Combobox(parent, textvariable=v["candle"], values=[x[0] for x in self.CANDLES], state="readonly",
+                     width=7).grid(row=1, column=1, sticky="w", padx=(0, 12))
+        ttk.Label(parent, text="Which stretch").grid(row=0, column=2, sticky="w")
+        ttk.Combobox(parent, textvariable=v["when"], values=["Most recent", "Starting on"], state="readonly",
+                     width=12).grid(row=1, column=2, sticky="w", padx=(0, 6))
+        ttk.Label(parent, text="Start date (YYYY-MM-DD)").grid(row=0, column=3, sticky="w")
+        de = ttk.Entry(parent, textvariable=v["date"], width=12)
+        de.grid(row=1, column=3, sticky="w", padx=(0, 12))
+        Tip(de, "Any date back to mid 2015 (for BTC; newer coins start later). Try 2020-03-01 (the Covid crash), "
+                "2021-04-01 (the 2021 peak), 2022-05-01 (the LUNA crash) or 2022-11-01 (the FTX collapse).")
+
+        def sync(*_):
+            de.config(state="normal" if v["when"].get() == "Starting on" else "disabled")
+        v["when"].trace_add("write", sync)
+        sync()
+
+        def save():
+            c.update({prefix + "_period": v["length"].get(), prefix + "_candles": v["candle"].get(),
+                      prefix + "_when": v["when"].get(), prefix + "_from": v["date"].get()})
+            E.save_json(CONFIG_PATH, c)
+        v["save"] = save
+        v["bounds"] = lambda: self.period_bounds(v["length"].get(), v["when"].get(), v["date"].get())
+        v["gran"] = lambda: dict(self.CANDLES)[v["candle"].get()]
+        return v
 
     def _bt_sources(self):
         """Bots you can backtest: farm bots first, then Library bots. -> [(label, genes, farm bot or None, saved key)]"""
@@ -3655,48 +4080,74 @@ class App:
                 out.append((f"Library: {b.get('nickname') or E.bot_nickname(k)} ({STRAT_LABELS.get(b['name'], b['name'])})", b, None, k))
         return out
 
-    def open_backtest(self, v=None):
+    def open_backtest(self, v=None, parent=None):
+        if parent is None:  # it lives as a tab in the learning window
+            return self.open_hub('learning', 'Backtest a bot', v=v)
         srcs = self._bt_sources()
         if not srcs:
-            return messagebox.showinfo("Backtest", "No bots yet: start the farm or save some bots to your Library first.")
-        w = tk.Toplevel(self.root)
-        w.title("Backtest a bot")
-        w.geometry(f"960x{min(820, self.root.winfo_screenheight() - 80)}")
+            return self._nothing(parent, "Backtest", "No bots yet: start the farm or save some bots to your Library first.")
+        w = parent
         w.configure(bg=BG)
-        top = ttk.Frame(w, padding=10)
-        top.pack(fill="x")
+        coins = list(self.session_coins or [c for c, x in self.coin_vars.items() if x.get()] or ["BTC"])
+
+        # --- settings card
+        sf, sc = self.card(w, "TEST")
+        sf.pack(fill="x", padx=12, pady=(12, 0))
         names = [x[0] for x in srcs]
         pick = tk.StringVar(value=next((x[0] for x in srcs if x[2] is v), names[0]))
-        ttk.Label(top, text="Bot").grid(row=0, column=0, sticky="w")
-        ttk.Combobox(top, textvariable=pick, values=names, state="readonly", width=52).grid(row=0, column=1, columnspan=3, sticky="w", padx=6)
-        length = tk.StringVar(value=self.cfg.get("bt_len", "3 days"))
-        candle = tk.StringVar(value=self.cfg.get("bt_candle", "5 min"))
-        ttk.Label(top, text="History").grid(row=1, column=0, sticky="w", pady=(6, 0))
-        ttk.Combobox(top, textvariable=length, values=[x[0] for x in self.BT_LENGTHS], state="readonly", width=10).grid(
-            row=1, column=1, sticky="w", padx=6, pady=(6, 0))
-        ttk.Label(top, text="Candles").grid(row=1, column=2, sticky="e", pady=(6, 0))
-        ttk.Combobox(top, textvariable=candle, values=[x[0] for x in self.BT_CANDLES], state="readonly", width=8).grid(
-            row=1, column=3, sticky="w", padx=6, pady=(6, 0))
-        coins = list(self.session_coins or [c for c, x in self.coin_vars.items() if x.get()] or ["BTC"])
-        ttk.Label(top, text=f"Coins: {', '.join(coins)}", foreground=MUTED).grid(row=2, column=0, columnspan=4, sticky="w", pady=(4, 0))
-        go = ttk.Button(top, text="Run backtest", style="Accent.TButton")
-        go.grid(row=0, column=4, rowspan=2, padx=(16, 0))
-        status = ttk.Label(top, text="", foreground=MUTED)
-        status.grid(row=2, column=4, sticky="e")
-        body = tk.Frame(w, bg=BG)
-        body.pack(fill="both", expand=True, padx=10)
-        summary = tk.Label(body, text="Pick a bot, a stretch of history and a candle size, then Run backtest.\n\n"
-                                      "You get its result against just holding, a walk-forward check (does it work in every "
-                                      "part of the history, not just one lucky stretch), a bad-luck stress test (same trades, "
-                                      "random order), a double-fees test, and results per coin, per market mood and per rule.",
-                           bg=BG, fg=TEXT, justify="left", anchor="nw", wraplength=920, font=("", 10))
-        summary.pack(fill="x")
-        cv = tk.Canvas(body, height=220, bg=CARD, highlightthickness=0)
-        cv.pack(fill="both", expand=True, pady=(8, 0))
-        detail = tk.Label(body, text="", bg=BG, fg=MUTED, justify="left", anchor="nw", wraplength=920, font=("", 9))
-        detail.pack(fill="x", pady=(6, 0))
-        btns = ttk.Frame(w, padding=10)
-        btns.pack(fill="x")
+        r0 = tk.Frame(sc, bg=CARD)
+        r0.pack(fill="x")
+        tk.Label(r0, text="Bot", bg=CARD, fg=TEXT).pack(side="left")
+        ttk.Combobox(r0, textvariable=pick, values=names, state="readonly", width=58).pack(side="left", padx=8)
+        tk.Label(r0, text="on " + ", ".join(coins), bg=CARD, fg=MUTED).pack(side="left", padx=6)
+        r1 = ttk.Frame(sc)
+        r1.pack(fill="x", pady=(8, 0))
+        per = self.period_picker(r1, "bt", "1 month", "15 min")
+        go = ttk.Button(r1, text="Run backtest", style="Accent.TButton")
+        go.grid(row=1, column=5, sticky="w", padx=(12, 0))
+        r2 = tk.Frame(sc, bg=CARD)
+        r2.pack(fill="x", pady=(8, 0))
+        pbar = ttk.Progressbar(r2, mode="indeterminate", length=160)
+        pbar.pack(side="left")
+        status = tk.Label(r2, text="", bg=CARD, fg=MUTED, anchor="w")
+        status.pack(side="left", fill="x", expand=True, padx=8)
+
+        def est(*_):
+            try:
+                a, b = per["bounds"]()
+                n = self.est_candles(a, b, per["gran"]())
+                status.config(text=f"About {n:,} candles per coin"
+                                   + (f" (more than {self.BT_MAX:,}: only the latest {self.BT_MAX:,} are used; pick bigger candles)"
+                                      if n > self.BT_MAX else "") + ".  Older history downloads once, then it's instant.",
+                              fg=MUTED)
+            except ValueError:
+                status.config(text="Write the start date like 2020-03-02.", fg=RED)
+        for k in ("length", "candle", "when", "date"):
+            per[k].trace_add("write", est)
+        est()
+
+        # --- result: fixed-size tiles, verdict, chart (fixed height) and a scrolling details box
+        tiles = tk.Frame(w, bg=BG)
+        tiles.pack(fill="x", padx=12, pady=(10, 0))
+        tile_v = {}
+        for i, (key, lab) in enumerate((("ret", "RETURN"), ("hold", "JUST HOLDING"), ("edge", "VS HOLDING"),
+                                        ("dd", "WORST DROP"), ("trades", "TRADES / WIN RATE"), ("parts", "PARTS WON"))):
+            f = tk.Frame(tiles, bg=CARD, highlightthickness=1, highlightbackground=LINE, padx=10, pady=6)
+            f.grid(row=0, column=i, sticky="nsew", padx=(0 if i == 0 else 6, 0))
+            tiles.columnconfigure(i, weight=1, uniform="t")
+            tk.Label(f, text=lab, bg=CARD, fg=MUTED, font=("", 7, "bold"), anchor="w").pack(fill="x")
+            tile_v[key] = tk.Label(f, text="-", bg=CARD, fg=TEXT, font=("", 13, "bold"), anchor="w")
+            tile_v[key].pack(fill="x")
+        verdict = tk.Label(w, text="Pick a bot and a stretch of history, then Run backtest.", bg=BG, fg=MUTED,
+                           anchor="w", justify="left", font=("", 10, "bold"), height=1)
+        verdict.pack(fill="x", padx=12, pady=(8, 0))
+        chart_f = tk.Frame(w, bg=CARD, highlightthickness=1, highlightbackground=LINE, height=300)
+        chart_f.pack(fill="x", padx=12, pady=(6, 0))
+        chart_f.pack_propagate(False)
+        cv = tk.Canvas(chart_f, bg=CARD, highlightthickness=0, cursor="crosshair")
+        cv.pack(fill="both", expand=True)
+        btns = tk.Frame(w, bg=BG)
+        btns.pack(side="bottom", fill="x", padx=12, pady=10)
         save_btn = ttk.Button(btns, text="Save to its memory", state="disabled")
         save_btn.pack(side="left")
         teach_btn = ttk.Button(btns, text="Save + teach the farm", state="disabled")
@@ -3705,104 +4156,206 @@ class App:
                       "coins it struggles with, how it does in each market mood, and the test result. Its children inherit it.")
         Tip(teach_btn, "Also teaches the whole farm: losing buys go into the post-trade review, and if it beat holding "
                        "it becomes an elder that nudges future eggs.")
-        ttk.Button(btns, text="Close", command=w.destroy).pack(side="right")
-        state = {}
+        ttk.Button(btns, text="Close", command=lambda: w.winfo_toplevel().destroy()).pack(side="right")
+        df = tk.Frame(w, bg=BG)
+        df.pack(fill="both", expand=True, padx=12, pady=(8, 0))
+        details = tk.Text(df, bg=CARD, fg=TEXT, relief="flat", wrap="word", height=8, padx=10, pady=8,
+                          font=("", 9), highlightthickness=1, highlightbackground=LINE)
+        dsb = ttk.Scrollbar(df, orient="vertical", command=details.yview)
+        details.configure(yscrollcommand=dsb.set)
+        dsb.pack(side="right", fill="y")
+        details.pack(side="left", fill="both", expand=True)
+        details.tag_configure("h", foreground=ACCENT, font=("", 8, "bold"), spacing1=6)
+        details.tag_configure("good", foreground=GREEN)
+        details.tag_configure("bad", foreground=RED)
+        details.insert("end", "After a run you'll find the details here: each coin, each market mood, each part of the "
+                              "walk-forward check, every rule's record, and the stress tests.")
+        details.config(state="disabled")
+        state = dict(hover=None)
 
         def run():
             src = next(x for x in srcs if x[0] == pick.get())
-            self.cfg.update(bt_len=length.get(), bt_candle=candle.get())
-            mins = dict(self.BT_LENGTHS)[length.get()]
-            gran = dict(self.BT_CANDLES)[candle.get()]
-            count = min(5000, max(200, mins * 60 // gran))
+            try:
+                a, b = per["bounds"]()
+            except ValueError as e:
+                return messagebox.showerror("Backtest", str(e), parent=w)
+            gran = per["gran"]()
+            per["save"]()
             go.config(state="disabled")
-            status.config(text="Loading prices...")
+            pbar.start(12)
             fee, slip = E.cost_model(self.settings)
-            pct, cash, quote = self.settings["trade_pct"] / 100, self.start_cash, self.quote
+            pct, cash = self.settings["trade_pct"] / 100, self.start_cash
+
+            def note(txt):
+                self.q.put(("call", lambda: status.config(text=txt, fg=MUTED) if w.winfo_exists() else None))
 
             def work():
                 try:
-                    data = {c: E.fetch_ohlcv(c, gran, count, quote) for c in coins}
-                    L = min(len(d["c"]) for d in data.values())
-                    closes = {c: d["c"][-L:] for c, d in data.items()}
-                    extra = {c: {k: d[k][-L:] for k in ("h", "l", "v")} for c, d in data.items()}
-                    self.q.put(("call", lambda: status.config(text="Testing...")))
+                    closes, extra, info = self.load_stretch(coins, gran, a, b, note, self.BT_MAX)
+                    note(f"Testing on {info['bars']:,} candles...")
                     r = E.backtest_bot(src[1], closes, extra, cash, fee, pct, slip)
-                    self.q.put(("call", lambda: show(src, r, closes, gran)))
+                    t = next(iter(extra.values()))["t"]
+                    self.q.put(("call", lambda: show(src, r, closes, gran, info, t)))
                 except Exception as e:
-                    self.q.put(("call", lambda e=e: (status.config(text=""), go.config(state="normal"),
-                                                     messagebox.showerror("Backtest", f"Couldn't run it: {e}", parent=w))))
+                    self.q.put(("call", lambda e=e: (pbar.stop(), go.config(state="normal"),
+                                                     status.config(text=f"Couldn't run it: {e}", fg=RED)) if w.winfo_exists() else None))
             threading.Thread(target=work, daemon=True).start()
 
-        def show(src, r, closes, gran):
+        def put(txt, tag=None):
+            details.insert("end", txt, tag or ())
+
+        def show(src, r, closes, gran, info, times):
             if not w.winfo_exists():
                 return
+            pbar.stop()
             go.config(state="normal")
-            status.config(text="")
-            state.update(src=src, r=r)
             segs = r["segments"]
             passed = sum(1 for x in segs if x[2] > 0)
-            verdict = ("Solid: beat holding overall and in most parts of the history." if r["edge"] > 0 and passed >= max(1, len(segs) - 1)
-                       else "Mixed: beat holding overall, but not in every part. Could be luck." if r["edge"] > 0
-                       else "Weak: did worse than just holding on these prices.")
-            wr = "-" if r["winrate"] is None else f"{r['winrate'] * 100:.0f}%"
-            mc = "-" if r["mc_dd95"] is None else f"{r['mc_dd95'] * 100:.1f}%"
-            summary.config(text=(
-                f"{src[0]}  on {len(closes)} coin(s), {r['bars']} candles of {dict((b, a) for a, b in self.BT_CANDLES)[gran]}\n"
-                f"Return {r['ret'] * 100:+.2f}%   |   just holding {r['hold'] * 100:+.2f}%   |   vs holding {r['edge'] * 100:+.2f}%   |   "
-                f"worst drop {r['maxdd'] * 100:.1f}%   |   {r['trades']} trades, win rate {wr}   |   fees ${r['fees']:,.2f}\n"
-                f"Walk-forward: beat holding in {passed} of {len(segs)} parts   |   double fees: {r['fees2x'] * 100:+.2f}%   |   "
-                f"bad-luck drop (95%): {mc}\n"
-                f"Verdict: {verdict}"))
-            bits = []
+            st0 = r["start"] - 1
+            state.update(src=src, r=r, times=list(times[st0:st0 + len(r["eq"])]), segs=segs)
+            cname = dict((y, x) for x, y in self.CANDLES)[gran]
+            status.config(text=f"{datetime.fromtimestamp(info['start']).strftime('%b %d %Y')} to "
+                               f"{datetime.fromtimestamp(info['end']).strftime('%b %d %Y')}   |   {info['bars']:,} candles of "
+                               f"{cname}" + ("   |   trimmed to the latest candles" if info["trimmed"] else ""), fg=MUTED)
+            col = lambda x: GREEN if x > 0 else RED if x < 0 else TEXT
+            tile_v["ret"].config(text=f"{r['ret'] * 100:+.2f}%", fg=col(r["ret"]))
+            tile_v["hold"].config(text=f"{r['hold'] * 100:+.2f}%", fg=TEXT)
+            tile_v["edge"].config(text=f"{r['edge'] * 100:+.2f}%", fg=col(r["edge"]))
+            tile_v["dd"].config(text=f"{r['maxdd'] * 100:.1f}%", fg=TEXT)
+            tile_v["trades"].config(text=f"{r['trades']}  /  " + ("-" if r["winrate"] is None else f"{r['winrate'] * 100:.0f}%"), fg=TEXT)
+            tile_v["parts"].config(text=f"{passed} of {len(segs)}", fg=GREEN if passed >= max(1, len(segs) - 1) else TEXT)
+            if r["edge"] > 0 and passed >= max(1, len(segs) - 1):
+                verdict.config(text="Solid: it beat just holding overall and in most parts of this stretch.", fg=GREEN)
+            elif r["edge"] > 0:
+                verdict.config(text="Mixed: it beat just holding overall, but not in every part. Could be luck.", fg="#f59e0b")
+            else:
+                verdict.config(text="Weak: it did worse than just holding on this stretch.", fg=RED)
+            details.config(state="normal")
+            details.delete("1.0", "end")
+            put("STRESS TESTS\n", "h")
+            put(f"Double fees and slippage: {r['fees2x'] * 100:+.2f}%   |   bad-luck drop (95% of shuffled orders): "
+                + ("-" if r["mc_dd95"] is None else f"{r['mc_dd95'] * 100:.1f}%") + f"   |   fees paid ${r['fees']:,.2f}\n")
+            put("WALK-FORWARD PARTS (the bot vs just holding, in each quarter)\n", "h")
+            for i, (a_, h_, e_) in enumerate(segs):
+                put(f"  Part {i + 1}: {a_ * 100:+.1f}% vs {h_ * 100:+.1f}%   ")
+                put("won\n" if e_ > 0 else "lost\n", "good" if e_ > 0 else "bad")
             if r["by_coin"]:
-                bits.append("Per coin: " + ", ".join(f"{c} {x[0]} trades ${x[1]:+,.2f}" for c, x in r["by_coin"].items()))
+                put("PER COIN\n", "h")
+                for c_, x in r["by_coin"].items():
+                    put(f"  {c_}: {x[0]} trades, ")
+                    put(f"${x[1]:+,.2f}\n", "good" if x[1] > 0 else "bad")
             if r["by_mood"]:
-                bits.append("Per market mood: " + ", ".join(f"{MOOD_TEXT.get(m, m)} {x[1] * 100:+.2f}%" for m, x in r["by_mood"].items()))
+                put("PER MARKET MOOD\n", "h")
+                for m_, x in r["by_mood"].items():
+                    put(f"  {MOOD_TEXT.get(m_, m_)}: ")
+                    put(f"{x[1] * 100:+.2f}%\n", "good" if x[1] > 0 else "bad")
             st = dict(r["layer_stats"], **r["veto_stats"])
             if st:
-                bits.append("Rules: " + "; ".join(f"{E.VETOES[k]['name'] if k in E.VETOES else k} "
-                                                   f"{'saved' if x[1] >= 0 else 'cost'} {abs(x[1]):.1f}% over {int(x[0])}"
-                                                   for k, x in st.items()))
+                put("RULES (what each study and never-rule saved or cost)\n", "h")
+                for k_, x in sorted(st.items(), key=lambda kv: -abs(kv[1][1])):
+                    put(f"  {E.VETOES[k_]['name'] if k_ in E.VETOES else k_}: ")
+                    put(f"{'saved' if x[1] >= 0 else 'cost'} {abs(x[1]):.1f}%", "good" if x[1] >= 0 else "bad")
+                    put(f" over {int(x[0])}\n")
             if r["review"]:
-                bits.append("Losing buys a never-rule would have stopped: " +
-                            ", ".join(f"{E.VETOES[k]['name']} {x[0]}" for k, x in r["review"].items() if k in E.VETOES))
-            bits.append("Parts (walk-forward): " + "  ".join(f"[{i + 1}] {a * 100:+.1f}% vs {h * 100:+.1f}%" for i, (a, h, _) in enumerate(segs)))
-            detail.config(text="\n".join(bits))
+                rv = [(k_, x) for k_, x in r["review"].items() if k_ in E.VETOES]
+                if rv:
+                    put("LOSING BUYS A NEVER-RULE WOULD HAVE STOPPED\n", "h")
+                    put("  " + ", ".join(f"{E.VETOES[k_]['name']} {x[0]}" for k_, x in rv) + "\n")
+            details.config(state="disabled")
             save_btn.config(state="normal")
             teach_btn.config(state="normal")
             draw()
 
-        def draw(_=None):
-            r = state.get("r")
-            cv.delete("all")
-            if not r:
-                return
+        def geom():
+            r = state["r"]
             W, H = cv.winfo_width(), cv.winfo_height()
             eq, he = r["eq"], r["hold_eq"]
             lo, hi = min(eq + he), max(eq + he)
             pad = (hi - lo) * 0.08 or 1
             lo, hi = lo - pad, hi + pad
             n = len(eq)
-            X = lambda i: 60 + i * (W - 70) / max(1, n - 1)
-            Y = lambda y: H - 16 - (y - lo) / (hi - lo) * (H - 30)
+            X = lambda i: 64 + i * (W - 76) / max(1, n - 1)
+            Y = lambda y: H - 26 - (y - lo) / (hi - lo) * (H - 52)
+            return W, H, n, lo, hi, X, Y
+
+        def draw(_=None):
+            cv.delete("all")
+            r = state.get("r")
+            W, H = cv.winfo_width(), cv.winfo_height()
+            if not r:
+                cv.create_text(W // 2, H // 2, text="The bot's account (blue) and just holding (grey) appear here.", fill=MUTED)
+                return
+            W, H, n, lo, hi, X, Y = geom()
+            eq, he, times = r["eq"], r["hold_eq"], state["times"]
+            segs = state["segs"] or [(0, 0, 0)]
+            ns = len(segs)
+            for k in range(ns):  # walk-forward parts as faint bands, each with its result
+                x0, x1 = X(k * (n - 1) / ns), X((k + 1) * (n - 1) / ns)
+                if k % 2:
+                    cv.create_rectangle(x0, 22, x1, H - 26, fill=BG, outline="")
+                e_ = segs[k][2]
+                cv.create_text((x0 + x1) / 2, 30, text=f"part {k + 1}: {e_ * 100:+.1f}% vs holding",
+                               fill=GREEN if e_ > 0 else RED, font=("", 7))
             for k in range(4):
                 yv = lo + (hi - lo) * k / 3
-                cv.create_line(60, Y(yv), W - 10, Y(yv), fill=LINE)
-                cv.create_text(54, Y(yv), text=f"{yv:,.0f}", anchor="e", fill=MUTED, font=("", 8))
-            segs = len(r["segments"]) or 1
-            for k in range(1, segs):
-                cv.create_line(X(k * (n - 1) / segs), 8, X(k * (n - 1) / segs), H - 14, fill=LINE, dash=(3, 3))
-            step = max(1, n // 1200)
+                cv.create_line(64, Y(yv), W - 12, Y(yv), fill=LINE, dash=(2, 4))
+                cv.create_text(58, Y(yv), text=f"${yv:,.0f}", anchor="e", fill=MUTED, font=("", 8))
+            if times:  # dates along the bottom
+                for k in range(5):
+                    i = int(k * (n - 1) / 4)
+                    if i < len(times):
+                        cv.create_text(X(i), H - 12, text=datetime.fromtimestamp(times[i]).strftime("%b %d %Y" if times[-1] - times[0] > 200 * 86400 else "%b %d"),
+                                       anchor="n" if 0 < k < 4 else ("nw" if k == 0 else "ne"), fill=MUTED, font=("", 7))
+            if times and E.events():  # big news days
+                t0, t1 = times[0], times[-1]
+                for kind in E.BIG_EVENTS:
+                    for et in E.events().get(kind) or []:
+                        if t0 <= et <= t1:
+                            i = bisect.bisect_left(times, et)
+                            cv.create_line(X(i), H - 30, X(i), H - 26, fill="#f59e0b", width=2)
+            step = max(1, n // 1400)
             cv.create_line(*[z for i in range(0, n, step) for z in (X(i), Y(he[i]))], fill="#9ca3af", width=1)
             cv.create_line(*[z for i in range(0, n, step) for z in (X(i), Y(eq[i]))], fill=ACCENT, width=2)
-            for i, c, side, px in r["marks"][-300:]:
+            for i, c, side, px in r["marks"][-400:]:
                 j = i - r["start"] + 1
                 if 0 <= j < n:
                     x, y = X(j), Y(eq[j])
-                    cv.create_polygon(*((x, y + 2, x - 4, y + 9, x + 4, y + 9) if side == "buy" else (x, y - 2, x - 4, y - 9, x + 4, y - 9)),
+                    cv.create_polygon(*((x, y + 3, x - 4, y + 10, x + 4, y + 10) if side == "buy" else (x, y - 3, x - 4, y - 10, x + 4, y - 10)),
                                       fill=GREEN if side == "buy" else RED, outline="")
-            cv.create_text(W - 12, 6, anchor="ne", fill=MUTED, font=("", 8), text="blue = the bot, grey = just holding, dashes = walk-forward parts")
+            cv.create_text(W - 12, 6, anchor="ne", fill=MUTED, font=("", 8),
+                           text="blue = the bot   grey = just holding   orange ticks = big news days")
+            hover()
+
+        def hover(e=None):
+            """Crosshair + readout drawn inside the chart, so nothing around it moves."""
+            cv.delete("hover")
+            r = state.get("r")
+            if e is not None:
+                state["hover"] = e.x
+            x = state.get("hover")
+            if not r or x is None:
+                return
+            W, H, n, lo, hi, X, Y = geom()
+            i = int(round((x - 64) / max(1, W - 76) * (n - 1)))
+            if not 0 <= i < n:
+                return
+            xi = X(i)
+            cv.create_line(xi, 22, xi, H - 26, fill=MUTED, dash=(2, 2), tags="hover")
+            cv.create_oval(xi - 3, Y(r["eq"][i]) - 3, xi + 3, Y(r["eq"][i]) + 3, fill=ACCENT, outline="", tags="hover")
+            times = state["times"]
+            when = datetime.fromtimestamp(times[i]).strftime("%a %b %d %Y %H:%M") if i < len(times) else ""
+            b0 = r["eq"][0] or 1
+            txt = (f"{when}    bot ${r['eq'][i]:,.0f} ({(r['eq'][i] / b0 - 1) * 100:+.1f}%)    "
+                   f"holding ${r['hold_eq'][i]:,.0f} ({(r['hold_eq'][i] / (r['hold_eq'][0] or 1) - 1) * 100:+.1f}%)")
+            cv.create_rectangle(64, 4, 64 + 7 * len(txt), 18, fill=CARD, outline="", tags="hover")
+            cv.create_text(68, 11, text=txt, anchor="w", fill=TEXT, font=("", 8, "bold"), tags="hover")
+
+        def leave(_=None):
+            state["hover"] = None
+            cv.delete("hover")
         cv.bind("<Configure>", draw)
+        cv.bind("<Motion>", hover)
+        cv.bind("<Leave>", leave)
 
         def save(teach):
             src, r = state["src"], state["r"]
@@ -3823,14 +4376,14 @@ class App:
         if v is not None:
             run()
 
-    def backtest_hof(self):
+    def backtest_hof(self, parent=None):
         """Backtests every Hall of Fame bot on the current prices and ranks them."""
+        if parent is None:  # it lives as a tab in the learning window
+            return self.open_hub('learning', 'Hall of Fame test')
         hof = list(self.hof())
         if not hof or not self.session_coins:
-            return messagebox.showinfo("Backtest the Hall of Fame", "You need Hall of Fame bots and a running session (for prices).")
-        w = tk.Toplevel(self.root)
-        w.title("Hall of Fame backtest")
-        w.geometry("900x480")
+            return self._nothing(parent, "Backtest the Hall of Fame", "You need Hall of Fame bots and a running session (for prices).")
+        w = parent
         bb = ttk.Frame(w, padding=8)
         bb.pack(side="bottom", fill="x")
         lbl = ttk.Label(w, text="Testing...", padding=8)
@@ -3875,21 +4428,16 @@ class App:
             self.__dict__.pop("_file_cache", None)
             self.write(f"Saved {len(res)} Hall of Fame backtests to their memories.", "good")
         ttk.Button(bb, text="Save all to their memories", style="Accent.TButton", command=save_all).pack(side="left")
-        ttk.Button(bb, text="Close", command=w.destroy).pack(side="right")
+        ttk.Button(bb, text="Close", command=lambda: w.winfo_toplevel().destroy()).pack(side="right")
         threading.Thread(target=work, daemon=True).start()
 
     # ---------------- training camp ----------------
-    TC_LENGTHS = (("1 day", 1440), ("3 days", 4320), ("1 week", 10080), ("2 weeks", 20160), ("30 days", 43200),
-                  ("60 days", 86400), ("90 days", 129600), ("180 days", 259200))
-    TC_CANDLES = (("1 min", 60), ("5 min", 300), ("15 min", 900), ("1 hr", 3600), ("6 hr", 21600))
-    TC_MAX = 6000
+    TC_MAX = 12000
 
-    def open_training(self):
-        if getattr(self, "tc_win", None) is not None and self.tc_win.winfo_exists():
-            return self.tc_win.lift()
-        w = self.tc_win = tk.Toplevel(self.root)
-        w.title("Training camp")
-        w.geometry(f"1000x{min(780, self.root.winfo_screenheight() - 80)}")
+    def open_training(self, parent=None):
+        if parent is None:  # it lives as a tab in the learning window
+            return self.open_hub('learning', 'Training camp')
+        w = self.tc_win = parent
         w.configure(bg=BG)
         f = ttk.Frame(w, padding=12)
         f.pack(fill="x")
@@ -3901,18 +4449,18 @@ class App:
             "Only the ones that beat just holding in training AND in the exam pass.")).grid(row=1, column=0, columnspan=6,
                                                                                            sticky="w", pady=(2, 10))
         c = self.cfg
-        length = tk.StringVar(value=c.get("tc_len", "2 weeks"))
-        candle = tk.StringVar(value=c.get("tc_candle", "15 min"))
+        pf = ttk.Frame(f)
+        pf.grid(row=2, column=0, columnspan=6, sticky="w", pady=(0, 8))
+        per = self.period_picker(pf, "tc", "3 months", "1 hr")
         passes = tk.StringVar(value=str(c.get("tc_passes", 2)))
         size = tk.StringVar(value=str(c.get("tc_size", int(self.settings.get("max_bots", 30)))))
         exam = tk.StringVar(value=c.get("tc_exam", "25%"))
         start = tk.StringVar(value=c.get("tc_start", "Fresh eggs"))
         for idx, (lab, var, vals, wd) in enumerate((
-                ("History", length, [x[0] for x in self.TC_LENGTHS], 9), ("Candles", candle, [x[0] for x in self.TC_CANDLES], 7),
                 ("Passes", passes, ["1", "2", "3", "4", "5"], 3), ("Farm size", size, ["20", "30", "40", "60", "80", "120"], 4),
                 ("Final exam", exam, ["None", "15%", "25%", "35%"], 6),
                 ("Start from", start, ["Fresh eggs", "My current farm", "Hall of Fame", "Library"], 15))):
-            r0, col = (2, idx) if idx < 3 else (4, idx - 3)
+            r0, col = 4, idx
             ttk.Label(f, text=lab).grid(row=r0, column=col, sticky="w", padx=(0, 14))
             ttk.Combobox(f, textvariable=var, values=vals, state="readonly" if lab not in ("Farm size",) else "normal",
                          width=wd).grid(row=r0 + 1, column=col, sticky="w", padx=(0, 14))
@@ -3921,13 +4469,15 @@ class App:
         note.grid(row=6, column=0, columnspan=6, sticky="w", pady=(6, 0))
 
         def update_note(*_):
-            mins = dict(self.TC_LENGTHS)[length.get()]
-            gran = dict(self.TC_CANDLES)[candle.get()]
-            n = mins * 60 // gran
-            cap = f" (capped to the latest {self.TC_MAX:,} candles, about {self.TC_MAX * gran / 86400:.1f} days)" if n > self.TC_MAX else ""
-            note.config(text=f"Coins: {', '.join(coins)}   |   {min(n, self.TC_MAX):,} candles per coin{cap}   |   "
+            try:
+                a, b = per["bounds"]()
+            except ValueError:
+                return note.config(text="Write the start date like 2020-03-02.")
+            n = self.est_candles(a, b, per["gran"]())
+            cap = f" (only the latest {self.TC_MAX:,} are used: pick bigger candles for the whole period)" if n > self.TC_MAX else ""
+            note.config(text=f"Coins: {', '.join(coins)}   |   about {min(n, self.TC_MAX):,} candles per coin{cap}   |   "
                              f"about {min(n, self.TC_MAX) * int(passes.get() or 1):,} farm decisions in total")
-        for var in (length, candle, passes):
+        for var in (per["length"], per["candle"], per["when"], per["date"], passes):
             var.trace_add("write", update_note)
         update_note()
         row = ttk.Frame(f)
@@ -3960,19 +4510,23 @@ class App:
         Tip(b_teach, "Gives your farm the camp's memory: its elders (nudge future eggs), its post-trade review, its mutation "
                      "memory and its season champions (woken up when their market mood comes back).")
         Tip(b_lib, "Saves the passed bots to your Library, with their exam result in their memory.")
-        ttk.Button(bb, text="Close", command=w.destroy).pack(side="right")
+        ttk.Button(bb, text="Close", command=lambda: w.winfo_toplevel().destroy()).pack(side="right")
         st = dict(stop=False, res=None)
 
         def run():
-            mins = dict(self.TC_LENGTHS)[length.get()]
-            gran = dict(self.TC_CANDLES)[candle.get()]
+            try:
+                pa, pb = per["bounds"]()
+            except ValueError as e:
+                return messagebox.showerror("Training camp", str(e), parent=w)
+            gran = per["gran"]()
+            per["save"]()
             try:
                 n_pass = min(5, max(1, int(passes.get())))
                 cap = min(200, max(14, int(float(size.get()))))
             except ValueError:
                 return messagebox.showerror("Training camp", "Farm size must be a number (14 to 200).", parent=w)
             ex = {"None": 0.0, "15%": 0.15, "25%": 0.25, "35%": 0.35}[exam.get()]
-            self.cfg.update(tc_len=length.get(), tc_candle=candle.get(), tc_passes=n_pass, tc_size=cap, tc_exam=exam.get(),
+            self.cfg.update(tc_passes=n_pass, tc_size=cap, tc_exam=exam.get(),
                             tc_start=start.get())
             E.save_json(CONFIG_PATH, self.cfg)
             seeds = []
@@ -3982,7 +4536,6 @@ class App:
                 seeds = [dict(b) for b in self.hof()]
             elif start.get() == "Library":
                 seeds = [dict(b) for b in self.library()]
-            count = min(self.TC_MAX, max(300, mins * 60 // gran))
             opts = E.tournament_opts(self.settings)
             fee, slip = E.cost_model(self.settings)
             pct, cash, quote = self.settings["trade_pct"] / 100, self.start_cash, self.quote
@@ -4004,14 +4557,11 @@ class App:
 
             def work():
                 try:
-                    data = {}
-                    for i, c_ in enumerate(coins):
-                        self.q.put(("call", lambda i=i, c_=c_: status.config(text=f"Loading {c_} ({i + 1}/{len(coins)})...")
-                                    if w.winfo_exists() else None))
-                        data[c_] = E.fetch_ohlcv(c_, gran, count, quote)
-                    L = min(len(d["c"]) for d in data.values())
-                    closes = {c_: d["c"][-L:] for c_, d in data.items()}
-                    extra = {c_: {k: d[k][-L:] for k in ("h", "l", "v")} for c_, d in data.items()}
+                    closes, extra, info = self.load_stretch(
+                        coins, gran, pa, pb, lambda txt: self.q.put(("call", lambda: status.config(text=txt) if w.winfo_exists() else None)),
+                        self.TC_MAX)
+                    if info["bars"] < 300:
+                        raise RuntimeError(f"only {info['bars']} candles in that period: pick a longer period or smaller candles")
                     res = E.train_farm(closes, extra, opts, cap=cap, passes=n_pass, exam_frac=ex, seed_genes=seeds,
                                        start_cash=cash, fee=fee, pct=pct, evolve=evolve, params=params,
                                        retire_steps=retire, progress=prog, stop=lambda: st["stop"])
@@ -4060,10 +4610,10 @@ class App:
 
         def bring():
             if not self.tourn or not self.seeded:
-                return messagebox.showinfo("Training camp", "Start your farm first (Wildcard), then bring the bots over.", parent=w)
+                return self._nothing(parent, "Training camp", "Start your farm first (Wildcard), then bring the bots over.", parent=w)
             picks = chosen()
             if not picks:
-                return messagebox.showinfo("Training camp", "No bots passed. Select rows to bring some anyway.", parent=w)
+                return self._nothing(parent, "Training camp", "No bots passed. Select rows to bring some anyway.", parent=w)
             closes = {c_: self.hist[c_] for c_ in self.session_coins}
             n = 0
             for r in picks:
@@ -4088,7 +4638,7 @@ class App:
 
         def teach():
             if not self.tourn:
-                return messagebox.showinfo("Training camp", "Start your farm first (Wildcard).", parent=w)
+                return self._nothing(parent, "Training camp", "Start your farm first (Wildcard).", parent=w)
             E.teach_from(self.tourn, st["res"]["tourn"])
             self.save_farm(force=True)
             self.write("Your farm learned from the training camp: elders, post-trade review, mutation memory and season champions.", "good")
@@ -4096,7 +4646,7 @@ class App:
         def save_lib():
             picks = chosen()
             if not picks:
-                return messagebox.showinfo("Training camp", "No bots passed. Select rows to save some anyway.", parent=w)
+                return self._nothing(parent, "Training camp", "No bots passed. Select rows to save some anyway.", parent=w)
             t = st["res"]["tourn"]
             ids = {id(r["v"]) for r in picks}
             rows = [dict(r, bar_minutes=st["res"]["gran"] / 60) for r in t.board() if id(r["v"]) in ids]
@@ -4116,85 +4666,130 @@ class App:
         b_lib.config(command=save_lib)
 
     # ---------------- free roam (self-study) ----------------
-    ROAM_CANDLES = (300, 900, 3600, 21600)  # 5 min, 15 min, 1 hr, 6 hr: the farm picks one each study
+    ROAM_CANDLES = (300, 900, 3600, 21600, 86400)  # 5 min to 1 day: the farm picks one each study
 
     def roam_path(self):
         return os.path.join(E.HOME_DIR, "free-roam.json")
 
     def start_free_roam(self):
-        """Free roam: the farm goes back in time on its own. With Free roam mode ON it studies back to back; otherwise
-        (Settings > Learning) it studies quietly now and then while idle. Each study either backtests some of its own
-        bots on a random stretch of history, or runs a small practice farm there; every lesson is saved."""
+        """Free roam: the farm goes back in time on its own, ONLY while Free roam is switched ON (nothing runs in the
+        background otherwise). Each study either backtests some of its own
+        bots on a stretch of history (anywhere back to 2015), or runs a small practice farm there; every lesson is saved."""
         if getattr(self, "_roam_thread", None) and self._roam_thread.is_alive():
             return
         saved = E.load_json(self.roam_path(), {}) or {}
         self.roam_log = list(saved.get("log") or [])[-300:]
         self.roam_n = int(saved.get("n", len(self.roam_log)))
         self.roam_now = None
+        self.roam_err = None
+        self.roam_feed = deque(maxlen=400)
+        self.roam_trades = 0
 
         def loop():
             k = 0
             while True:
-                time.sleep(2)
+                time.sleep(1)
                 try:
-                    s_ = self.settings
                     t = self.tourn
-                    mode = bool(self.cfg.get("roam_on"))
-                    if t is None or not self.session_coins:
+                    if not self.cfg.get("roam_on") or t is None or not self.session_coins:
                         continue
-                    if not mode:
-                        if not s_.get("free_roam", True) or (self.running and not s_.get("free_roam_running", False)):
-                            continue
-                    wait = 3 if mode else (900 if self.running else 120)
+                    wait = self.roam_wait()
                     if time.time() - getattr(self, "_roam_last", 0) < wait:
                         continue
                     k += 1
-                    if k % 4 == 0:
+                    if k % 3 == 0:
                         self._roam_camp(t)
                     else:
                         self._roam_check(t)
+                    self.roam_err = None
                     self._roam_last = time.time()
                 except E.TrainingStopped:  # the farm changed (reset, new session): just move on
                     self.roam_now = None
-                except Exception:
+                except Exception as e:
                     self.roam_now = None
-                    self.q.put(("log", (self._record_error("free roam") or "Free roam hit a problem; it will try again.", "warn")))
-                    time.sleep(30)
+                    msg = str(e) or e.__class__.__name__
+                    self.roam_err = (time.time(), msg)
+                    self._record_error("free roam")
+                    self.q.put(("log", (f"Free roam hit a problem: {msg[:160]}. It tries again in a minute.", "warn")))
+                    self._roam_last = time.time() - max(0, self.roam_wait() - 60)
         self._roam_thread = threading.Thread(target=loop, daemon=True)
         self._roam_thread.start()
 
+    def roam_wait(self):
+        return 3
+
+    def roam_check_on(self, t=None):
+        """Stops the study in progress as soon as Free roam is switched off (or the farm changes)."""
+        if not self.cfg.get("roam_on") or (t is not None and self.tourn is not t):
+            raise E.TrainingStopped()
+
+    def roam_watching(self):
+        """Is the Free roam screen open? (A flag the screen sets: background threads must never touch Tk.)"""
+        return time.time() - getattr(self, "_roam_seen", 0) < 2
+
+    def _roam_feed(self, who, c, tr, ts, kind):
+        """One trade from a Free roam study, for the live trade list."""
+        if kind == "test":
+            self.roam_check_on()
+        self.roam_trades = getattr(self, "roam_trades", 0) + 1
+        o = tr.get("contract")
+        what = E.contract_text(dict(o, under=c)) if o else c
+        self.roam_feed.append(dict(t=ts, who=who, side=tr["side"], what=what, price=tr.get("price"),
+                                   pl=tr.get("pl"), usd=tr.get("usd"), kind=kind))
+        if self.roam_watching():
+            time.sleep(0.03 if kind == "test" else 0.004)  # someone's watching: let the trades scroll by
+
     def _roam_pick(self, rng, min_bars=400):
-        """The farm chooses where to learn: a candle size, then a stretch of history it has studied least."""
-        gran = rng.choice(self.ROAM_CANDLES)
+        """The farm chooses where to learn: a candle size, then a stretch of history it has studied least (any time
+        back to 2015), downloads it if needed, and lines the coins up."""
         coins = list(self.session_coins)
-        self.roam_now = dict(kind="choosing", text="Choosing where to learn next...", gran=gran, coins=coins, t0=time.time())
-        data = {c: E.fetch_ohlcv(c, gran, 3000, self.quote) for c in coins}
-        L = min(len(d["c"]) for d in data.values())
-        span = min(L, rng.randint(min_bars, max(min_bars, min(L, 1500))))
         now = time.time()
-        covered = [(x["start"], x["end"]) for x in self.roam_log[-120:]]
-        best, best_score = 0, None
-        for _ in range(8):  # prefer stretches it hasn't studied yet
-            a = rng.randint(0, max(0, L - span))
-            st, en = now - (L - a) * gran, now - (L - a - span) * gran
-            overlap = sum(max(0, min(en, e) - max(st, s0)) for s0, e in covered)
-            if best_score is None or overlap < best_score:
-                best, best_score = a, overlap
-        a = best
-        closes = {c: d["c"][a:a + span] for c, d in data.items()}
-        extra = {c: {x: d[x][a:a + span] for x in ("h", "l", "v")} for c, d in data.items()}
-        start, end = now - (L - a) * gran, now - (L - a - span) * gran
+        earliest = max(E.HIST_START, datetime(int(self.settings.get("roam_from", 2015)), 7, 20).timestamp())
+        covered = [(x["start"], x["end"]) for x in self.roam_log[-150:]]
+        last_err = None
+        for _attempt in range(3):
+            gran = rng.choice(self.ROAM_CANDLES)
+            n = rng.randint(min_bars, max(min_bars, 1500))
+            days = n / E.bars_per_day(gran) * 1.02
+            hi = now - days * 86400
+            if hi <= earliest:
+                a_opts = [earliest]
+                days = (now - earliest) / 86400
+            else:
+                a_opts = [rng.uniform(earliest, hi) for _ in range(10)]
+            best = min(a_opts, key=lambda a: sum(max(0, min(a + days * 86400, e) - max(a, s0)) for s0, e in covered))
+            a, b = best, min(now, best + days * 86400)
+            self.roam_now = dict(kind="Getting ready", phase="download", gran=gran, coins=coins, start=a, end=b,
+                                 text=f"Fetching {E.fmt_bar(gran / 60)} candles for {self._when(a, True)} to {self._when(b, True)}",
+                                 t0=time.time(), done=0, total=1)
+            try:
+                closes, extra, info = self.load_stretch(
+                    coins, gran, a, b, note=lambda txt: (self.roam_check_on(), self.roam_now and self.roam_now.update(text=txt)),
+                    max_bars=2500)
+                if info["bars"] >= min_bars // 2:
+                    break
+                last_err = RuntimeError("too few candles there")
+            except RuntimeError as e:
+                if "history" not in str(e).lower() and "candles" not in str(e).lower():
+                    raise
+                last_err = e
+        else:
+            raise last_err or RuntimeError("couldn't find a stretch of history to study")
+        times = next(iter(extra.values()))["t"]
+        span = len(times)
         hold = sum(closes[c][-1] / closes[c][0] for c in coins) / len(coins) - 1
         moods = [E.market_mood(closes[c])[0] for c in coins]
         known = [m for m in moods if m != "unknown"]
-        prev = [sum(closes[c][i] / closes[c][0] for c in coins) / len(coins) for i in range(0, span, max(1, span // 300))]
-        info = dict(gran=gran, coins=coins, start=start, end=end, bars=span, hold=hold, preview=prev,
-                    mood=max(set(known), key=known.count) if known else "unknown", oldest=now - L * gran)
+        step = max(1, span // 300)
+        prev = [sum(closes[c][i] / closes[c][0] for c in coins) / len(coins) for i in range(0, span, step)]
+        info = dict(gran=gran, coins=coins, start=times[0], end=times[-1], bars=span, hold=hold, preview=prev,
+                    preview_t=[times[i] for i in range(0, span, step)], oldest=earliest,
+                    mood=max(set(known), key=known.count) if known else "unknown")
         return closes, extra, info
 
     @staticmethod
-    def _when(ts):
-        return datetime.fromtimestamp(ts).strftime("%b %d %H:%M")
+    def _when(ts, year=False):
+        return datetime.fromtimestamp(ts).strftime("%b %d %Y" if year else "%b %d %Y %H:%M")
 
     def _roam_finish(self, rec):
         self.roam_log.append(rec)
@@ -4207,7 +4802,7 @@ class App:
             pass
 
     def _roam_check(self, t):
-        """Self-backtest: the leader and a few others test themselves on the chosen stretch."""
+        """Self-test: the leader and a few others backtest themselves on the chosen stretch."""
         import random as _r
         rng = _r.Random()
         vars_ = list(t.vars)
@@ -4216,15 +4811,24 @@ class App:
         picks = list(dict.fromkeys(([t.active[0]] if t.active else []) + rng.sample(vars_, min(3, len(vars_)))))
         closes, extra, info = self._roam_pick(rng)
         names = [E.bot_nickname(v.key()) for v in picks]
-        self.roam_now = dict(info, kind="Self-test", text=f"{len(picks)} bots are testing themselves", bots=names, done=0,
-                             total=len(picks), t0=time.time())
+        self.roam_now = dict(info, kind="Self-test", phase="study", text=f"{len(picks)} bots are testing themselves",
+                             bots=names, done=0, total=len(picks), t0=time.time())
+        self.roam_feed.append(dict(kind="sep", text=f"Self-test on {self._when(info['start'], True)} to "
+                                                    f"{self._when(info['end'], True)}  ({E.fmt_bar(info['gran'] / 60)} candles)"))
         fee, slip = E.cost_model(self.settings)
         out = []
         for i, v in enumerate(picks):
             if self.tourn is not t:
                 return
             self.roam_now.update(done=i, text=f"{names[i]} is testing itself ({i + 1} of {len(picks)})")
-            out.append((v, E.backtest_bot(v, closes, extra, self.start_cash, fee, self.settings["trade_pct"] / 100, slip)))
+
+            def prog(d, n, i=i):
+                self.roam_check_on(t)
+                if self.roam_now:
+                    self.roam_now["done"] = i + d / max(1, n)
+            out.append((v, E.backtest_bot(v, closes, extra, self.start_cash, fee, self.settings["trade_pct"] / 100, slip,
+                                          progress=prog,
+                                          on_trade=lambda c, tr, ts, nm=names[i]: self._roam_feed(nm, c, tr, ts, "test"))))
 
         def apply():
             if self.tourn is not t:
@@ -4237,11 +4841,11 @@ class App:
             good = sum(1 for x in res if x[1] > 0)
             rec = dict(time=time.time(), kind="Self-test", start=info["start"], end=info["end"], gran=info["gran"],
                        bars=info["bars"], hold=round(info["hold"] * 100, 2), mood=info["mood"], results=res,
-                       summary=f"{good} of {len(res)} beat holding; lessons saved to their memories")
+                       summary=f"{good} of {len(res)} beat holding")
             self._roam_finish(rec)
-            if not self.cfg.get("roam_on"):
-                self.write(f"◇ Free roam: {len(res)} bots tested themselves on {self._when(info['start'])} to "
-                           f"{self._when(info['end'])}; {good} beat holding. Lessons saved.")
+            if False:
+                self.write(f"◇ Free roam: {len(res)} bots tested themselves on {self._when(info['start'], True)} to "
+                           f"{self._when(info['end'], True)}; {good} beat holding. Lessons saved.")
         self.q.put(("call", apply))
 
     def _roam_camp(self, t):
@@ -4250,18 +4854,26 @@ class App:
         import random as _r
         rng = _r.Random()
         closes, extra, info = self._roam_pick(rng, 700)
-        seeds = [E._genes(v) for v in (t.active[:4] or t.vars[:4])]
-        self.roam_now = dict(info, kind="Practice farm", text="A practice farm is living through this stretch",
-                             bots=[E.bot_nickname(v.key()) for v in (t.active[:4] or t.vars[:4])], done=0, total=1, t0=time.time())
+        lead = t.active[:4] or t.vars[:4]
+        seeds = [E._genes(v) for v in lead]
+        self.roam_now = dict(info, kind="Practice farm", phase="study", text="A practice farm is living through this stretch",
+                             bots=[E.bot_nickname(v.key()) for v in lead], done=0, total=1, t0=time.time())
+        self.roam_feed.append(dict(kind="sep", text=f"Practice farm on {self._when(info['start'], True)} to "
+                                                    f"{self._when(info['end'], True)}  ({E.fmt_bar(info['gran'] / 60)} candles)"))
         fee, slip = E.cost_model(self.settings)
+        names = {}
 
         def prog(done, total, text):
             if self.roam_now:
                 self.roam_now.update(done=done, total=total, text=f"Practice farm: {text}")
+
+        def on_trade(v, c, tr, ts):
+            nm = names.get(id(v)) or names.setdefault(id(v), E.bot_nickname(v.key()))
+            self._roam_feed(nm, c, tr, ts, "farm")
         res = E.train_farm(closes, extra, E.tournament_opts(self.settings), cap=20, passes=1, exam_frac=0.25,
                            seed_genes=seeds, start_cash=self.start_cash, fee=fee, pct=self.settings["trade_pct"] / 100,
                            evolve=int(self.settings["evolve_every"]), params=self.settings["params"], progress=prog,
-                           stop=lambda: self.tourn is not t)
+                           stop=lambda: self.tourn is not t or not self.cfg.get("roam_on"), on_trade=on_trade)
 
         def apply():
             if self.tourn is not t:
@@ -4279,15 +4891,17 @@ class App:
                     grad = E.bot_nickname(v.key())
                     self.refresh_board()
             gen = max((v.gen for v in res["tourn"].vars), default=0)
+            top = sorted(res["results"], key=lambda r: -((r["exam_edge"] if r["exam_edge"] is not None else r["train_edge"]) or 0))[:5]
             rec = dict(time=time.time(), kind="Practice farm", start=info["start"], end=info["end"], gran=info["gran"],
                        bars=info["bars"], hold=round(info["hold"] * 100, 2), mood=info["mood"],
-                       results=[(E.bot_nickname(r["v"].key()), round((r["exam_edge"] or 0) * 100, 2), r["trades"]) for r in passed[:5]],
-                       graduate=grad, summary=f"{gen} generations, {len(passed)} passed the exam"
-                                              + (f"; {grad} joined your farm" if grad else "") + "; farm memory updated")
+                       results=[(E.bot_nickname(r["v"].key()), round(((r["exam_edge"] if r["exam_edge"] is not None else r["train_edge"]) or 0) * 100, 2),
+                                 r["trades"]) for r in top],
+                       passed=len(passed), graduate=grad,
+                       summary=f"{gen} generations, {len(passed)} passed the exam" + (f"; {grad} joined your farm" if grad else ""))
             self._roam_finish(rec)
-            if not self.cfg.get("roam_on"):
-                self.write(f"◇ Free roam: a practice farm lived through {self._when(info['start'])} to "
-                           f"{self._when(info['end'])}. {rec['summary']}.")
+            if False:
+                self.write(f"◇ Free roam: a practice farm lived through {self._when(info['start'], True)} to "
+                           f"{self._when(info['end'], True)}. {rec['summary']}.")
         self.q.put(("call", apply))
 
     def toggle_roam(self, on=None):
@@ -4295,20 +4909,47 @@ class App:
         self.cfg["roam_on"] = bool(on)
         E.save_json(CONFIG_PATH, self.cfg)
         self._roam_last = 0
-        self.write("◇ Free roam mode ON: the farm is going back in time to learn on its own." if on else
-                   "◇ Free roam mode OFF.", "good" if on else None)
+        if on and not self.tourn:
+            self.write("◇ Free roam mode ON. It starts as soon as there's a farm: press Start once (you can pause it "
+                       "straight away) and Free roam keeps learning.", "warn")
+        else:
+            self.write("◇ Free roam mode ON: the farm is going back in time to learn on its own." if on else
+                       "◇ Free roam mode OFF: it stops the study in progress, and nothing learns in the background.", "good" if on else None)
         if hasattr(self, "roam_btn"):
             self.roam_btn.config(text="◇ Free roam: ON" if on else "◇ Free roam")
         self.start_free_roam()
 
-    def open_roam(self):
-        """The Free roam screen: where in the past the farm is learning right now, what it has covered, and what it found."""
-        if getattr(self, "roam_win", None) is not None and self.roam_win.winfo_exists():
-            return self.roam_win.lift()
+    def roam_bots(self):
+        """Every bot Free roam has tested, best first: [dict(name, n, wins, avg, best, worst, last, farm)]."""
+        agg = {}
+        for r in self.roam_log:
+            for nm, e, tr in r.get("results", []):
+                a = agg.setdefault(nm, dict(name=nm, n=0, wins=0, tot=0.0, best=None, worst=None, last=0, trades=0, kinds=set()))
+                a["n"] += 1
+                a["wins"] += e > 0
+                a["tot"] += e
+                a["trades"] += tr
+                a["best"] = e if a["best"] is None else max(a["best"], e)
+                a["worst"] = e if a["worst"] is None else min(a["worst"], e)
+                a["last"] = max(a["last"], r["time"])
+                a["kinds"].add(r["kind"])
+                if r.get("graduate") == nm:
+                    a["grad"] = True
+        alive = {E.bot_nickname(v.key()) for v in (self.tourn.vars if self.tourn else [])}
+        out = []
+        for a in agg.values():
+            a["avg"] = a["tot"] / a["n"]
+            a["farm"] = a["name"] in alive
+            out.append(a)
+        return sorted(out, key=lambda a: (-(a["avg"] > 0 and a["wins"] * 2 >= a["n"]), -a["avg"]))
+
+    def open_roam(self, parent=None):
+        """The Free roam screen: an in-session banner, where in the past it's learning, the trades as they happen,
+        and its findings sorted best to worst."""
+        if parent is None:  # it lives as a tab in the learning window
+            return self.open_hub('learning', 'Free roam')
         self.start_free_roam()
-        w = self.roam_win = tk.Toplevel(self.root)
-        w.title("Free roam")
-        w.geometry(f"1080x{min(860, self.root.winfo_screenheight() - 80)}")
+        w = self.roam_win = parent
         w.configure(bg=BG)
         top = tk.Frame(w, bg=BG, padx=12, pady=10)
         top.pack(fill="x")
@@ -4318,108 +4959,255 @@ class App:
         tog.pack(side="left", padx=14)
         state_lbl = tk.Label(top, text="", bg=BG, fg=MUTED, font=("", 9), justify="left", anchor="w")
         state_lbl.pack(side="left", fill="x", expand=True)
-        tog.config(command=lambda: (self.toggle_roam(), paint()))
-        tk.Label(w, bg=BG, fg=MUTED, wraplength=1040, justify="left", anchor="w", padx=12, text=(
-            "The farm goes back in time on its own. For every study it picks a candle size (5 min to 6 hours) and a stretch "
-            "of the past it has studied least, then either lets a few of its bots test themselves there, or sends a small "
-            "practice farm through it. Every lesson is saved: rule evidence and weak coins to each bot's memory, the "
-            "practice farm's elders, season champions and post-trade review to your farm, and its best graduate joins "
-            "your farm. Your account never trades in Free roam.")).pack(fill="x")
-        now_f = tk.Frame(w, bg=CARD, padx=12, pady=8, highlightthickness=1, highlightbackground=LINE)
-        now_f.pack(fill="x", padx=12, pady=(8, 0))
-        now_t = tk.Label(now_f, text="", bg=CARD, fg=TEXT, font=("", 11, "bold"), anchor="w", justify="left")
-        now_t.pack(fill="x")
-        now_d = tk.Label(now_f, text="", bg=CARD, fg=MUTED, anchor="w", justify="left", wraplength=1000)
-        now_d.pack(fill="x")
-        pbar = ttk.Progressbar(now_f, mode="determinate")
-        pbar.pack(fill="x", pady=(4, 0))
-        tk.Label(w, text="WHERE IT IS LEARNING  (the last few months; shaded = already studied, bright = right now)",
-                 bg=BG, fg=ACCENT, font=("", 8, "bold"), anchor="w", padx=12).pack(fill="x", pady=(10, 0))
-        tl = tk.Canvas(w, height=74, bg=CARD, highlightthickness=0)
-        tl.pack(fill="x", padx=12)
-        tk.Label(w, text="THE STRETCH BEING STUDIED  (average of your coins; grey line = where it started)",
-                 bg=BG, fg=ACCENT, font=("", 8, "bold"), anchor="w", padx=12).pack(fill="x", pady=(8, 0))
-        pc = tk.Canvas(w, height=130, bg=CARD, highlightthickness=0)
-        pc.pack(fill="x", padx=12)
+
+        # --- the session banner (animated while it studies)
+        ban = tk.Canvas(w, height=78, bg=CARD, highlightthickness=1, highlightbackground=LINE)
+        ban.pack(fill="x", padx=12)
+
+        # --- middle: where/what on the left, live trades on the right
+        mid = tk.Frame(w, bg=BG)
+        mid.pack(fill="x", padx=12, pady=(8, 0))
+        left = tk.Frame(mid, bg=BG)
+        left.pack(side="left", fill="both", expand=True)
+        right = tk.Frame(mid, bg=BG, width=470)
+        right.pack(side="right", fill="y", padx=(10, 0))
+        right.pack_propagate(False)
+        tk.Label(left, text="WHERE IT IS LEARNING  (2015 to now; blue = already studied, orange = right now)",
+                 bg=BG, fg=ACCENT, font=("", 8, "bold"), anchor="w").pack(fill="x")
+        tl = tk.Canvas(left, height=70, bg=CARD, highlightthickness=0)
+        tl.pack(fill="x")
+        tk.Label(left, text="THE STRETCH BEING STUDIED  (average of your coins; orange ticks = big news days)",
+                 bg=BG, fg=ACCENT, font=("", 8, "bold"), anchor="w").pack(fill="x", pady=(8, 0))
+        pc = tk.Canvas(left, height=150, bg=CARD, highlightthickness=0)
+        pc.pack(fill="x")
+        feed_h = tk.Label(right, text="LIVE TRADES", bg=BG, fg=ACCENT, font=("", 8, "bold"), anchor="w")
+        feed_h.pack(fill="x")
+        ff = tk.Frame(right, bg=BG)
+        ff.pack(fill="both", expand=True)
+        feed = ttk.Treeview(ff, columns=("when", "who", "what", "res"), show="headings", height=9)
+        for c_, lab, wd, an in (("when", "Market time", 112, "w"), ("who", "Bot", 110, "w"), ("what", "Trade", 150, "w"),
+                                ("res", "Result", 70, "e")):
+            feed.heading(c_, text=lab)
+            feed.column(c_, width=wd, anchor=an, stretch=c_ == "what")
+        fsb = ttk.Scrollbar(ff, orient="vertical", command=feed.yview)
+        feed.configure(yscrollcommand=fsb.set)
+        fsb.pack(side="right", fill="y")
+        feed.pack(side="left", fill="both", expand=True)
+        feed.tag_configure("win", foreground=GREEN)
+        feed.tag_configure("loss", foreground=RED)
+        feed.tag_configure("open", foreground=TEXT)
+        feed.tag_configure("sep", foreground=ACCENT)
+
         stats = tk.Label(w, text="", bg=BG, fg=TEXT, anchor="w", justify="left", padx=12, font=("", 9))
         stats.pack(fill="x", pady=(8, 0))
-        learn = tk.Label(w, text="", bg=BG, fg=MUTED, anchor="w", justify="left", padx=12, wraplength=1040, font=("", 9))
-        learn.pack(fill="x", pady=(2, 0))
-        tk.Label(w, text="STUDY LOG", bg=BG, fg=ACCENT, font=("", 8, "bold"), anchor="w", padx=12).pack(fill="x", pady=(8, 0))
-        box = tk.Frame(w, bg=BG)
-        box.pack(fill="both", expand=True, padx=12, pady=(0, 10))
-        log = self.make_tree(box, ("when", "kind", "stretch", "candles", "market", "result"), (100, 95, 220, 60, 190, 380),
-                             ("When", "Study", "Stretch of the past", "Candles", "Market then", "What it learned"))
-        st = dict(n=-1)
+
+        # --- results, organised
+        nb = ttk.Notebook(w)
+        nb.pack(fill="both", expand=True, padx=12, pady=(4, 10))
+        t1 = tk.Frame(nb, bg=BG)
+        t2 = tk.Frame(nb, bg=BG)
+        t3 = tk.Frame(nb, bg=BG)
+        nb.add(t1, text="  Bots it tested: best to worst  ")
+        nb.add(t2, text="  Study log  ")
+        nb.add(t3, text="  What the results do  ")
+        bots = self.make_tree(t1, ("who", "n", "wins", "avg", "best", "worst", "mode", "why"),
+                              (130, 50, 90, 90, 70, 70, 90, 420),
+                              ("Bot", "Tests", "Beat holding", "Avg vs holding", "Best", "Worst", "Now", "What it means"))
+        bots.tag_configure("good", foreground=GREEN)
+        bots.tag_configure("mixed", foreground="#f59e0b")
+        bots.tag_configure("bad", foreground=RED)
+        fr = tk.Frame(t2, bg=BG)
+        fr.pack(fill="x", pady=(4, 2))
+        tk.Label(fr, text="Show", bg=BG, fg=MUTED).pack(side="left")
+        flt = tk.StringVar(value="All")
+        ttk.Combobox(fr, textvariable=flt, values=["All", "Good finds", "Bad results", "Self-tests", "Practice farms"],
+                     state="readonly", width=14).pack(side="left", padx=6)
+        lb = tk.Frame(t2, bg=BG)
+        lb.pack(fill="both", expand=True)
+        log = self.make_tree(lb, ("time", "kind", "strategy", "candles", "status", "why"), (100, 95, 230, 60, 200, 420),
+                             ("Studied", "Study", "Stretch of the past", "Candles", "Market then (holding)", "Result"))
+        log.tag_configure("good", foreground=GREEN)
+        log.tag_configure("bad", foreground=RED)
+        log.tag_configure("mixed", foreground="#f59e0b")
+        tk.Label(t3, bg=BG, fg=TEXT, justify="left", anchor="nw", wraplength=1100, padx=8, pady=8, font=("", 9), text=(
+            "Free roam never trades your account. It works on your farm's bots and memory:\n\n"
+            "SELF-TEST  A few of your bots (always including the leader) trade a stretch of the past on their own.\n"
+            "   • Beat just holding (with 4+ trades): the bot becomes an ELDER, so new eggs are more likely to copy it, and "
+            "its rules gain evidence and spread to its children.\n"
+            "   • Did worse than holding: nothing is deleted, but its costly rules and the coins it struggles with are "
+            "written into its memory, so its children drop those rules, and the farm's post-trade review learns which "
+            "never-rules would have stopped its losing buys.\n"
+            "   • Every result is also kept in the bot's memory (its card shows its tests).\n\n"
+            "PRACTICE FARM  A small farm, started from your leaders, lives through a stretch, breeding as it goes, then "
+            "sits an exam on the last quarter it never trained on.\n"
+            "   • Bots that beat holding in training AND the exam pass. The best one joins your farm as a 'Free roam "
+            "graduate' (it still has to prove itself on live prices).\n"
+            "   • Your farm also learns the practice farm's memory: its elders, season champions, post-trade review and "
+            "which kinds of mutation made winners.\n\n"
+            "HOW TO READ THE 'BEST TO WORST' TAB  Green bots beat holding in at least half their tests and on average: "
+            "they're your strongest candidates for the Hall of Fame. Orange = mixed (could be luck). Red = usually worse "
+            "than holding. 'Now' shows whether the bot is still in your farm. One good test can be luck; look for bots "
+            "that win across many different stretches and market moods.")).pack(fill="both", expand=True)
+
+        st = dict(n=-1, flt="", feed=0, phase=0.0, fb=None)
 
         def paint():
             if not w.winfo_exists():
                 return
+            try:
+                if w.winfo_toplevel().state() != "iconic":
+                    self._roam_seen = time.time()
+            except tk.TclError:
+                pass
             on = bool(self.cfg.get("roam_on"))
             tog.config(text="ON  —  click to stop" if on else "OFF  —  click to start", bg=GREEN if on else "#4b5563",
                        activebackground=GREEN if on else "#4b5563")
             if not self.tourn:
-                state_lbl.config(text="Start your farm once (Wildcard) so there are bots to study with; it can be paused "
-                                      "afterwards and Free roam keeps learning.")
+                state_lbl.config(text="There's no farm yet: press Start once so there are bots to study with (pause it "
+                                      "straight away if you like). Free roam then keeps learning, even when the market is closed.",
+                                 fg="#f59e0b")
             elif on:
-                state_lbl.config(text="Free roam mode: studying back to back" + (" (alongside live prices)" if self.running else
-                                                                                 " (the farm is paused, so it has the computer to itself)"))
+                state_lbl.config(text="Studying back to back" + (" (alongside live prices)" if self.running else
+                                                                 " (the farm is paused, so it has the computer to itself)"), fg=MUTED)
             else:
-                state_lbl.config(text="Off. " + ("It still studies now and then while idle (Settings > Learning)."
-                                                 if self.settings.get("free_roam", True) else "Idle studies are off too."))
+                state_lbl.config(text="Off. Nothing studies in the background: Free roam only learns while this is ON.", fg=MUTED)
             cur = self.roam_now
-            if cur and cur.get("start"):
-                now_t.config(text=f"{cur['kind']}: {self._when(cur['start'])}  →  {self._when(cur['end'])}   "
-                                  f"({(cur['end'] - cur['start']) / 86400:.1f} days, {E.fmt_bar(cur['gran'] / 60)} candles)")
-                now_d.config(text=f"{cur.get('text', '')}.   Coins: {', '.join(cur['coins'])}.   Market then: "
-                                  f"{MOOD_TEXT.get(cur['mood'], cur['mood'])}, just holding {cur['hold'] * 100:+.1f}%."
-                                  + (f"   Bots: {', '.join(cur.get('bots', [])[:6])}" if cur.get("bots") else "")
-                                  + f"   Running for {int(time.time() - cur['t0'])} s.")
-                pbar.config(value=100 * cur.get("done", 0) / max(1, cur.get("total", 1)))
-            elif cur:
-                now_t.config(text=cur.get("text", ""))
-                now_d.config(text="")
-                pbar.config(value=0)
-            else:
-                now_t.config(text="Resting between studies" if (on or self.settings.get("free_roam", True)) and self.tourn else "Not studying")
-                now_d.config(text="")
-                pbar.config(value=0)
             draw_timeline(cur)
             draw_price(cur)
+            fill_feed()
             L_ = self.roam_log
-            days = covered_days()
             res = [x for r in L_ for x in r.get("results", [])]
-            best = max(res, key=lambda x: x[1]) if res else None
             grads = [r["graduate"] for r in L_ if r.get("graduate")]
-            stats.config(text=(f"Studies: {getattr(self, 'roam_n', 0)}   |   past covered: {days:.1f} days   |   bot self-tests: "
-                               f"{sum(len(r.get('results', [])) for r in L_ if r['kind'] == 'Self-test')}   |   practice farms: "
-                               f"{sum(1 for r in L_ if r['kind'] == 'Practice farm')}   |   graduates adopted: {len(grads)}"
-                               + (f"   |   best find: {best[0]} {best[1]:+.1f}% vs holding" if best else "")))
-            t = self.tourn
-            if t:
-                rv = sorted(((k, x) for k, x in t.review.items() if k in E.VETOES), key=lambda kv: -kv[1][0])[:3]
-                ms = sorted(((k, x) for k, x in t.mut_stats.items() if x[0] >= 5), key=lambda kv: -(kv[1][1] / kv[1][0]))[:3]
-                moods = {}
-                for r in L_[-60:]:
-                    for _, e, _ in r.get("results", []):
-                        moods.setdefault(r.get("mood"), []).append(e)
-                mtxt = ", ".join(f"{MOOD_TEXT.get(m, m)} {sum(v) / len(v):+.1f}%" for m, v in moods.items() if m and v)
-                learn.config(text=(
-                    "What the farm is learning:  "
-                    + (f"never-rules that would have stopped the most losing buys: "
-                       + ", ".join(f"{E.VETOES[k]['name']} ({x[0]})" for k, x in rv) + ".  " if rv else "")
-                    + (f"Changes that make winners most often: " + ", ".join(f"{k} ({x[1] / x[0] * 100:.0f}%)" for k, x in ms) + ".  " if ms else "")
-                    + (f"Season champions known: {', '.join(MOOD_TEXT.get(m, m) for m in t.champions)}.  " if t.champions else "")
-                    + (f"Average result by market: {mtxt}." if mtxt else "")))
-            if len(L_) != st["n"]:
-                st["n"] = len(L_)
-                log.delete(*log.get_children())
-                for r in reversed(L_[-200:]):
-                    ex = r["summary"] + (": " + ", ".join(f"{n} {e:+.1f}%" for n, e, _ in r.get("results", [])[:4]) if r.get("results") else "")
-                    log.insert("", "end", values=(datetime.fromtimestamp(r["time"]).strftime("%b %d %H:%M"), r["kind"],
-                                                  f"{self._when(r['start'])} → {self._when(r['end'])}",
-                                                  E.fmt_bar(r["gran"] / 60), f"{MOOD_TEXT.get(r['mood'], r['mood'])} ({r['hold']:+.1f}%)", ex))
-            w.after(1000, paint)
+            stats.config(text=(f"Studies: {getattr(self, 'roam_n', 0)}   |   past covered: {covered_days():.0f} days   |   "
+                               f"bot tests: {len(res)} ({sum(1 for x in res if x[1] > 0)} beat holding)   |   "
+                               f"graduates adopted: {len(grads)}   |   trades this session: {getattr(self, 'roam_trades', 0):,}"))
+            if len(L_) != st["n"] or flt.get() != st["flt"]:
+                st["n"], st["flt"] = len(L_), flt.get()
+                fill_log()
+                fill_bots()
+            w.after(500, paint)
+
+        def verdict(r):
+            res = r.get("results") or []
+            if r["kind"] == "Practice farm":
+                return "good" if r.get("passed") else "bad"
+            good = sum(1 for x in res if x[1] > 0)
+            return "good" if good * 2 > len(res) else "bad" if good == 0 else "mixed"
+
+        def fill_log():
+            log.delete(*log.get_children())
+            f_ = flt.get()
+            for r in reversed(self.roam_log[-300:]):
+                v_ = verdict(r)
+                if (f_ == "Good finds" and v_ != "good") or (f_ == "Bad results" and v_ != "bad") or \
+                        (f_ == "Self-tests" and r["kind"] != "Self-test") or (f_ == "Practice farms" and r["kind"] != "Practice farm"):
+                    continue
+                ex = r["summary"] + (":  " + ",  ".join(f"{n} {e:+.1f}%" for n, e, _ in r.get("results", [])[:4]) if r.get("results") else "")
+                log.insert("", "end", tags=(v_,), values=(
+                    datetime.fromtimestamp(r["time"]).strftime("%b %d %H:%M"), r["kind"],
+                    f"{self._when(r['start'], True)} to {self._when(r['end'], True)}", E.fmt_bar(r["gran"] / 60),
+                    f"{MOOD_TEXT.get(r['mood'], r['mood'])} ({r['hold']:+.1f}%)", ex))
+
+        def fill_bots():
+            bots.delete(*bots.get_children())
+            for a in self.roam_bots():
+                good = a["avg"] > 0 and a["wins"] * 2 >= a["n"]
+                tag = "good" if good else "bad" if a["wins"] == 0 or a["avg"] < -1 else "mixed"
+                means = ("Strong: beats holding across stretches. Elder; a Hall of Fame candidate." if good and a["n"] >= 3 else
+                         "Promising: beat holding, but needs more tests to rule out luck." if good else
+                         "Mixed: wins sometimes. Its weak rules are being weeded out." if tag == "mixed" else
+                         "Usually loses to holding. Its costly rules fade in its children.")
+                if a.get("grad"):
+                    means = "Practice-farm graduate. " + means
+                bots.insert("", "end", tags=(tag,), values=(
+                    a["name"], a["n"], f"{a['wins']} of {a['n']}", f"{a['avg']:+.1f}%", f"{a['best']:+.1f}%", f"{a['worst']:+.1f}%",
+                    "in farm" if a["farm"] else "gone", means))
+
+        def fill_feed():
+            items = list(self.roam_feed)
+            n = getattr(self, "roam_trades", 0) + len(items)
+            if n == st["feed"]:
+                return
+            st["feed"] = n
+            feed.delete(*feed.get_children())
+            for x in reversed(items[-150:]):
+                if x.get("kind") == "sep":
+                    feed.insert("", "end", tags=("sep",), values=("", "", x["text"], ""))
+                    continue
+                pl = x.get("pl")
+                if x["side"] == "buy":
+                    res_, tag = "opened", "open"
+                else:
+                    paid = (x.get("usd") or 0) - (pl or 0)
+                    res_ = f"{(pl / paid * 100 if paid > 0 else 0):+.0f}%" if pl is not None else "closed"
+                    tag = "win" if (pl or 0) > 0 else "loss"
+                feed.insert("", "end", tags=(tag,), values=(
+                    datetime.fromtimestamp(x["t"]).strftime("%b %d %Y %H:%M") if x.get("t") else "",
+                    x["who"], ("buy " if x["side"] == "buy" else "sell ") + x["what"], res_))
+
+        def animate():
+            """The session banner: a spinning ring and a sweeping beam while it studies."""
+            if not w.winfo_exists():
+                return
+            ban.delete("all")
+            W, H = ban.winfo_width(), ban.winfo_height()
+            cur = self.roam_now
+            err = self.roam_err
+            on = bool(self.cfg.get("roam_on"))
+            st["phase"] = (st["phase"] + 0.06) % 1.0
+            ph = st["phase"]
+            if cur and cur.get("phase") == "study":
+                colr, big = "#f59e0b", "IN SESSION"
+            elif cur:
+                colr, big = ACCENT, "GETTING READY"
+            elif err and time.time() - err[0] < 120:
+                colr, big = RED, "PROBLEM"
+            elif self.tourn and on:
+                colr, big = MUTED, "RESTING"
+            else:
+                colr, big = MUTED, "OFF" if not self.tourn or not on else "WAITING"
+            cx, cy, R = 40, H // 2, 22
+            ban.create_oval(cx - R, cy - R, cx + R, cy + R, outline=LINE, width=4)
+            if cur:
+                ban.create_arc(cx - R, cy - R, cx + R, cy + R, start=-ph * 360, extent=110, style="arc", outline=colr, width=4)
+                ban.create_arc(cx - R, cy - R, cx + R, cy + R, start=-ph * 360 + 180, extent=50, style="arc", outline=colr, width=4)
+                r2 = 6 + 3 * math.sin(ph * 2 * math.pi)
+                ban.create_oval(cx - r2, cy - r2, cx + r2, cy + r2, fill=colr, outline="")
+            else:
+                ban.create_oval(cx - 6, cy - 6, cx + 6, cy + 6, fill=colr, outline="")
+            ban.create_text(76, 18, anchor="w", text=big, fill=colr, font=("", 14, "bold"))
+            if cur:
+                if cur.get("start"):
+                    sub = (f"{cur.get('kind', '')}:  {self._when(cur['start'], True)}  to  {self._when(cur['end'], True)}"
+                           f"   ·   {E.fmt_bar(cur['gran'] / 60)} candles" + (f"   ·   {cur['bars']:,} of them" if cur.get("bars") else ""))
+                else:
+                    sub = cur.get("kind", "")
+                ban.create_text(220, 18, anchor="w", text=sub, fill=TEXT, font=("", 10, "bold"))
+                ban.create_text(76, 42, anchor="w", text=cur.get("text", "") + f"   ·   {int(time.time() - cur.get('t0', time.time()))} s",
+                                fill=MUTED, font=("", 9))
+                x0, x1, y = 76, W - 16, 62  # progress track with a sweeping highlight
+                ban.create_rectangle(x0, y - 3, x1, y + 3, fill=BG, outline="")
+                if cur.get("phase") == "study":
+                    frac = min(1.0, cur.get("done", 0) / max(1, cur.get("total", 1)))
+                    ban.create_rectangle(x0, y - 3, x0 + (x1 - x0) * frac, y + 3, fill=colr, outline="")
+                bx = x0 + (x1 - x0) * ph
+                ban.create_rectangle(max(x0, bx - 40), y - 3, min(x1, bx + 40), y + 3, fill="#fde68a" if cur.get("phase") == "study" else "#93c5fd",
+                                     outline="", stipple="gray50")
+                if cur.get("bots"):
+                    ban.create_text(W - 16, 42, anchor="e", text="Bots: " + ", ".join(cur["bots"][:5]), fill=MUTED, font=("", 8))
+            elif err and time.time() - err[0] < 120:
+                ban.create_text(220, 18, anchor="w", text=err[1][:150], fill=RED, font=("", 9, "bold"))
+                ban.create_text(76, 46, anchor="w", text="It tries again in about a minute. Details are in the activity log "
+                                                         "and crash.log.", fill=MUTED, font=("", 9))
+            elif big == "RESTING":
+                left_s = max(0, int(self.roam_wait() - (time.time() - getattr(self, "_roam_last", 0))))
+                ban.create_text(220, 18, anchor="w", text=(f"Next study in about {left_s} s" if left_s > 2 else "Starting the next study..."),
+                                fill=TEXT, font=("", 10))
+                ban.create_text(76, 46, anchor="w", text="Saving what it learned before the next study.", fill=MUTED, font=("", 9))
+            else:
+                ban.create_text(220, 18, anchor="w", text="Not studying right now.", fill=TEXT, font=("", 10))
+                ban.create_text(76, 46, anchor="w", text=state_lbl.cget("text")[:160], fill=MUTED, font=("", 9))
+            w.after(70 if cur else 400, animate)
 
         def covered_days():
             iv = sorted((r["start"], r["end"]) for r in self.roam_log)
@@ -4439,49 +5227,75 @@ class App:
             tl.delete("all")
             W, H = tl.winfo_width(), tl.winfo_height()
             now = time.time()
-            oldest = min([r["start"] for r in self.roam_log] + ([cur["oldest"]] if cur and cur.get("oldest") else []) + [now - 30 * 86400])
-            X = lambda ts: 10 + (ts - oldest) / max(1, now - oldest) * (W - 20)
-            tl.create_rectangle(10, 26, W - 10, 46, fill=BG, outline=LINE)
+            oldest = max(E.HIST_START, datetime(int(self.settings.get("roam_from", 2015)), 7, 20).timestamp())
+            X = lambda ts: 10 + (max(ts, oldest) - oldest) / max(1, now - oldest) * (W - 20)
+            tl.create_rectangle(10, 22, W - 10, 42, fill=BG, outline=LINE)
             for r in self.roam_log:
-                tl.create_rectangle(X(r["start"]), 27, max(X(r["start"]) + 2, X(r["end"])), 45, fill="#1d4ed8" if DARK else "#93c5fd",
-                                    outline="", stipple="gray50")
+                tl.create_rectangle(X(r["start"]), 23, max(X(r["start"]) + 2, X(r["end"])), 41,
+                                    fill="#1d4ed8" if DARK else "#93c5fd", outline="")
             if cur and cur.get("start"):
                 x0, x1 = X(cur["start"]), max(X(cur["start"]) + 3, X(cur["end"]))
-                tl.create_rectangle(x0, 22, x1, 50, fill="#f59e0b", outline="")
-                tl.create_text((x0 + x1) / 2, 12, text="studying now", fill="#f59e0b", font=("", 8, "bold"))
-            span = now - oldest
-            step = 86400 * (1 if span < 10 * 86400 else 7 if span < 120 * 86400 else 30)
-            ts = now
-            while ts > oldest:
-                x = X(ts)
-                tl.create_line(x, 46, x, 52, fill=MUTED)
-                tl.create_text(x, 62, text="now" if ts == now else datetime.fromtimestamp(ts).strftime("%b %d"), fill=MUTED, font=("", 7))
-                ts -= step
+                tl.create_rectangle(x0, 18, x1, 46, fill="#f59e0b", outline="")
+                tl.create_text(min(max((x0 + x1) / 2, 50), W - 50), 9, text="studying now", fill="#f59e0b", font=("", 8, "bold"))
+            y = datetime.fromtimestamp(oldest).year
+            while True:
+                ts = datetime(y, 1, 1).timestamp()
+                if ts > now:
+                    break
+                if ts >= oldest:
+                    tl.create_line(X(ts), 42, X(ts), 48, fill=MUTED)
+                    tl.create_text(X(ts), 58, text=str(y), fill=MUTED, font=("", 7))
+                y += 1
+            tl.create_text(W - 12, 58, text="now", anchor="e", fill=MUTED, font=("", 7))
 
         def draw_price(cur):
             pc.delete("all")
             W, H = pc.winfo_width(), pc.winfo_height()
+            held = False
+            if cur and cur.get("preview"):
+                st["last"] = dict(cur)
+            elif st.get("last"):  # keep the last study's chart up until the next one is ready (no flashing)
+                cur, held = st["last"], True
             if not cur or not cur.get("preview"):
                 pc.create_text(W // 2, H // 2, text="The stretch appears here while the farm studies it.", fill=MUTED)
                 return
-            pv = cur["preview"]
+            pv, pt = cur["preview"], cur.get("preview_t") or []
             lo, hi = min(pv), max(pv)
             pad = (hi - lo) * 0.1 or 0.01
             lo, hi = lo - pad, hi + pad
             X = lambda i: 50 + i * (W - 60) / max(1, len(pv) - 1)
-            Y = lambda y: H - 12 - (y - lo) / (hi - lo) * (H - 24)
+            Y = lambda y: H - 18 - (y - lo) / (hi - lo) * (H - 34)
             pc.create_line(50, Y(1.0), W - 10, Y(1.0), fill=LINE, dash=(3, 3))
+            if pt and E.events():
+                for kind in E.BIG_EVENTS:
+                    for et in E.events().get(kind) or []:
+                        if pt[0] <= et <= pt[-1]:
+                            x = X(bisect.bisect_left(pt, et))
+                            pc.create_line(x, H - 16, x, H - 10, fill="#f59e0b", width=2)
             pc.create_line(*[z for i, y in enumerate(pv) for z in (X(i), Y(y))], fill=GREEN if pv[-1] >= 1 else RED, width=2)
             for y in (lo + pad, hi - pad):
                 pc.create_text(46, Y(y), text=f"{(y - 1) * 100:+.1f}%", anchor="e", fill=MUTED, font=("", 7))
-            pc.create_text(52, 8, anchor="nw", text=self._when(cur["start"]), fill=MUTED, font=("", 7))
-            pc.create_text(W - 12, 8, anchor="ne", text=self._when(cur["end"]), fill=MUTED, font=("", 7))
-            if cur.get("total") and cur.get("kind") == "Practice farm":
-                x = X(int((len(pv) - 1) * min(1.0, cur.get("done", 0) / max(1, cur["total"]) / 0.75)))
+            pc.create_text(52, 6, anchor="nw", text=self._when(cur["start"], True), fill=MUTED, font=("", 7))
+            pc.create_text(W - 12, 6, anchor="ne", text=self._when(cur["end"], True), fill=MUTED, font=("", 7))
+            if held:
+                pc.create_text(W // 2, 6, anchor="n", text="last study (the next one appears here when it's ready)",
+                               fill=MUTED, font=("", 7, "italic"))
+            elif cur.get("phase") == "study" and cur.get("total"):
+                frac = cur.get("done", 0) / max(1, cur["total"])
+                if cur.get("kind") == "Practice farm":
+                    frac = min(1.0, frac / 0.75)
+                    lab = "the practice farm is here"
+                else:
+                    d_ = cur.get("done", 0)
+                    frac = d_ - int(d_)
+                    lab = "this bot is here"
+                x = X(int((len(pv) - 1) * min(1.0, frac)))
                 pc.create_line(x, 4, x, H - 4, fill="#f59e0b", width=2)
-                pc.create_text(x + 4, H - 6, anchor="sw", text="the practice farm is here", fill="#f59e0b", font=("", 7, "bold"))
-        paint()
+                pc.create_text(x + 4, H - 4, anchor="sw", text=lab, fill="#f59e0b", font=("", 7, "bold"))
 
+        tog.config(command=lambda: (self.toggle_roam(), paint()))
+        paint()
+        animate()
     # ================= Slow farm: hourly candles, holds of days to weeks =================
     SLOW_GRAN = 3600   # one candle per hour
     SLOW_HISTORY = 3000  # about four months of hourly candles to learn from
@@ -4583,10 +5397,16 @@ class App:
                     done = [i for i, x in enumerate(t) if x + self.SLOW_GRAN <= time.time()]  # finished candles only
                     k = (done[-1] + 1) if done else n
                     hist[c], ts[c] = d["c"][:k], t[:k]
-                    hx[c] = {x: d[x][:k] for x in ("h", "l", "v")}
+                    hx[c] = {x: list(d[x][:k]) for x in ("h", "l", "v")}
+                    hx[c]["t"] = list(t[:k])
                 L = min(len(v) for v in hist.values())
                 hist = {c: v[-L:] for c, v in hist.items()}
                 hx = {c: {x: y[-L:] for x, y in d.items()} for c, d in hx.items()}
+                if self.settings.get("ctx_studies", True):
+                    try:
+                        self.add_ctx(hx, self.SLOW_GRAN, self.SLOW_HISTORY, quote)
+                    except Exception:
+                        pass
                 last_ts = min(ts[c][-1] for c in coins) if L else 0
                 t = sl["t"]
                 if t is None and saved.get("farm"):
@@ -4672,13 +5492,20 @@ class App:
             for c in sl["coins"]:
                 ts, cl, hi, lo, vol = new[c][i]
                 sl["hist"][c].append(cl)
-                for x, val in (("h", hi), ("l", lo), ("v", vol)):
-                    sl["hx"][c][x].append(val)
+                for x, val in (("h", hi), ("l", lo), ("v", vol), ("t", ts)):
+                    sl["hx"][c].setdefault(x, []).append(val)
                 del sl["hist"][c][:-6000]
-                for x in ("h", "l", "v"):
+                for x in ("h", "l", "v", "t"):
                     del sl["hx"][c][x][:-6000]
             sl["last_ts"] = new[sl["coins"][0]][i][0]
-            t.step({c: sl["hist"][c] for c in sl["coins"]}, {c: sl["hx"][c] for c in sl["coins"]})
+            cx = sl["hx"].get(E.CTX_KEY)
+            if cx:  # the watched coins move on too (latest known price)
+                for sym, q in cx.items():
+                    px_ = self.last.get(sym) or (q[-1] if q else None)
+                    if px_:
+                        q.append(px_)
+                        del q[:-6000]
+            t.step({c: sl["hist"][c] for c in sl["coins"]}, dict(sl["hx"]))
             px = {c: sl["hist"][c][-1] for c in sl["coins"]}
             for c in sl["coins"]:
                 sig, mult = t.vote(c)
@@ -4803,7 +5630,7 @@ class App:
         on = bool(self.cfg.get("slow_on"))
         self.slow_btn.config(text="⏸ Pause the slow farm" if on and t else "▶ Start the slow farm")
         try:
-            if "Slow farm" not in self.nb.tab(self.nb.select(), "text"):
+            if "Slow farm" not in self.cur_tab():
                 return  # redrawn when you open the tab
         except Exception:
             pass
@@ -4917,12 +5744,12 @@ class App:
         tk.Label(f, text="Highlighted rows are where they differ.", bg=BG, fg=MUTED).grid(row=len(rows), column=0, columnspan=3, sticky="w", pady=(8, 0))
 
     # ---------------- bloodlines (drawn tree) ----------------
-    def open_bloodlines(self):
+    def open_bloodlines(self, parent=None):
+        if parent is None:  # it lives as a tab in the family window
+            return self.open_hub('family', 'Bloodlines')
         if not self.tourn:
-            return messagebox.showinfo("Bloodlines", "Start the farm first.")
-        w = tk.Toplevel(self.root)
-        w.title("Bloodlines")
-        w.geometry("1100x640")
+            return self._nothing(parent, "Bloodlines", "Start the farm first.")
+        w = parent
         w.configure(bg=BG)
         tk.Label(w, text="Each row is a generation. Lines run from parent to child; bright = alive, gold = strong line "
                          "(a living descendant beating holding). Click a living dragon to open it.", bg=BG, fg=MUTED,
@@ -4996,13 +5823,13 @@ class App:
         ev = [e for e in self.tourn.events if any(w in e for w in ("Bred", "Retired", "Season", "Migration", "Classic", "Twin"))][-3:]
         self.farm_hist.append((time.time(), tiers.count("egg"), tiers.count("rising"), tiers.count("beast"), ev))
 
-    def open_replay(self):
+    def open_replay(self, parent=None):
+        if parent is None:  # it lives as a tab in the insights window
+            return self.open_hub('insights', 'Farm replay')
         data = list(self.farm_hist)
         if len(data) < 5:
-            return messagebox.showinfo("Farm replay", "Not enough farm history yet. Let the farm run for a while.")
-        w = tk.Toplevel(self.root)
-        w.title("Farm replay")
-        w.geometry("900x520")
+            return self._nothing(parent, "Farm replay", "Not enough farm history yet. Let the farm run for a while.")
+        w = parent
         w.configure(bg=BG)
         cv = tk.Canvas(w, bg=CARD, highlightthickness=0, height=300)
         cv.pack(fill="both", expand=True, padx=10, pady=(10, 4))
@@ -5115,10 +5942,25 @@ class App:
                 dirs[:] = [d for d in dirs if d not in ("cache", "backups")]
                 for fn in files:
                     full = os.path.join(root_, fn)
+                    if fn == "config.json":  # never put keys in a backup, even when the keychain isn't available
+                        try:
+                            c_ = json.load(open(full, encoding="utf-8"))
+                            for k in E.SECRET_CFG:
+                                c_.pop(k, None)
+                            for k in E.SECRET_SETTINGS + self.PRIVATE:
+                                (c_.get("settings") or {}).pop(k, None)
+                            for pr in (c_.get("profiles") or {}).values():
+                                for k in E.SECRET_SETTINGS + self.PRIVATE:
+                                    pr.pop(k, None)
+                            z.writestr("config.json", json.dumps(c_))
+                            n += 1
+                        except Exception:
+                            pass
+                        continue
                     z.write(full, os.path.relpath(full, E.HOME_DIR))
                     n += 1
         self.write(f"Backed up {n} files (Library, Hall of Fame, farms, sessions, settings, trades) to {p}. "
-                   f"Your Coinbase login is not in it.", "good")
+                   f"Your Alpaca login is not in it.", "good")
         return p
 
     def restore_all(self):
@@ -5143,6 +5985,8 @@ class App:
                 dest = os.path.normpath(os.path.join(E.HOME_DIR, m))
                 if not dest.startswith(os.path.normpath(E.HOME_DIR) + os.sep):
                     continue  # never write outside the data folder
+                if m.endswith("/") or not re.search(r"\.(json|csv|log|txt)$", m, re.I):
+                    continue  # only CBBF's own data files (never programs)
                 os.makedirs(os.path.dirname(dest), exist_ok=True)
                 with z.open(m) as src, open(dest, "wb") as out:
                     out.write(src.read())
@@ -5163,16 +6007,22 @@ class App:
             return
 
         def loop():
-            offset = None
+            offset, primed = None, False
             while True:
                 s_ = self.settings
                 if not s_.get("tg_remote") or not s_.get("alert_tg_token") or not s_.get("alert_tg_chat"):
                     time.sleep(15)
+                    primed = False
                     continue
                 try:
+                    if not primed:  # skip anything sent while CBBF was closed (an old "/kill confirm" must not fire now)
+                        _, offset = E.tg_updates(s_["alert_tg_token"], offset, timeout=0)
+                        primed = True
                     ups, offset = E.tg_updates(s_["alert_tg_token"], offset)
-                    for chat, text in ups:
-                        if str(chat) == str(s_["alert_tg_chat"]).strip():
+                    for chat, text, sent, private, sender in ups:
+                        # only your own private chat with the bot, and only fresh messages
+                        if (str(chat) == str(s_["alert_tg_chat"]).strip() and private and str(sender) == str(chat)
+                                and time.time() - sent < 120):
                             self.q.put(("call", lambda t=text: self.tg_command(t)))
                 except Exception:
                     time.sleep(20)
@@ -5212,6 +6062,254 @@ class App:
         if reply:
             s_ = dict(self.settings, alert_discord="")
             threading.Thread(target=lambda: E.send_alert(s_, reply), daemon=True).start()
+
+    # ---------------- market context ----------------
+    def ctx_list(self, coins=None):
+        """The market-context coins the bots watch (minus any they trade)."""
+        coins = coins if coins is not None else self.session_coins
+        return [c for c in (self.settings.get("ctx_tickers") or []) if E.valid_coin(c) and c not in coins]
+
+    def extra_now(self):
+        """The extra data for a farm step: highs/lows/volumes/times per traded coin, plus the watched coins."""
+        x = {c: self.hx[c] for c in self.session_coins}
+        if self.ctx_hist:
+            x[E.CTX_KEY] = self.ctx_hist
+        return x
+
+    def add_ctx(self, extra, gran, count, quote="USD"):
+        """Fetches the watched coins for a stretch of history and lines them up with its bar times."""
+        coins = [c for c in extra if c != E.CTX_KEY]
+        if not coins:
+            return extra
+        times = list(extra[coins[0]].get("t") or [])
+        if not times:
+            return extra
+        out = {}
+        for sym in self.ctx_list(coins):
+            try:
+                d = (E.fetch_range(sym, gran, times[0] - gran * 3, times[-1] + gran, quote) if not count or times[0] < time.time() - 120 * 86400
+                     else E.fetch_ohlcv(sym, gran, count, quote))
+                if d.get("t"):
+                    out[sym] = E.align_ctx(times, d["t"], d["c"])
+            except Exception:
+                continue
+        if out:
+            extra[E.CTX_KEY] = out
+        return extra
+
+    def ctx_card_build(self):
+        for w in self.ctx_box.winfo_children():
+            w.destroy()
+        self.ctx_labels = {}
+        syms = [x for x in (self.settings.get("ctx_tickers") or []) if E.valid_coin(x)]
+        if not syms:
+            tk.Label(self.ctx_box, text="None. Click Edit to add some (BTC, ETH, SOL...).", bg=CARD, fg=MUTED,
+                     font=("", 8), wraplength=220, justify="left").pack(anchor="w")
+        for sym in syms:
+            row = tk.Frame(self.ctx_box, bg=CARD)
+            row.pack(fill="x")
+            tk.Label(row, text=sym, bg=CARD, fg=TEXT,
+                     font=("", 9, "bold"), width=11, anchor="w").pack(side="left")
+            l = tk.Label(row, text="-", bg=CARD, fg=MUTED, font=("", 9), anchor="w")
+            l.pack(side="left")
+            self.ctx_labels[sym] = l
+
+    def ctx_card_refresh(self):
+        for sym, l in getattr(self, "ctx_labels", {}).items():
+            q = self.ctx_hist.get(sym) or self.hist.get(sym)
+            px = self.last.get(sym) or (q[-1] if q else None)
+            if not px:
+                l.config(text="-", fg=MUTED)
+                continue
+            base = self.start_px.get(sym) or (q[0] if q else None)
+            ch = (px / base - 1) * 100 if base else 0
+            l.config(text=f"{fmt_px(px)}  {ch:+.2f}%", fg=GREEN if ch > 0 else RED if ch < 0 else MUTED)
+
+    def edit_context(self):
+        cur = ", ".join(self.settings.get("ctx_tickers") or [])
+        ans = simpledialog.askstring("Market context", "Coins the bots WATCH but never trade, separated by commas.\n"
+                                                       "BTC leads most of the market; ETH and SOL are the next "
+                                                       "biggest. Coins you trade are skipped. Up to 8:", initialvalue=cur)
+        if ans is None:
+            return
+        syms = [x.strip().upper() for x in ans.replace(";", ",").split(",") if E.valid_coin(x.strip().upper())][:8]
+        self.settings["ctx_tickers"] = syms
+        self.cfg["settings"] = self.settings
+        E.save_json(CONFIG_PATH, self.cfg)
+        if self.tourn:
+            self.tourn.ctx_syms = [c for c in syms if c not in self.tourn.coins]
+            self.tourn.o["ctx"] = syms
+        self.ctx_card_build()
+        self.write("Market context: " + (", ".join(syms) or "none") + ". New coins join the live data when you start "
+                   "a new session; studies on them start appearing in new eggs.")
+
+    def ctx_report(self):
+        """Per watched coin: how many bots study it, and what those studies did for them (from the farm and the slow farm)."""
+        out = {}
+        for t in (self.tourn, (getattr(self, "slow", {}) or {}).get("t")):
+            if not t:
+                continue
+            for v in t.vars:
+                for e in v.layers.get("ctx", []):
+                    d = out.setdefault(e["sym"], dict(bots=0, n=0.0, saved=0.0, rules=[]))
+                    d["bots"] += 1
+                    st = v.layer_stats.get(f"ctx:{e['sym']}")
+                    if st:
+                        d["n"] += st[0]
+                        d["saved"] += st[1]
+                        d["rules"].append((st[1] / st[0] if st[0] else 0, E.ctx_text(e), E.bot_nickname(v.key())))
+        return out
+
+    # ---------------- economic calendar ----------------
+    def news_card_refresh(self):
+        try:
+            for w in self.news_box.winfo_children():
+                w.destroy()
+            up = E.upcoming_events(days=21)[:4]
+            if not E.events():
+                tk.Label(self.news_box, text="No calendar yet. Click Calendar... to download it (free).", bg=CARD, fg=MUTED,
+                         font=("", 8), wraplength=220, justify="left").pack(anchor="w")
+            elif not up:
+                tk.Label(self.news_box, text="Nothing big in the next 3 weeks.", bg=CARD, fg=MUTED, font=("", 8)).pack(anchor="w")
+            for t, k in up:
+                row = tk.Frame(self.news_box, bg=CARD)
+                row.pack(fill="x")
+                soon = t - time.time() < 36 * 3600
+                tk.Label(row, text=datetime.fromtimestamp(t).strftime("%a %b %d %H:%M"), bg=CARD, fg=TEXT if soon else MUTED,
+                         font=("", 8, "bold" if soon else ""), anchor="w").pack(side="left", padx=(0, 8))
+                tk.Label(row, text=E.EVENT_KINDS[k][1], bg=CARD, fg="#f59e0b" if soon and k in E.BIG_EVENTS else TEXT,
+                         font=("", 8), anchor="w").pack(side="left")
+        except tk.TclError:
+            return
+        self.root.after(15 * 60 * 1000, self.news_card_refresh)
+
+    def fetch_calendar(self, key=None, done=None, quiet=False):
+        key = (key or self.cfg.get("fred_key") or "").strip()
+        if not key:
+            if done:
+                done(False, "Enter your FRED key first.")
+            return
+
+        def work():
+            try:
+                ev, errs = E.fetch_events(key)
+                n = sum(len(x) for x in ev.values())
+                msg = f"Economic calendar downloaded: {n} releases since 2015, plus the scheduled ones." + (
+                    f" (Skipped: {'; '.join(errs)})" if errs else "")
+                ok = True
+            except Exception as e:
+                msg, ok = f"Couldn't download the economic calendar: {e}", False
+
+            def fin():
+                if not quiet or not ok:
+                    self.write(msg, "good" if ok else "warn")
+                self.news_card_refresh()
+                if done:
+                    done(ok, msg)
+            self.q.put(("call", fin))
+        threading.Thread(target=work, daemon=True).start()
+
+    def event_report(self):
+        """Per event never-rule: bots using it and its graded record."""
+        out = {k: dict(bots=0, n=0, saved=0.0) for k in E.EVENT_VETOES}
+        pools = [self.tourn.vars] if self.tourn else []
+        if self.slow.get("t"):
+            pools.append(self.slow["t"].vars)
+        for vs in pools:
+            for v in vs:
+                for k in E.EVENT_VETOES:
+                    if k in (v.vetoes or {}):
+                        out[k]["bots"] += 1
+                    st = (v.veto_stats or {}).get(k)
+                    if st:
+                        out[k]["n"] += st[0]
+                        out[k]["saved"] += st[1]
+        return out
+
+    def open_calendar(self, parent=None):
+        if parent is None:  # it lives as a tab in the insights window
+            return self.open_hub('insights', 'Economic calendar')
+        w = parent
+        w.configure(bg=BG)
+        tk.Label(w, bg=BG, fg=MUTED, justify="left", anchor="w", wraplength=730, padx=12, pady=8, text=(
+            "Big US economic news moves crypto too: Bitcoin often swings hard around CPI, jobs reports and Fed "
+            "decisions. With the calendar downloaded, bots can grow three never-rules "
+            "around these days (quiet before big news, quiet before the Fed, let the news settle), and every trade those "
+            "rules skip is graded afterwards, in live trading, the farms, backtests, Training camp and Free roam, all the "
+            "way back to 2016. Release dates come from FRED, the St. Louis Fed's free data service.")
+                 ).pack(fill="x")
+        top = tk.Frame(w, bg=BG, padx=12)
+        top.pack(fill="x")
+        tk.Label(top, text="FRED API key:", bg=BG, fg=TEXT).pack(side="left")
+        key = tk.StringVar(value=self.cfg.get("fred_key", ""))
+        ttk.Entry(top, textvariable=key, width=36, show="*").pack(side="left", padx=6)
+        res = tk.Label(w, text="", bg=BG, fg=MUTED, anchor="w", padx=12, wraplength=730, justify="left")
+
+        def go():
+            k = key.get().strip()
+            if not re.fullmatch(r"[0-9a-zA-Z]{32}", k):
+                return messagebox.showerror("Economic calendar", "A FRED key is 32 letters and numbers.", parent=w)
+            self.cfg["fred_key"] = k
+            E.save_json(CONFIG_PATH, self.cfg)
+            res.config(text="Downloading...", fg=MUTED)
+            self.fetch_calendar(k, lambda ok, msg: (res.config(text=msg, fg=GREEN if ok else RED), fill())
+                                if w.winfo_exists() else None)
+        ttk.Button(top, text="Download", style="Accent.TButton", command=go).pack(side="left")
+        ttk.Button(top, text="Get a free key", style="Plain.TButton",
+                   command=lambda: webbrowser.open("https://fred.stlouisfed.org/docs/api/api_key.html")).pack(side="left", padx=6)
+        res.pack(fill="x", pady=(4, 0))
+        fe = E.events_fetched()
+        if fe:
+            res.config(text=f"Last downloaded {datetime.fromtimestamp(fe).strftime('%b %d %Y')}. It refreshes itself weekly.")
+        tk.Label(w, text="Next 45 days", bg=BG, fg=TEXT, font=("", 10, "bold"), anchor="w", padx=12).pack(fill="x", pady=(8, 0))
+        f1 = tk.Frame(w, bg=BG, padx=12)
+        f1.pack(fill="both", expand=True)
+        up = self.make_tree(f1, ("time", "who", "in"), (210, 260, 200), ("When (your time)", "Release", "In"))
+        tk.Label(w, text="What the bots learned about news days", bg=BG, fg=TEXT, font=("", 10, "bold"), anchor="w",
+                 padx=12).pack(fill="x", pady=(8, 0))
+        f2 = tk.Frame(w, bg=BG, padx=12, pady=(0))
+        f2.pack(fill="x", pady=(0, 12))
+        lr = self.make_tree(f2, ("who", "bots", "n", "saved"), (330, 100, 130, 160), ("Never-rule", "Bots using", "Trades skipped", "Saved / cost"))
+        lr.configure(height=3)
+
+        def fill():
+            for t_ in (up, lr):
+                t_.delete(*t_.get_children())
+            for t, k in E.upcoming_events(days=45):
+                d = (t - time.time()) / 86400
+                up.insert("", "end", values=(datetime.fromtimestamp(t).strftime("%a %b %d  %H:%M"), E.EVENT_KINDS[k][1],
+                                             "now" if d < 0 else f"{d * 24:.0f} hours" if d < 2 else f"{d:.0f} days"))
+            for k, d in self.event_report().items():
+                lr.insert("", "end", values=(E.VETOES[k]["name"], d["bots"], int(d["n"]),
+                                             f"{'saved' if d['saved'] >= 0 else 'cost'} {abs(d['saved']):.1f}%" if d["n"] else "-"))
+        fill()
+
+    def open_context(self, parent=None):
+        if parent is None:  # it lives as a tab in the insights window
+            return self.open_hub('insights', 'Market context')
+        w = parent
+        w.configure(bg=BG)
+        tk.Label(w, bg=BG, fg=MUTED, justify="left", anchor="w", wraplength=900, padx=12, pady=8, text=(
+            "The bots watch these coins without trading them. A context study votes for or against a trade depending on "
+            "what the watched coin is doing, and every trade it held back is checked afterwards: 'saved' means skipping "
+            "those trades avoided losses, 'cost' means it blocked winners. Good studies spread to children, costly ones die "
+            "out.")).pack(fill="x")
+        t = self.make_tree(w, ("sym", "now", "bots", "n", "saved", "best"), (90, 110, 70, 90, 110, 440),
+                           ("Ticker", "Now", "Bots using", "Trades judged", "Saved / cost", "Best rule so far (and who)"))
+        rep_ = self.ctx_report()
+        for sym in list(dict.fromkeys(list(self.settings.get("ctx_tickers") or []) + list(rep_))):
+            d = rep_.get(sym, dict(bots=0, n=0, saved=0, rules=[]))
+            q = self.ctx_hist.get(sym) or []
+            px = self.last.get(sym) or (q[-1] if q else None)
+            best = max(d["rules"]) if d["rules"] else None
+            t.insert("", "end", values=(sym, fmt_px(px) if px else "-", d["bots"], int(d["n"]),
+                                        f"{'saved' if d['saved'] >= 0 else 'cost'} {abs(d['saved']):.1f}%" if d["n"] else "-",
+                                        f"{best[1]}  ({best[2]})" if best else
+                                        "traded this session, so its own chart is already studied" if sym in self.session_coins
+                                        else "no evidence yet"))
+        tk.Label(w, bg=BG, fg=MUTED, anchor="w", padx=12, pady=6,
+                 text="Tip: Free roam and the Training camp let the farm learn these reactions from months of history.").pack(fill="x")
+
 
     # ---------------- compact top bar ----------------
     def apply_compact(self):
@@ -5539,10 +6637,11 @@ class App:
         E.save_json(CONFIG_PATH, self.cfg)
         return text
 
-    def show_report(self):
+    def show_report(self, parent=None):
+        if parent is None:  # it lives as a tab in the insights window
+            return self.open_hub('insights', 'Weekly report')
         text = self.weekly_report(force=True)
-        w = tk.Toplevel(self.root)
-        w.title("Weekly report")
+        w = parent
         w.configure(bg=BG)
         box = tk.Text(w, width=90, height=28, bg=CARD, fg=TEXT, relief="flat", padx=10, pady=8, font=("", 10))
         box.pack(fill="both", expand=True)
@@ -5590,7 +6689,7 @@ class App:
                     who=friendly_label(t["name"], t["params"], t.get("tf", 1), self.session_bar)))
             del self.shadow_trades[:-4000]
             if new:
-                if self.nb.tab(self.nb.select(), "text").strip() == "Trades":
+                if self.cur_tab() == "Trades":
                     self.refresh_trades()
                 else:
                     self._trades_dirty = True  # redrawn when you open the Trades tab
@@ -5746,7 +6845,7 @@ class App:
         # Each screen update is isolated: one failing widget must not hide the trade or freeze the balances.
         def trades_tab():
             try:
-                visible = self.nb.tab(self.nb.select(), "text").strip() == "Trades"
+                visible = self.cur_tab() == "Trades"
             except Exception:
                 visible = True
             if visible:
@@ -5981,6 +7080,16 @@ class App:
         return tuple(float(o.get(k) or 0) for k in ("filled_size", "filled_value", "total_fees"))
 
     def live_buy(self, c, spend, reason):
+        mx = float(self.settings.get("max_spread_pct", 0) or 0)
+        if mx and reason not in ("manual", "manual buy"):
+            try:
+                bid, ask = self.best_bid_ask(c)
+                gap = float((ask - bid) / ((ask + bid) / 2) * 100)
+                if gap > mx:
+                    return self.q.put(("fail", ("buy", c, spend, f"skipped: {c}'s bid/ask gap is {gap:.2f}%, wider than "
+                                                                  f"your {mx:g}% limit (thin market, it would fill badly)")))
+            except Exception:
+                pass
         try:
             qty = val = fee = 0.0
             if self.use_limit(reason):
@@ -6013,11 +7122,31 @@ class App:
                 return self.q.put(("fill", ("buy", c, qty, val + fee, spend, reason + " (limit, part filled)")))
             self.q.put(("fail", ("buy", c, spend, str(e))))
 
+    def coinbase_available(self, c):
+        """How much of this coin the Coinbase account can sell right now (its own count)."""
+        cursor, seen = None, 0
+        while seen < 20:
+            r = E.to_dict(self.client.get_accounts(limit=250, cursor=cursor) if cursor else self.client.get_accounts(limit=250))
+            for a_ in r.get("accounts") or []:
+                if a_.get("currency") == c:
+                    return Decimal(str((a_.get("available_balance") or {}).get("value") or "0"))
+            if not r.get("has_next"):
+                break
+            cursor, seen = r.get("cursor"), seen + 1
+        return Decimal("0")
+
     def live_sell(self, c, qty, reason):
         got_q = got_v = 0.0
         try:
             base_inc, px_inc = self.product_info(c)
             size = (Decimal(str(qty)) // base_inc) * base_inc
+            held = (self.coinbase_available(c) // base_inc) * base_inc  # never sell more than Coinbase says you have
+            if size > held:
+                if held <= 0:
+                    raise RuntimeError(f"Coinbase shows no {c} available to sell, so nothing was sold")
+                self.q.put(("log", (f"Selling {format(held, 'f')} {c}, what Coinbase shows as available "
+                                    f"(CBBF's record said {format(size, 'f')}).", "warn")))
+                size = held
             if size <= 0:
                 raise RuntimeError("position below minimum increment")
             if self.use_limit(reason):
@@ -6226,47 +7355,6 @@ class App:
             self.write("Add-ons ready. Click 'Log in to Coinbase' to continue.")
 
     # ---------------- backtest ----------------
-    def backtest(self):
-        coins = [c for c, v in self.coin_vars.items() if v.get()]
-        names = [n for n, v in self.strat_vars.items() if v.get()] or [n for n in E.STRATS]
-        if not coins:
-            return messagebox.showinfo("Backtest", "Check at least one coin.")
-        s = dict(self.settings)
-        s["quote"] = self.cur_quote()
-        self.write(f"Backtesting {', '.join(coins)} on {E.fmt_bar(E.candle_gran(s['bar_minutes']) / 60)} candles (fetching history)...")
-        threading.Thread(target=self._backtest, args=(coins, names, s), daemon=True).start()
-
-    def _backtest(self, coins, names, s):
-        try:
-            gran = E.candle_gran(s["bar_minutes"])
-            data = {c: E.fetch_ohlcv(c, gran, 900, s.get("quote", "USD")) for c in coins}
-            closes = {c: d["c"] for c, d in data.items()}
-            extra = {c: dict(h=d["h"], l=d["l"], v=d["v"]) for c, d in data.items()}
-            L = min(len(v) for v in closes.values())
-            if L < 150:
-                return self.q.put(("log", "Not enough history for a backtest."))
-            rows = E.run_backtest(closes, names, s, extra=extra)
-            days = L * gran / 86400
-            self.q.put(("bt", (rows, f"{', '.join(coins)} | {L} bars of {E.fmt_bar(gran / 60)} (~{days:.1f} days)")))
-        except Exception as e:
-            self.q.put(("log", f"Backtest failed: {e}"))
-
-    def show_backtest(self, rows, info):
-        w = tk.Toplevel(self.root)
-        w.title("Backtest results")
-        ttk.Label(w, text=info, padding=6).pack(anchor="w")
-        t = ttk.Treeview(w, columns=("s", "r", "d", "t"), show="headings", height=len(rows))
-        for c, h, wd in (("s", "Strategy", 220), ("r", "Return", 90), ("d", "Max drawdown", 110), ("t", "Trades", 70)):
-            t.heading(c, text=h)
-            t.column(c, width=wd, anchor="w" if c == "s" else "e")
-        for name, ret, dd, tr in rows:
-            t.insert("", "end", values=(STRAT_LABELS.get(name, name), f"{ret * 100:+.2f}%", f"{dd * 100:.1f}%", tr))
-        t.pack(padx=6)
-        ttk.Label(w, padding=6, wraplength=470, foreground="gray",
-                  text="Past results do not predict future results. Fees and your stop-loss / take-profit "
-                       "settings are included. The wildcard row only starts ranking after ~100 bars.").pack()
-        self.write("Backtest complete.")
-
     # ---------------- Bot Farm grid (default tab): eggs, rising, BEASTS, Hall of Fame ----------------
     GRID_STATUS = {"active": ("WINNING", "#22c55e"), "slowed": ("SHAKY", "#f59e0b"), "standby": ("STANDBY", "#3b82f6"),
                    "benched": ("RESTING", "#6b7280"), "warming up": ("LEARNING", "#8b5cf6")}
@@ -6696,7 +7784,7 @@ class App:
         f = self.grid_filter.get()
         style = self.farm_style.get()
         try:
-            if "Bot Farm" not in self.nb.tab(self.nb.select(), "text"):
+            if "Bot Farm" not in self.cur_tab():
                 return  # not visible: drawn when you open the tab
         except Exception:
             pass
@@ -7323,17 +8411,29 @@ class App:
         self._auto_resume = False
 
     # ---------------- only redraw what you can see ----------------
-    def tab_visible(self, widget):
+    def cur_tab(self):
+        """The name of the tab you're looking at (the inner one when Markets or Trades is open)."""
         try:
-            return self.nb.select() == str(self.nb.nametowidget(widget.winfo_parent())) or \
-                self.nb.select() == str(widget)
+            t = self.nb.tab(self.nb.select(), "text").strip()
+            sn = getattr(self, "subnb", {}).get(t)
+            return sn.tab(sn.select(), "text").strip() if sn is not None else t
         except Exception:
-            return True
+            return ""
 
+    def show_tab(self, name):
+        """Brings a tab forward by name, inner tabs included."""
+        for t_ in self.nb.tabs():
+            if name in self.nb.tab(t_, "text"):
+                return self.nb.select(t_)
+        for outer, sn in getattr(self, "subnb", {}).items():
+            for t_ in sn.tabs():
+                if name in sn.tab(t_, "text"):
+                    sn.select(t_)
+                    return self.show_tab(outer)
     def refresh_visible(self):
         """Catches up the tab you just opened (hidden tabs skip their redraws to save effort)."""
         try:
-            tab = self.nb.tab(self.nb.select(), "text").strip()
+            tab = self.cur_tab()
         except Exception:
             return
         if tab == "Trades" and getattr(self, "_trades_dirty", False):
@@ -7969,10 +9069,10 @@ class App:
         try:
             if mode != "Off" and self.root.state() != "iconic" and not self.moving():
                 self.farm_phase = getattr(self, "farm_phase", 0) + 1
-                tab = self.nb.index(self.nb.select()) if hasattr(self, "nb") else 0
-                if tab == 0:
+                tab = self.cur_tab() if hasattr(self, "nb") else "Bot Farm"
+                if "Bot Farm" in tab:
                     self._grid_anim_frame()
-                elif self.nb.tab(tab, "text").strip() == "Strategy scoreboard":
+                elif tab == "Strategy scoreboard":
                     self._draw_farm()
         except Exception:
             pass
@@ -8289,7 +9389,7 @@ class App:
         self.col_head = ttk.Label(top, text="Bot Library", font=("", 13, "bold"))
         self.col_head.pack(anchor="w")
         ttk.Label(top, foreground=MUTED, wraplength=980, text=(
-            "Catch bots from the scoreboard, the Bot Lab or the Hall of Fame. Rarity comes from how much they beat "
+            "Catch bots from the farm, Training camp or the Hall of Fame. Rarity comes from how much they beat "
             "holding, their win rate and how long they kept winning; catching a bot again levels it up. Pick a team "
             f"of up to {E.TEAM_MAX} and tick 'Trade with my team' to run Wildcard with just them.")).pack(anchor="w", pady=(2, 6))
         bar = ttk.Frame(top)
@@ -8388,7 +9488,7 @@ class App:
         self.col_cards = []
         if not bots:
             c.create_text(W // 2, 80, fill=MUTED, justify="center", text=(
-                "No bots here yet.\nSelect bots on the scoreboard and press 'Catch!', or catch Bot Lab passes and "
+                "No bots here yet.\nSelect bots on the scoreboard and press 'Catch!', or catch Training camp graduates and "
                 "Hall of Fame bots.\nHall of Fame bots are caught automatically."))
         for i, b in enumerate(bots):
             x = g + (i % per) * (cw + g)
@@ -8720,12 +9820,12 @@ class App:
         w.after(100, tick)
 
     # ---------------- family tree ----------------
-    def open_family(self):
+    def open_family(self, parent=None):
+        if parent is None:  # it lives as a tab in the family window
+            return self.open_hub('family', 'Family tree')
         if not self.tourn:
-            return messagebox.showinfo("Family tree", "Start the bot with Wildcard ticked first.")
-        w = tk.Toplevel(self.root)
-        w.title("Bot family tree")
-        w.geometry("900x560")
+            return self._nothing(parent, "Family tree", "Start the bot with Wildcard ticked first.")
+        w = parent
         ttk.Label(w, padding=(10, 8, 10, 2), wraplength=860, foreground=MUTED, text=(
             "Every bot's family: starters at the top, their tweaked and bred children underneath. A bred bot has two "
             "parents; it is listed under the first and names the second. Bold = alive, ★ = Hall of Fame. "
@@ -8778,7 +9878,7 @@ class App:
         b = ttk.Frame(w, padding=10)
         b.pack(fill="x")
         ttk.Button(b, text="Refresh", command=fill).pack(side="left")
-        ttk.Button(b, text="Close", command=w.destroy).pack(side="right")
+        ttk.Button(b, text="Close", command=lambda: w.winfo_toplevel().destroy()).pack(side="right")
 
     # ---------------- Hall of Fame ----------------
     def open_hof(self):
@@ -8880,220 +9980,6 @@ class App:
         status.pack(side="right", padx=10)
         fill()
 
-    # ---------------- Bot Lab ----------------
-    def open_lab(self):
-        if getattr(self, "lab_win", None) is not None and self.lab_win.winfo_exists():
-            return self.lab_win.lift()
-        w = self.lab_win = tk.Toplevel(self.root)
-        w.title("Bot Lab")
-        w.geometry("1000x640")
-        top = ttk.Frame(w, padding=(12, 10, 12, 4))
-        top.pack(fill="x")
-        ttk.Label(top, text="Bot Lab: breed bots on past prices, then test them on prices they never saw",
-                  font=("", 12, "bold")).pack(anchor="w")
-        ttk.Label(top, foreground=MUTED, wraplength=960, justify="left", text=(
-            "1. Downloads history for your ticked coins.  2. Runs the full Wildcard tournament (tweaking, crossbreeding, "
-            "retiring) on the older part.  3. Takes its best bots and replays them, unchanged, on the newer part they never "
-            "saw.  A bot passes only if it made money there AND beat just holding. Running several rounds with different "
-            "random seeds shows whether a result is real or luck. Fees and spread are included.")).pack(anchor="w", pady=(2, 8))
-        opts = ttk.Frame(top)
-        opts.pack(fill="x")
-        coins = [c for c, v in self.coin_vars.items() if v.get()]
-        ttk.Label(opts, text="Coins: " + (", ".join(coins) or "none ticked")).grid(row=0, column=0, sticky="w", padx=(0, 16))
-        ttk.Label(opts, text="Candle size").grid(row=0, column=1, sticky="e")
-        gran = tk.StringVar(value=self.cfg.get("lab_gran", "15 min"))
-        ttk.Combobox(opts, textvariable=gran, values=list(LAB_CANDLES), state="readonly", width=8).grid(row=0, column=2, padx=(4, 14))
-        ttk.Label(opts, text="Candles").grid(row=0, column=3, sticky="e")
-        count = tk.StringVar(value=str(self.cfg.get("lab_count", 3000)))
-        ttk.Combobox(opts, textvariable=count, values=["1000", "2000", "3000", "5000"], width=6).grid(row=0, column=4, padx=(4, 14))
-        ttk.Label(opts, text="Rounds").grid(row=0, column=5, sticky="e")
-        rounds = tk.StringVar(value=str(self.cfg.get("lab_rounds", 3)))
-        ttk.Combobox(opts, textvariable=rounds, values=["1", "2", "3", "5", "8"], width=4).grid(row=0, column=6, padx=(4, 14))
-        ttk.Label(opts, text="Learn on").grid(row=0, column=7, sticky="e")
-        split = tk.StringVar(value=self.cfg.get("lab_split", "70%"))
-        ttk.Combobox(opts, textvariable=split, values=["60%", "70%", "80%"], state="readonly", width=5).grid(row=0, column=8, padx=4)
-        span = ttk.Label(top, foreground=MUTED)
-        span.pack(anchor="w", pady=(4, 0))
-
-        def show_span(*_):
-            try:
-                mins = LAB_CANDLES[gran.get()] / 60 * int(count.get())
-                frac = int(split.get().rstrip("%")) / 100
-                span.config(text=f"About {mins / 1440:.1f} days of history: the bots learn on the first {mins * frac / 1440:.1f} "
-                                 f"days and are tested on the last {mins * (1 - frac) / 1440:.1f}.")
-            except (ValueError, KeyError):
-                span.config(text="")
-        for var in (gran, count, split):
-            var.trace_add("write", show_span)
-        show_span()
-        run_row = ttk.Frame(w, padding=(12, 4))
-        run_row.pack(fill="x")
-        self.lab_btn = ttk.Button(run_row, text="Run the Lab", style="Accent.TButton", command=lambda: start())
-        self.lab_btn.pack(side="left")
-        self.lab_bar = ttk.Progressbar(run_row, length=300, mode="determinate", maximum=1.0)
-        self.lab_bar.pack(side="left", padx=10)
-        self.lab_status = ttk.Label(run_row, text="", foreground=MUTED)
-        self.lab_status.pack(side="left")
-        self.lab_summary = tk.Label(w, text="", bg=BG, fg=TEXT, anchor="w", justify="left", padx=12, font=("", 10, "bold"),
-                                    wraplength=960)
-        self.lab_summary.pack(fill="x", pady=(4, 2))
-        mid = ttk.Frame(w, padding=(12, 0))
-        mid.pack(fill="both", expand=True)
-        t = self.lab_tree = self.make_tree(
-            mid, ("strategy", "pace", "stops", "train", "test", "edge", "dd", "trades", "verdict", "round"),
-            (220, 65, 200, 75, 85, 80, 70, 55, 140, 45),
-            ("Strategy", "Pace", "Own stops and traits", "Learned on", "Unseen prices", "vs holding", "Worst drop", "Trades", "Verdict", "Round"))
-        t.configure(selectmode="extended")
-        t.tag_configure("pass", foreground=GREEN)
-        t.tag_configure("fail", foreground=MUTED)
-        t.tag_configure("meh", foreground="#fbbf24" if DARK else "#b45309")
-        self.lab_rows = []
-        b = ttk.Frame(w, padding=12)
-        b.pack(fill="x")
-
-        def picked(only_passed=True):
-            sel = [self.lab_rows[int(i)] for i in t.selection()]
-            return sel or [r for r in self.lab_rows if r["passed"] or not only_passed]
-
-        def export():
-            rows = picked()
-            if not rows:
-                return messagebox.showinfo("Bot Lab", "No bots passed. Select rows to export them anyway.", parent=w)
-            p = filedialog.asksaveasfilename(title="Export Lab bots", defaultextension=".json", parent=w,
-                                             initialfile="lab-passed-bots.json", filetypes=[("Bot file", "*.json")])
-            if p:
-                E.save_bots_file(p, E.export_bots(rows, self.version, note=self.lab_note))
-                self.write(f"Exported {len(rows)} Bot Lab bots to {p}")
-
-        def to_hof():
-            rows = picked()
-            if not rows:
-                return messagebox.showinfo("Bot Lab", "No bots passed. Select rows to add them anyway.", parent=w)
-            n = E.induct(E.export_bots(rows, self.version, note=self.lab_note)["bots"], self.version)
-            self.write(f"Added {n} Bot Lab bots to the Hall of Fame.", "good")
-
-        def to_run():
-            if not self.tourn or not self.seeded:
-                return messagebox.showinfo("Bot Lab", "Start the bot with Wildcard ticked first.", parent=w)
-            closes = {c: self.hist[c] for c in self.session_coins}
-            n = 0
-            for r in picked():
-                if self.tourn.add_variant(r["name"], r["params"], closes, r.get("size", 1.0), note="From the Bot Lab:",
-                                          tf=r["tf"], risk=r.get("risk"), traits=r.get("traits"), vetoes=r.get("vetoes"), layers=r.get("layers"), origin="bot lab"):
-                    n += 1
-            self.flush_events()
-            self.refresh_board()
-            self.write(f"Added {n} Bot Lab bots to this run. Their pace counts in your bar length "
-                       f"({E.fmt_bar(self.session_bar)}), not the Lab's candle size.")
-        ttk.Button(b, text="Export passed...", style="Accent.TButton", command=export).pack(side="left")
-        ttk.Button(b, text="Add passed to Hall of Fame", command=to_hof).pack(side="left", padx=6)
-        ttk.Button(b, text="Add passed to this run", command=to_run).pack(side="left")
-        ttk.Button(b, text="Catch passed", command=lambda: self.catch_rows(picked(), "bot lab") if picked() else
-                   messagebox.showinfo("Bot Lab", "No bots passed. Select rows to catch them anyway.", parent=w)).pack(side="left", padx=6)
-        ttk.Label(b, text="Select rows to use them instead of the passed ones.", foreground=MUTED).pack(side="left", padx=10)
-        ttk.Button(b, text="Close", command=w.destroy).pack(side="right")
-
-        def start():
-            if getattr(self, "lab_busy", False):
-                return
-            cs = [c for c, v in self.coin_vars.items() if v.get()]
-            if not cs:
-                return messagebox.showinfo("Bot Lab", "Tick at least one coin first.", parent=w)
-            try:
-                n_c, n_r = int(count.get()), int(rounds.get())
-                assert 300 <= n_c <= 8000 and 1 <= n_r <= 10
-            except Exception:
-                return messagebox.showerror("Bot Lab", "Candles must be 300 to 8000 and rounds 1 to 10.", parent=w)
-            self.cfg.update(lab_gran=gran.get(), lab_count=n_c, lab_rounds=n_r, lab_split=split.get())
-            E.save_json(CONFIG_PATH, self.cfg)
-            frac = int(split.get().rstrip("%")) / 100
-            self.lab_busy = True
-            self.lab_btn.config(state="disabled", text="Running...")
-            t.delete(*t.get_children())
-            self.lab_rows = []
-            self.lab_summary.config(text="")
-            self.lab_note = f"Bot Lab, {', '.join(cs)}, {gran.get()} candles"
-            s = dict(self.settings)
-            threading.Thread(target=self._lab_work, args=(cs, LAB_CANDLES[gran.get()], n_c, n_r, frac, s, self.cur_quote()),
-                             daemon=True).start()
-
-    def _lab_work(self, coins, gran, count, rounds, frac, settings, quote):
-        try:
-            closes, extra = {}, {}
-            for i, c in enumerate(coins):
-                self.q.put(("lab", ("progress", (f"Downloading {c} history...", 0.1 * i / len(coins)))))
-                d = E.fetch_ohlcv(c, gran, count, quote)
-                closes[c], extra[c] = d["c"], dict(h=d["h"], l=d["l"], v=d["v"])
-            L = min(len(v) for v in closes.values())
-            if L < 300:
-                return self.q.put(("lab", ("fail", f"Only {L} candles came back. Try a bigger candle size or fewer coins.")))
-            seen, rows, sums = set(), [], []
-            for r in range(rounds):
-                def prog(stage, d, n, r=r):
-                    part = (0.75 if stage == "train" else 0.25) * d / max(n, 1) + (0 if stage == "train" else 0.75)
-                    self.q.put(("lab", ("progress", (f"Round {r + 1} of {rounds}: "
-                                                     f"{'evolving bots' if stage == 'train' else 'testing on unseen prices'}...",
-                                                     0.1 + 0.9 * (r + part) / rounds))))
-                res = E.run_lab(closes, settings, train_frac=frac, seed=1000 + r, progress=prog, extra=extra)
-                sums.append(res)
-                for row in res["rows"]:
-                    k = E.bot_key(row)
-                    if k in seen:
-                        continue
-                    seen.add(k)
-                    row["round"] = r + 1
-                    rows.append(row)
-            self.q.put(("lab", ("done", (rows, sums, L, gran))))
-        except Exception as e:
-            self.q.put(("lab", ("fail", f"{e.__class__.__name__}: {e}")))
-
-    def on_lab_msg(self, kind, data):
-        if kind != "progress":
-            self.lab_busy = False
-        if getattr(self, "lab_win", None) is None or not self.lab_win.winfo_exists():
-            if kind == "done":
-                rows = data[0]
-                self.write(f"Bot Lab finished: {sum(r['passed'] for r in rows)} of {len(rows)} bots passed on unseen prices.")
-            return
-        if kind == "progress":
-            text, frac = data
-            self.lab_status.config(text=text)
-            self.lab_bar["value"] = frac
-            return
-        self.lab_btn.config(state="normal", text="Run the Lab again")
-        if kind == "fail":
-            self.lab_status.config(text=data, foreground=RED)
-            self.lab_bar["value"] = 0
-            return
-        rows, sums, L, gran = data
-        self.lab_bar["value"] = 1.0
-        rows.sort(key=lambda r: (not r["passed"], -r["test_edge"]))
-        self.lab_rows = rows
-        t = self.lab_tree
-        bar_min = gran / 60
-        for i, r in enumerate(rows):
-            tag = "pass" if r["passed"] else "meh" if r["verdict"] == "Lost less than holding" else "fail"
-            t.insert("", "end", iid=str(i), tags=(tag,), values=(
-                friendly_label(r["name"], r["params"]), E.fmt_bar(r["tf"] * bar_min),
-                ", ".join(x for x in (E.risk_text(r.get("risk")), E.traits_text(r.get("traits"))) if x) or "-",
-                pct_txt(r["train_ret"]), pct_txt(r["test_ret"]), pct_txt(r["test_edge"]), f"{r['test_dd'] * 100:.1f}%",
-                r["test_trades"], r["verdict"], r["round"]))
-            r["lifetime"] = dict(return_pct=round(r["test_ret"] * 100, 2), vs_holding_pct=round(r["test_edge"] * 100, 2),
-                                 worst_drop_pct=round(r["test_dd"] * 100, 2), trades=r["test_trades"],
-                                 bar_minutes=bar_min, source="Bot Lab unseen-data test")
-        n_pass = sum(r["passed"] for r in rows)
-        hold = sum(s["test_hold"] for s in sums) / len(sums)
-        wild = sum(s["wildcard"]["ret"] for s in sums) / len(sums)
-        days = (L - sums[0]["split"]) * bar_min / 1440
-        self.lab_summary.config(
-            text=f"{n_pass} of {len(rows)} bots passed.  On the unseen last {days:.1f} days: just holding "
-                 f"{hold * 100:+.1f}%, the full Wildcard system {wild * 100:+.1f}% (average of {len(sums)} rounds). "
-                 + ("A bot that passes in several rounds is more trustworthy than a one-off."
-                    if len(sums) > 1 else "Run more rounds to see if results hold up."),
-            fg=GREEN if n_pass else TEXT)
-        self.lab_status.config(text="Done.", foreground=MUTED)
-        self.write(f"Bot Lab: {n_pass} of {len(rows)} bots passed on unseen prices (holding {hold * 100:+.1f}%).")
-
     # ---------------- bot picks coins ----------------
     def scout_then_start(self):
         self.write(f"Scouting Coinbase for {self.settings['auto_coins']} busy coins that are moving...")
@@ -9119,10 +10005,12 @@ class App:
         self._scouted = True
         self.toggle()
 
-    def show_shortcuts(self):
+    def show_shortcuts(self, parent=None):
+        if parent is None:
+            return self.open_hub("help", 'Shortcuts')
         self.info_window("Keyboard shortcuts", (
             "Ctrl+Enter    Start / stop the bot\n"
-            "Ctrl+L        Bot Lab\n"
+            "Ctrl+L        Learning (backtests, Training camp, Free roam)\n"
             "Ctrl+H        Hall of Fame\n"
             "Ctrl+K        Browse coins\n"
             "Ctrl+B        Bot Library\n"
@@ -9132,9 +10020,27 @@ class App:
             "Scoreboard: double-click a strategy for its detail card and chart. Select a strategy and pick a coin in "
             "the chart menu to see that bot's entries and exits on the main chart.\n"
             "Chart: hover for exact values, click the range buttons (30 ticks to All), drag the bar under the chart "
-            "to make it taller."))
+            "to make it taller."), parent=parent)
 
     # ---------------- settings / export / updates ----------------
+    EVERYDAY = ("trade_pct", "stop_loss", "take_profit", "trail_stop", "daily_loss", "max_coin_pct", "bot_allowance",
+                "max_spread_pct", "order_type", "max_bots", "bar_minutes", "ctx_tickers", "animations")
+    HIDDEN_SETTINGS = ()
+
+    def settings_groups(self):
+        """Everyday settings first; the full groups (minus those) are the advanced tabs."""
+        fields = {k: (k, lab, typ) for _, _, fs in SETTING_GROUPS for (k, lab, typ) in fs if typ != "head"}
+        out = [("Everyday", "The settings most people change. Tick 'Show advanced settings' below for everything else.",
+                [fields[k] for k in self.EVERYDAY if k in fields])]
+        for title, blurb, fs in SETTING_GROUPS:
+            keep = [f for f in fs if f[0] not in self.EVERYDAY and f[0] not in self.HIDDEN_SETTINGS]
+            while keep and keep[-1][2] == "head":
+                keep.pop()
+            keep = [f for i_, f in enumerate(keep) if not (f[2] == "head" and i_ + 1 < len(keep) and keep[i_ + 1][2] == "head")]
+            if any(f[2] != "head" for f in keep):
+                out.append((title, blurb, keep))
+        return out
+
     def open_settings(self):
         if getattr(self, "settings_win", None) is not None and self.settings_win.winfo_exists():
             return self.settings_win.lift()
@@ -9146,9 +10052,12 @@ class App:
         nb = ttk.Notebook(outer)
         nb.pack()
         ents = {}
-        for title, blurb, fields in SETTING_GROUPS:
+        adv_tabs = []
+        for title, blurb, fields in self.settings_groups():
             f = ttk.Frame(nb, padding=10)
             nb.add(f, text=f"  {title}  ")
+            if title != "Everyday":
+                adv_tabs.append(f)
             ttk.Label(f, text=blurb, foreground=MUTED, wraplength=620).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
             lpos, lr, lc = {}, 1, 0  # Learning tab: switches two per row
             for r, (key, label, typ) in enumerate(fields, start=1):
@@ -9177,11 +10086,17 @@ class App:
                     if title == "Learning":
                         ttk.Checkbutton(f, text=label, variable=var).grid(row=r, column=lpos[r_][1], sticky="w", pady=2,
                                                                           padx=(0, 16))
-                    else:
-                        ttk.Checkbutton(f, text=label, variable=var).grid(row=r, column=0, columnspan=2, sticky="w", pady=3)
+                    else:  # long switch labels wrap instead of stretching the window
+                        cf = ttk.Frame(f)
+                        cf.grid(row=r, column=0, columnspan=2, sticky="w", pady=3)
+                        ttk.Checkbutton(cf, variable=var).pack(side="left", anchor="n")
+                        lb = ttk.Label(cf, text=label, wraplength=560, justify="left", cursor="hand2")
+                        lb.pack(side="left", anchor="w")
+                        lb.bind("<Button-1>", lambda e, v_=var: v_.set(not v_.get()))
                     ents[key] = (var, bool)
                     continue
-                ttk.Label(f, text=label, wraplength=360, justify="left").grid(row=r, column=0, sticky="w", pady=3)
+                ttk.Label(f, text=label, wraplength=520 if title == "Everyday" else 360, justify="left").grid(
+                    row=r, column=0, sticky="w", pady=2 if title == "Everyday" else 3)
                 if typ == "bar":
                     var = tk.StringVar(value=BAR_LABELS.get(float(cur), "1 min"))
                     ttk.Combobox(f, textvariable=var, values=list(BAR_LABELS.values()), state="readonly", width=12).grid(
@@ -9202,6 +10117,9 @@ class App:
                     var = tk.StringVar(value=ORDER_LABELS.get(cur, ORDER_LABELS["market"]))
                     ttk.Combobox(f, textvariable=var, values=list(ORDER_LABELS.values()), state="readonly", width=34).grid(
                         row=r, column=1, padx=(10, 0), sticky="w")
+                elif typ == "tickers":
+                    var = tk.StringVar(value=", ".join(cur or []))
+                    ttk.Entry(f, textvariable=var, width=30).grid(row=r, column=1, padx=(10, 0), sticky="w")
                 else:
                     var = tk.StringVar(value="" if cur is None else str(cur))
                     ttk.Entry(f, textvariable=var, width=44 if typ is str else 8,
@@ -9242,6 +10160,15 @@ class App:
                     "and no spread, but they only fill if the market comes to them. Safety stops and Sell everything "
                     "always use market orders so they happen right away.")).grid(row=len(fields) + 1, column=0, columnspan=2,
                                                                                  sticky="w", pady=(10, 0))
+        adv = tk.BooleanVar(value=bool(self.cfg.get("settings_advanced", False)))
+
+        def show_adv():
+            self.cfg["settings_advanced"] = bool(adv.get())
+            for f_ in adv_tabs:
+                nb.tab(f_, state="normal" if adv.get() else "hidden")
+        ttk.Checkbutton(outer, text="Show advanced settings (how the farm breeds and learns, orders, timing, alerts, "
+                                    "Library and Hall of Fame)", variable=adv, command=show_adv).pack(anchor="w", pady=(6, 0))
+        show_adv()
         f = ttk.Frame(nb, padding=10)
         nb.add(f, text="  Strategy details  ")
         ttk.Label(f, text="Starting numbers for each strategy. Wildcard tweaks these on its own.",
@@ -9295,6 +10222,8 @@ class App:
                         new[k] = next(b for b, l in BAR_LABELS.items() if l == v)
                     elif typ == "order":
                         new[k] = next(o for o, l in ORDER_LABELS.items() if l == v)
+                    elif typ == "tickers":
+                        new[k] = [x.strip().upper() for x in v.replace(";", ",").split(",") if E.valid_coin(x.strip().upper())][:8]
                     elif typ is str or typ in ("anim", "chars", "eggs"):
                         new[k] = v.strip()
                     else:
