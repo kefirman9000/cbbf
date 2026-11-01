@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.17.0
+**Three new things the bots can learn**
+
+- **Time habits**: bots can grow "quiet hours" (never buys during a 6-hour stretch of the day, shown in your own time)
+  and "no weekend buying". Like every never-rule, each trade they skip is graded afterwards, so useful habits spread
+  to children and costly ones fade out.
+- **Sell in parts**: bots can evolve "sell half at +X% and let the rest run" (2% to 40%), keeping the second half on
+  their stops and trailing stop. Children inherit it, and it competes like any other gene.
+- **Crowd confidence**: your account trades bigger when several *different* strategies agree on a buy (x0.85 for one,
+  up to x1.3 for four or more) and smaller when the farm is split. Each trade's "why" says how many agreed and the
+  size it used.
+- All three can be switched off in Settings > Learning.
+
 ## 1.16.1
 **Free roam checks history first, test on any coin, and a smoother app**
 

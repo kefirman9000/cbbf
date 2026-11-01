@@ -914,6 +914,9 @@ DEFAULT_SETTINGS = {
     "lead_study": True,          # bots can evolve a "Bitcoin leads" study: BTC's recent move votes on other coins
     "post_review": True,         # after losing trades the farm notes which never-rule would have helped, and tries those more
     "islands": 3,                # separate sub-farms that only swap a champion now and then (1 = one big farm)
+    "time_habits": True,         # bots can learn quiet hours and weekends (never-rules graded in hindsight)
+    "scale_out": True,           # bots can learn to sell half at a gain and let the rest run
+    "agree_sizing": True,        # the account trades bigger when several different strategies agree, smaller when split
     "adapt_exits": True,         # bots can evolve stops and targets that widen in wild markets and tighten in calm ones
     "mut_memory": True,          # the farm remembers which kinds of change make winners and does more of those
     "multicore": True,           # warm up the islands on several processor cores at once
@@ -1042,6 +1045,23 @@ class Sim:
         self.cost[c] = self.cost.get(c, 0) + spend
         self.tbars.append(n)
         self.last = dict(side="buy", coin=c, qty=qty, price=fill, usd=spend, pl=None)
+        return True
+
+    def sell_part(self, c, px, n=0, frac=0.5):
+        """Sells part of a position (the rest stays, at the same average cost)."""
+        q = self.pos.get(c, 0)
+        if q <= 0 or not 0 < frac < 1:
+            return False
+        qp = q * frac
+        fill = px * (1 - self.slip)
+        proceeds = qp * fill * (1 - self.fee)
+        basis = self.cost.get(c, 0) * frac
+        self.fees += qp * fill * self.fee
+        self.cash += proceeds
+        self.last = dict(side="sell", coin=c, qty=qp, price=fill, usd=proceeds, pl=proceeds - basis, part=True)
+        self.pos[c] = q - qp
+        self.cost[c] = self.cost.get(c, 0) - basis
+        self.tbars.append(n)
         return True
 
     def sell(self, c, px, n=0):
@@ -1227,7 +1247,9 @@ def tournament_opts(settings):
                 htf_studies=bool(settings.get("htf_studies", True)), lead_study=bool(settings.get("lead_study", True)),
                 ctx=[c for c in (settings.get("ctx_tickers") or []) if valid_coin(c)] if settings.get("ctx_studies", True) else [],
                 post_review=bool(settings.get("post_review", True)), islands=max(1, min(6, int(settings.get("islands", 3) or 1))),
-                adapt_exits=bool(settings.get("adapt_exits", True)), mut_memory=bool(settings.get("mut_memory", True)))
+                adapt_exits=bool(settings.get("adapt_exits", True)), mut_memory=bool(settings.get("mut_memory", True)),
+                time_habits=bool(settings.get("time_habits", True)), scale_out=bool(settings.get("scale_out", True)),
+                agree_sizing=bool(settings.get("agree_sizing", True)))
 
 
 RISK_BOUNDS = {"sl": (0.5, 30.0), "tp": (0.5, 100.0)}  # a bot's own stop-loss / take-profit, % (0 = none)
@@ -1264,13 +1286,15 @@ TRAITS = {
     "confirm": dict(lo=2, hi=3, kind=int, text=lambda v: f"waits for {v} signals in a row"),
     "entries": dict(lo=1, hi=5, kind=int, text=lambda v: f"buys at most {v}x per position"),
     "exit":    dict(lo=1, hi=1, kind=int, text=lambda v: "sells only through its stops"),
+    "scale":   dict(lo=2.0, hi=40.0, kind=float, text=lambda v: f"sells half at +{v:g}% and lets the rest run"),
     "adapt":   dict(lo=1, hi=1, kind=int, text=lambda v: "stops widen in wild markets, tighten in calm ones"),
     "moods":   dict(lo=1, hi=14, kind=int, text=lambda v: "trades only when " + " / ".join(
         m for i, m in enumerate(MOODS) if v & (1 << i))),
 }
 TRAIT_NAMES = {"trail": "Trailing stop", "maxhold": "Max hold", "minhold": "Min hold", "cool": "Cooldown", "trend": "Trend filter",
                "minvol": "Min volatility", "rsicap": "Overbought guard", "confirm": "Confirmation",
-               "entries": "Max entries", "exit": "Stops-only exit", "moods": "Mood gate", "adapt": "Adaptive stops"}
+               "entries": "Max entries", "exit": "Stops-only exit", "moods": "Mood gate", "adapt": "Adaptive stops",
+               "scale": "Sell in parts"}
 
 
 def clean_traits(t):
@@ -1311,11 +1335,23 @@ VETOES = {
                     text=lambda x: f"never buys in the {x:g} hours before a Fed decision"),
     "postev":  dict(lo=0.5, hi=24, side="open", name="Let the news settle",
                     text=lambda x: f"never buys in the {x:g} hours after CPI, the jobs report or a Fed decision"),
+    "night":   dict(lo=1, hi=24, side="buy", name="Quiet hours",
+                    text=lambda x: f"never buys between {_local_hour(x - 1)} and {_local_hour(x + 5)} (your time)"),
+    "weekend": dict(lo=1, hi=1, side="buy", name="No weekend buying",
+                    text=lambda x: "never buys on weekends (Saturday and Sunday, UTC)"),
     "panic":   dict(lo=0.5, hi=5.0, side="sell", name="No panic selling",
                     text=lambda x: f"never sells on its strategy right after a {x:g}%+ one-bar drop (stops still work)"),
 }
 MAX_VETOES = 3
-EVENT_VETOES = ("preev", "prefed", "postev")  # only grown once the economic calendar is downloaded
+EVENT_VETOES = ("preev", "prefed", "postev")
+TIME_VETOES = ("night", "weekend")
+
+
+def _local_hour(h_utc):
+    """A UTC hour as this computer's clock time, like '2 am'."""
+    off = -(time.altzone if time.localtime().tm_isdst > 0 else time.timezone) / 3600
+    h = int(round(h_utc + off)) % 24
+    return f"{h % 12 or 12} {'am' if h < 12 else 'pm'}"  # only grown once the economic calendar is downloaded
 
 
 def clean_vetoes(d):
@@ -1327,7 +1363,7 @@ def clean_vetoes(d):
             x = 0
         if x > 0 and len(out) < MAX_VETOES:
             x = min(max(x, spec["lo"]), spec["hi"])
-            out[k] = int(round(x)) if k == "revenge" else round(x, 2)
+            out[k] = int(round(x)) if k in ("revenge", "night", "weekend") else round(x, 2)
     return out
 
 
@@ -1364,6 +1400,11 @@ def _veto(v, k, x, c, closes, n, extra, coins):
             return False
         base = sum(vol[-L - 1:-1]) / L
         return base > 0 and vol[-1] < x * base
+    if k in TIME_VETOES:
+        d = datetime.fromtimestamp(_bar_time(extra, c, v.sim), timezone.utc)
+        if k == "weekend":
+            return d.weekday() >= 5
+        return (d.hour - (int(x) - 1)) % 24 < 6
     if k in ("preev", "prefed", "postev"):
         if not events():
             return False
@@ -1635,7 +1676,14 @@ def bot_step(v, closes, n, coins, extra=None):
                 why = "trail"
             elif tr.get("maxhold") and n - v.since.get(c, n) >= tr["maxhold"] * v.tf:
                 why = "time"
+            scaled = v.__dict__.setdefault("scaled", {})
+            if not why and tr.get("scale") and not scaled.get(c) and r >= tr["scale"] * k_:
+                if sim.sell_part(c, last[c], n, 0.5):  # sell half at a gain; the rest rides with its stops
+                    scaled[c] = True
+                    v.sig[c] = "sell"
+                    v.why[c] = f"it sold half at +{r:.1f}% (sell in parts at +{tr['scale']:g}%)"
             if why:
+                scaled.pop(c, None)
                 sim.sell(c, last[c], n)
                 v.sig[c] = "sell"
                 v.why[c] = {"stop": f"its own safety stop ({v.risk['sl']:g}%)", "target": f"its own profit target ({v.risk['tp']:g}%)",
@@ -1892,6 +1940,7 @@ class Tournament:
         self.replaying = False
         self.o.update(opts or {})
         self.slowed, self.cool, self.add_cool, self.kind = [], {}, {}, {}
+        self.agree = {}  # coin -> (different strategies agreeing, size factor, how split the farm was)
         self.rng = rng or random.Random()
         self.n = 0
         self.events = []
@@ -1949,6 +1998,11 @@ class Tournament:
         v.review = bool(self.o.get("post_review", True))
         if not self.o.get("adapt_exits", True):
             v.traits.pop("adapt", None)
+        if not self.o.get("scale_out", True):
+            v.traits.pop("scale", None)
+        if not self.o.get("time_habits", True):
+            for k in TIME_VETOES:
+                (v.vetoes or {}).pop(k, None)
         if not self.o.get("htf_studies", True):
             v.layers.pop("htf", None)
         if not self.o.get("lead_study", True):
@@ -2129,7 +2183,8 @@ class Tournament:
             return {}
         out = {}
         for _ in range(self.rng.randint(1, 2)):
-            k = self.review_pick([k for k in VETOES if k not in out and (k not in EVENT_VETOES or events())])
+            k = self.review_pick([k for k in VETOES if k not in out and (k not in EVENT_VETOES or events())
+                                  and (k not in TIME_VETOES or self.o.get("time_habits", True))])
             out[k] = self.rng.uniform(VETOES[k]["lo"], VETOES[k]["hi"])
         return clean_vetoes(out)
 
@@ -2156,7 +2211,8 @@ class Tournament:
                 out[k] = x
                 stats[k] = [st[0] / 2, st[1] / 2]
         if len(out) < MAX_VETOES and self.rng.random() < 0.15 * self.mut_bias("rules"):
-            k = self.review_pick([k for k in VETOES if k not in out and (k not in EVENT_VETOES or events())])
+            k = self.review_pick([k for k in VETOES if k not in out and (k not in EVENT_VETOES or events())
+                                  and (k not in TIME_VETOES or self.o.get("time_habits", True))])
             out[k] = self.rng.uniform(VETOES[k]["lo"], VETOES[k]["hi"])
         out = clean_vetoes(out)
         return out, {k: s for k, s in stats.items() if k in out}
@@ -2522,6 +2578,13 @@ class Tournament:
             sig, mult, from_winner = "buy", bs / bw, act_buy
         elif sw > bw:
             sig, mult, from_winner = "sell", ss / sw, act_sell
+        if sig == "buy" and self.o.get("agree_sizing", True):
+            # several DIFFERENT strategies agreeing = more confidence; a split farm = less
+            kinds = {v.name for v in self.active + self.slowed if v.sig.get(c) == "buy"}
+            split = sw / (bw + sw) if bw + sw else 0.0
+            agree = min(1.3, 0.85 + 0.15 * (len(kinds) - 1)) * (1 - 0.6 * split)
+            self.agree[c] = (len(kinds), round(agree, 2), round(split, 2))
+            mult *= agree
         if sig and not from_winner:  # only shaky strategies want this: slow it down
             if self.cool.get(c, 0) > 0:
                 return None, 1.0
