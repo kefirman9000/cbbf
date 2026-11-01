@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.18.1
+- When Windows signs out or shuts down, CBBF now saves the whole farm and session first, so the bots pick up
+  from that exact point next time (before, up to 5 minutes of learning could be lost).
+
 ## 1.18.0
 - **Background mode (icon by the clock)**: File > "Run in the background" hides CBBF to a small icon next to the
   clock. It keeps training the bots on practice prices at a lower priority (anything you're doing comes first), skips

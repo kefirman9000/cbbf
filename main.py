@@ -704,6 +704,7 @@ class App:
         self.reset_state(1000.0)
         self.build_ui()
         root.protocol("WM_DELETE_WINDOW", self.on_close)
+        root.protocol("WM_SAVE_YOURSELF", self.on_shutdown)  # Windows is signing out or shutting down
         root.after(200, self.drain)
         root.after(5000, self.watchdog)
         root.after(400, self.auto_login)
@@ -900,6 +901,21 @@ class App:
         if self.tray is not None:
             self.tray.stop()
         self.root.destroy()
+
+    def on_shutdown(self):
+        """The computer is shutting down: save the farm and the session right now, and leave the "was running" mark,
+        so the bots carry on from this exact point next time."""
+        try:
+            self.save_farm(force=True)
+            self.slow_save()
+        except Exception:
+            pass
+        try:
+            self.cfg["was_running"] = bool(self.running)
+            E.save_json(CONFIG_PATH, self.cfg)
+            self.save_state()
+        except Exception:
+            pass
 
     # ---------------- background mode (icon by the clock) ----------------
     def tray_lib(self):
