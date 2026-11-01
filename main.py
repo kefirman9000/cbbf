@@ -648,6 +648,9 @@ def read_version():
 
 class App:
     def __init__(self, root):
+        # Background learning (Free roam, Slow farm, Training camp) shares Python with the window. Handing control
+        # back more often keeps the window responsive while they crunch numbers (default is every 5 ms).
+        sys.setswitchinterval(0.0005)
         self.root = root
         self.version = read_version()
         root.title("CBBF")
@@ -3224,7 +3227,7 @@ class App:
         return self.open_hub("help", tab)
 
     def open_reset(self):
-        """One Reset window: tick what to clear."""
+        """One Reset window: the account, the farm (optionally keeping some of its dens), a saved copy, or a saved farm back."""
         w = tk.Toplevel(self.root)
         w.title("Reset")
         w.resizable(False, False)
@@ -3234,30 +3237,113 @@ class App:
         acct = tk.BooleanVar(value=True)
         farm = tk.BooleanVar(value=False)
         what = "LIVE session tracking" if self.live else "practice account"
-        ttk.Checkbutton(f, text=f"The {what}: cash, contracts and trades"
+        ttk.Checkbutton(f, text=f"The {what}: cash, positions and trades"
                                 + ("" if self.live else " (you start again with the practice money on the left)"),
                         variable=acct).pack(anchor="w", pady=(10, 0))
-        ttk.Checkbutton(f, text="The farm: every bot goes, fresh eggs hatch at the next Start", variable=farm).pack(anchor="w", pady=(4, 0))
-        ttk.Label(f, foreground=MUTED, wraplength=460, justify="left", text=(
+        ttk.Checkbutton(f, text="The farm: fresh eggs hatch at the next Start", variable=farm).pack(anchor="w", pady=(4, 0))
+        # which dens to keep when the farm is reset
+        dens = {"beast": [], "rising": [], "egg": [], "hof": []}
+        if self.tourn:
+            hof_keys = {E.bot_key(b) for b in E.load_hof()}
+            for r in self.tourn.board():
+                if r["v"].key() in hof_keys:
+                    dens["hof"].append(r)
+                dens[self.tier(r)].append(r)
+        kf = ttk.Frame(f, padding=(22, 2, 0, 0))
+        kf.pack(anchor="w")
+        ttk.Label(kf, text="...but keep these bots (they rejoin the new farm, with what they learned):", foreground=MUTED).pack(anchor="w")
+        keep = {}
+        row = ttk.Frame(kf)
+        row.pack(anchor="w", pady=(2, 0))
+        for key, lab, on in (("beast", "BEASTS", True), ("rising", "Rising", False), ("egg", "Eggs", False),
+                             ("hof", "Hall of Fame bots on the farm", True)):
+            keep[key] = tk.BooleanVar(value=on and bool(dens[key]))
+            ttk.Checkbutton(row, text=f"{lab} ({len(dens[key])})", variable=keep[key]).pack(side="left", padx=(0, 12))
+        save = tk.BooleanVar(value=True)
+        ttk.Checkbutton(kf, text="Save a copy of the whole farm first (you can bring it back below)", variable=save).pack(anchor="w", pady=(4, 0))
+
+        def sync(*_):
+            st = "normal" if farm.get() else "disabled"
+            for wd in [c for r_ in (row,) for c in r_.winfo_children()] + [kf.winfo_children()[-1]]:
+                try:
+                    wd.config(state=st)
+                except tk.TclError:
+                    pass
+        farm.trace_add("write", sync)
+        sync()
+        ttk.Label(f, foreground=MUTED, wraplength=520, justify="left", text=(
             "Your Library, Hall of Fame, settings and downloaded history are always kept."
-            + ("\nLIVE contracts stay in your broker account but won't be tracked by OBF any more."
+            + ("\nLIVE positions stay in your broker account but won't be tracked by CBBF any more."
                if self.live and any(q > 0 for q in self.pos.values()) else ""))).pack(anchor="w", pady=(10, 0))
 
         def go():
             if not acct.get() and not farm.get():
                 return w.destroy()
+            kept, note = [], ""
+            if farm.get():
+                if save.get() and self.tourn:
+                    note = self.save_farm_copy()
+                rows = []
+                for key in ("beast", "rising", "egg", "hof"):
+                    if keep[key].get():
+                        rows += [r for r in dens[key] if r not in rows]
+                if rows:
+                    kept = E.export_bots(rows, self.version, note="kept through a farm reset")["bots"]
             w.destroy()
             if farm.get():
                 self.reset_farm(ask=False)
+                if kept:
+                    self.cfg["carry_bots"] = kept
+                    E.save_json(CONFIG_PATH, self.cfg)
             if acct.get():
                 self.reset(ask=False)
             self.write("Reset " + " and ".join(x for x, on in ((what, acct.get()), ("the farm", farm.get())) if on)
-                       + ". Press Start to begin again.", "good")
+                       + (f", keeping {len(kept)} bots for the new farm" if kept else "") + "." + (f" {note}" if note else "")
+                       + " Press Start to begin again.", "good")
+
+        def bring_back():
+            folder = os.path.join(E.HOME_DIR, "saved-farms")
+            p_ = filedialog.askopenfilename(title="Bring back a saved farm", initialdir=folder if os.path.isdir(folder) else E.HOME_DIR,
+                                            filetypes=[("Saved farm", "*.json")], parent=w)
+            if not p_:
+                return
+            d = E.load_json(p_, None)
+            if not isinstance(d, dict) or not isinstance(d.get("farm"), dict):
+                return messagebox.showerror("Reset", "That file isn't a saved farm.", parent=w)
+            if self.running:
+                self.toggle()
+            if self.tourn:
+                self.save_farm_copy()
+            shutil.copy2(p_, E.farm_path(self.live))
+            w.destroy()
+            if self.session and d.get("coins") == self.session_coins and float(d.get("bar", -1)) == float(self.session_bar):
+                t_ = self.load_farm()
+                if t_:
+                    self.tourn, self.seeded, self._restored_farm = t_, False, t_
+                    self.refresh_board()
+                    return self.write(f"Brought back the saved farm ({len(t_.vars)} bots). Press Start to carry on.", "good")
+            self.write(f"The saved farm is ready, but it was made for {', '.join(d.get('coins') or [])} on "
+                       f"{E.fmt_bar(float(d.get('bar', 1)))} decisions. Start a session with those to carry on with it "
+                       f"(your farm from just now was saved first).", "warn")
         b = ttk.Frame(f)
         b.pack(fill="x", pady=(14, 0))
+        ttk.Button(b, text="Bring back a saved farm...", command=bring_back).pack(side="left")
         ttk.Button(b, text="Cancel", command=w.destroy).pack(side="right")
         ttk.Button(b, text="Reset", style="Accent.TButton", command=go).pack(side="right", padx=6)
 
+    def save_farm_copy(self):
+        """Saves the current farm to saved-farms/ (to bring back later). Returns a short note."""
+        if not self.tourn:
+            return ""
+        folder = os.path.join(E.HOME_DIR, "saved-farms")
+        os.makedirs(folder, exist_ok=True)
+        path = os.path.join(folder, f"farm-{'live' if self.live else 'practice'}-{datetime.now():%Y%m%d-%H%M%S}.json")
+        try:
+            E.save_json(path, dict(coins=self.session_coins, bar=self.session_bar, saved_at=time.time(),
+                                   farm=self.tourn.to_state()))
+            return f"A copy of the old farm ({len(self.tourn.vars)} bots) was saved first."
+        except Exception:
+            return ""
 
     def reset_farm(self, ask=True):
         if ask and not messagebox.askyesno("Reset the farm", "Clear every bot on the farm and hatch a fresh one next time you "
@@ -3394,6 +3480,20 @@ class App:
                                   risk=d.get("risk"), traits=d.get("traits"), vetoes=d.get("vetoes"), layers=d.get("layers"), origin="saved")
             if saved:
                 self.q.put(("log", f"Loaded {len(saved)} saved strategies into the tournament."))
+            carry = self.cfg.pop("carry_bots", None) or []
+            for b in carry if not squad else []:  # bots kept through a farm reset
+                if b.get("name") not in E.STRATS:
+                    continue
+                v = tourn.add_variant(b["name"], b["params"], hist, b.get("size", 1.0), note="Kept from your last farm:",
+                                      tf=b.get("tf", 1), risk=b.get("risk"), traits=b.get("traits"), vetoes=b.get("vetoes"),
+                                      layers=b.get("layers"), origin="saved")
+                if v:
+                    for k_ in ("layer_stats", "veto_stats"):
+                        if isinstance(b.get(k_), dict):
+                            setattr(v, k_, {kk: list(x) for kk, x in b[k_].items()})
+            if carry:
+                self.q.put(("call", lambda: E.save_json(CONFIG_PATH, self.cfg)))
+                self.q.put(("log", (f"{len(carry)} bots you kept rejoined the new farm.", "good")))
             if self.settings.get("hof_load", True) and not squad:
                 have = {v.key() for v in tourn.vars}
                 hof = [b for b in E.load_hof() if E.bot_key(b) not in have][:10]

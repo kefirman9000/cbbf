@@ -3480,9 +3480,13 @@ def warm_islands(coins, start_cash, fee, pct, evolve, params, opts, cap, retire_
     try:
         import concurrent.futures as cf
         import multiprocessing as mp
-        ctx = mp.get_context("spawn") if sys.platform.startswith("win") or sys.platform == "darwin" else mp.get_context()
-        with cf.ProcessPoolExecutor(max_workers=min(k, workers or cpus), mp_context=ctx) as ex:
-            states = list(ex.map(_warm_island, jobs))
+        # "spawn" everywhere: forking a busy app (with threads running) can leave the helpers stuck on Linux
+        ctx = mp.get_context("spawn")
+        ex = cf.ProcessPoolExecutor(max_workers=min(k, workers or cpus), mp_context=ctx)
+        try:
+            states = list(ex.map(_warm_island, jobs, timeout=900))
+        finally:
+            ex.shutdown(wait=False, cancel_futures=True)
     except Exception as e:  # e.g. a locked-down computer: warm up on one core instead
         if log:
             log(f"Multi-core warmup unavailable ({e}); using one core.")

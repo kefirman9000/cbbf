@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.17.1
+- **Snappier window**: background work (Free roam, warm-up, history loading) no longer makes the window stutter.
+  The longest freezes while Free roam runs dropped from about 1.5 seconds to under 0.2.
+- **Reset can keep bots**: choose to reset the account, the farm, or both, and keep the BEASTS, Rising, Eggs or
+  Hall of Fame bots - they rejoin the next farm when you press Start.
+- **Saved farms**: Reset saves a copy of the whole farm first (on by default), and "Bring back a saved farm..."
+  restores one later.
+- Fixed: starting the farm a second time could get stuck while warming up islands on several processor cores.
+
 ## 1.17.0
 **Three new things the bots can learn**
 
