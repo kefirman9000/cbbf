@@ -113,6 +113,8 @@ SETTING_GROUPS = [
                "Lock in profit take over; these numbers are then the fallback. Fees are always counted.", [
         ("trade_pct", "Trade size: each buy spends this % of your starting money. Example: 10 with $1,000 = $100 per buy "
                       "(winning bots can scale this up to their trade-size multiplier)", float),
+        ("max_group_pct", "Coins that move together: never have more than this % of your starting money in a group of coins "
+                          "whose prices have been moving in step (0 = off)", float),
         ("max_coin_pct", "Limit per coin: never have more than this % of your starting money in any single coin. "
                          "Example: 50 with $1,000 = at most $500 in BTC", float),
         ("stop_loss", "Safety stop: automatically sell a coin if it falls this % below the price you paid. "
@@ -209,6 +211,8 @@ SETTING_GROUPS = [
         ("fee_pct", "Market order fee used in Practice mode (%)", float),
         ("maker_fee_pct", "Limit order (maker) fee used in Practice mode (%)", float),
         ("slippage", "Spread and slippage on market orders in Practice mode (%)", float),
+        ("learn_costs", "Learn real costs: after 5 LIVE market orders, use what they really lost to the spread and price "
+                        "movement when that's more than the line above (the bots then train with real costs)", bool),
     ]),
     ("Timing", "How often the bot looks at prices.", [
         ("bar_minutes", "How often strategies decide (15 sec is the fastest)", "bar"),
@@ -990,6 +994,13 @@ class App:
                         "Not tested yet." if top.twin is None else f"{top.twin * 100:+.1f}% vs holding on older prices."))
             dd = t.drawdown(top) * 100
             out.append((dd < 10, "The top bot isn't in a deep slump", f"{dd:.1f}% below its recent best (want under 10%)."))
+            dr = (self.cfg.get("crash_drills") or {}).get(str(top.uid))
+            if dr:
+                ok, txt = E.drill_verdict(dr)
+                out.append((bool(ok), "The top bot survives crash drills", txt))
+            else:
+                out.append((False, "The top bot survives crash drills",
+                            "Not run yet: press 'Run crash drills' below (replays it on the worst stretches since 2020)."))
         pl, hold = self.equity() - self.start_cash, self.bench_equity() - self.start_cash
         out.append((pl > 0 and pl >= hold, "The practice account is beating just holding",
                     f"{pl:+,.2f} vs {hold:+,.2f} holding this session."))
@@ -1020,7 +1031,45 @@ class App:
             ttk.Label(col, text=detail, foreground=MUTED, wraplength=440).pack(anchor="w")
         ttk.Label(f, text="Past results never guarantee future ones. Start LIVE small and keep the safety stops on.",
                   foreground=MUTED, wraplength=470).pack(anchor="w", pady=(10, 4))
-        ttk.Button(f, text="Close", command=w.destroy).pack(anchor="e")
+        msg = ttk.Label(f, text="", foreground=MUTED, wraplength=470)
+        msg.pack(anchor="w")
+        btns = ttk.Frame(f)
+        btns.pack(fill="x", pady=(6, 0))
+        ttk.Button(btns, text="Close", command=w.destroy).pack(side="right")
+        top = self.tourn.active[0] if self.tourn and self.tourn.active else None
+        if top is not None:
+            def run():
+                b.config(state="disabled")
+                key = str(top.uid)
+                coins, quote = list(self.session_coins), self.quote
+                fee, slip = E.cost_model(self.settings)
+                pct = self.settings["trade_pct"] / 100
+
+                def say(m):
+                    self.q.put(("call", lambda: msg.winfo_exists() and msg.config(text=m)))
+
+                def work():
+                    try:
+                        res = E.crash_drill(top, coins, quote, 1000.0, fee, pct, slip, progress=say)
+                    except Exception as e:
+                        return say(f"The crash drill couldn't finish ({e}).")
+
+                    def done():
+                        self.cfg.setdefault("crash_drills", {})[key] = res
+                        drills = self.cfg["crash_drills"]
+                        for k_ in list(drills)[:-30]:  # keep the latest 30 bots' results
+                            drills.pop(k_, None)
+                        E.save_json(CONFIG_PATH, self.cfg)
+                        lines = [f"{r['name']}: {r['ret'] * 100:+.1f}% (holding {r['hold'] * 100:+.1f}%)" for r in res]
+                        self.write("Crash drills for " + top.label + ":\n  " + "\n  ".join(lines or ["no stretches with history"]))
+                        if w.winfo_exists():
+                            w.destroy()
+                            self.open_live_check()
+                    self.q.put(("call", done))
+                threading.Thread(target=work, daemon=True).start()
+                say("Downloading the crash stretches (only the first time; about a minute per coin)...")
+            b = ttk.Button(btns, text="Run crash drills", style="Accent.TButton", command=run)
+            b.pack(side="right", padx=(0, 6))
 
     # ---------------- background mode (icon by the clock) ----------------
     def tray_lib(self):
@@ -4222,6 +4271,10 @@ class App:
                 mult = self.allowance_mult(c, voters, mult)
                 if mult <= 0:
                     sig = None
+            if sig == "buy":
+                mult = self.group_mult(c, mult, prices)
+                if mult <= 0:
+                    sig = None
             if sig:
                 self.pending_detail[c] = self.why_text(c, sig, voters, who)
                 ag = (self.tourn.agree.get(c) if self.tourn and sig == "buy" and self.tourn.kind.get(c) != "add" else None)
@@ -7076,6 +7129,81 @@ class App:
         w.geometry(f"+{max(0, x)}+{max(0, y)}")
         self._tour_win = w
 
+    def note_slip(self, x):
+        """One real market order: how much worse than the decision price it filled (a fraction; negative = better).
+        After 5 orders, the typical (median) cost is what Practice and the bots assume, if it's worse than your
+        Slippage setting. Bots then learn with what trading really costs you."""
+        obs = [float(v) for v in (self.cfg.get("fill_slip") or []) if isinstance(v, (int, float))]
+        obs = (obs + [max(-0.05, min(0.05, float(x)))])[-40:]
+        self.cfg["fill_slip"] = obs
+        if len(obs) >= 5:
+            med = sorted(obs)[len(obs) // 2]
+            learned = round(max(0.0, min(2.0, med * 100)), 3)
+            old = float(self.settings.get("slip_learned", 0) or 0)
+            self.settings["slip_learned"] = learned
+            self.cfg["settings"] = self.settings
+            if abs(learned - old) >= 0.02:
+                self.write(f"Real costs: your last {len(obs)} market orders typically filled {learned:.2f}% worse than the "
+                           f"price when they were decided. The bots now train with that cost"
+                           + ("." if learned > float(self.settings.get("slippage", 0) or 0) else
+                              " (your Slippage setting is higher, so that's still used)."), "good")
+                self.apply_costs()
+        try:
+            E.save_json(CONFIG_PATH, self.cfg)
+        except OSError:
+            pass
+
+    def apply_costs(self):
+        """Gives the running farm the current trading costs (bots grade trades and fees with these)."""
+        t = self.tourn
+        if not t:
+            return
+        fee, slip = E.cost_model(self.settings)
+        t.o["slip"] = slip
+        for v in t.vars:
+            v.sim.slip = slip
+            v.rt_cost = 2 * (t.fee + slip)
+            if v.fee_guard:
+                v.fee_guard = v.rt_cost
+
+    def group_mult(self, c, mult, prices):
+        """Coins that move together: the account never puts more than max_group_pct of its money into a group of
+        coins whose prices have been moving in step (BTC, ETH and SOL often fall on the same day)."""
+        pct = float(self.settings.get("max_group_pct", 0) or 0)
+        if pct <= 0:
+            return mult
+
+        def rets(k, n=120):
+            h = self.hist.get(k) or []
+            h = h[-n - 1:]
+            return [h[i] / h[i - 1] - 1 for i in range(1, len(h)) if h[i - 1]]
+
+        def corr(a, b):
+            n = min(len(a), len(b))
+            if n < 30:
+                return 0.0
+            a, b = a[-n:], b[-n:]
+            ma, mb = sum(a) / n, sum(b) / n
+            va, vb = sum((x - ma) ** 2 for x in a), sum((y - mb) ** 2 for y in b)
+            return sum((x - ma) * (y - mb) for x, y in zip(a, b)) / (va * vb) ** 0.5 if va > 0 and vb > 0 else 0.0
+        mine = rets(c)
+        group = [k for k in self.session_coins if k != c and self.pos.get(k, 0) > 0 and corr(mine, rets(k)) >= 0.6]
+        if not group:
+            return mult
+        held = sum(self.pos[k] * (prices.get(k) or self.last.get(k) or 0) for k in group) + \
+            self.pos.get(c, 0) * (prices.get(c) or 0)
+        room = self.start_cash * pct / 100 - held
+        want = self.trade_size(c, mult)
+        if want <= 0 or room >= want:
+            return mult
+        if room < 1:
+            if time.time() - getattr(self, "_group_note", 0) > 900:
+                self._group_note = time.time()
+                self.write(f"Skipped buying {c}: it has been moving together with {', '.join(group)}, and that group "
+                           f"already holds {pct:g}% of your money. (Settings > Basics > Coins that move together)", "warn")
+            return 0.0
+        return mult * room / want
+
     def allowance_mult(self, c, voters, mult):
         """Allowance per bot: shrinks (or skips) a buy when the bots voting for it already have their share of the
         account tied up. Returns the new size multiplier (0 = skip)."""
@@ -7637,6 +7765,7 @@ class App:
         return tuple(float(o.get(k) or 0) for k in ("filled_size", "filled_value", "total_fees"))
 
     def live_buy(self, c, spend, reason):
+        ref = self.last.get(c)  # the price when it decided: the fill shows what the spread and movement really cost
         mx = float(self.settings.get("max_spread_pct", 0) or 0)
         if mx and reason not in ("manual", "manual buy"):
             try:
@@ -7672,6 +7801,8 @@ class App:
             r = E.to_dict(self.client.market_order_buy(
                 client_order_id=str(uuid.uuid4()), product_id=f"{c}-{self.quote}", quote_size=f"{spend_left:.2f}"))
             q2, v2, f2 = self.await_fill(r)
+            if q2 > 0 and ref:
+                self.q.put(("call", lambda x_=(v2 / q2) / ref - 1: self.note_slip(x_)))
             self.q.put(("fill", ("buy", c, qty + q2, val + fee + v2 + f2, spend,
                                  reason + (" (limit + market)" if qty > 0 else ""))))
         except Exception as e:
@@ -7693,6 +7824,7 @@ class App:
         return Decimal("0")
 
     def live_sell(self, c, qty, reason):
+        ref = self.last.get(c)
         got_q = got_v = 0.0
         try:
             base_inc, px_inc = self.product_info(c)
@@ -7722,6 +7854,8 @@ class App:
             r = E.to_dict(self.client.market_order_sell(
                 client_order_id=str(uuid.uuid4()), product_id=f"{c}-{self.quote}", base_size=format(size, "f")))
             q, val, fee = self.await_fill(r)
+            if q > 0 and ref:
+                self.q.put(("call", lambda x_=1 - (val / q) / ref: self.note_slip(x_)))
             self.q.put(("fill", ("sell", c, got_q + q, got_v + val - fee, 0,
                                  reason + (" (limit + market)" if got_q > 0 else ""))))
         except Exception as e:

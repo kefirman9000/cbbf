@@ -953,6 +953,8 @@ DEFAULT_SETTINGS = {
     "fee_aware": True,           # don't sell for a profit smaller than the round-trip fees (losses and stops still sell)
     "max_trades_hour": 30,       # brake: most signal trades the account may make in an hour (0 = no limit)
     "trail_stop": 0.0,           # % trailing stop: sell if a coin falls this far from its high since buying (0 = off)
+    "learn_costs": True,         # use the slippage your own LIVE fills really had when it's worse than the setting below
+    "max_group_pct": 50,         # never more than this % of your money in coins that move together (0 = off)
     "slippage": 0.05,            # % lost to the bid/ask spread and price movement on each market order (Practice)
     "order_type": "market",      # "market" or "limit" (post-only maker orders, lower fees)
     "maker_fee_pct": 0.4,        # fee for limit orders that rest on the book (Practice)
@@ -1002,7 +1004,10 @@ def cost_model(settings):
     """(fee, slippage) as fractions for simulated trades. Limit orders pay the maker fee and no spread."""
     if settings.get("order_type") == "limit":
         return float(settings.get("maker_fee_pct", 0.4)) / 100, 0.0
-    return float(settings.get("fee_pct", 0.6)) / 100, float(settings.get("slippage", 0.0)) / 100
+    slip = float(settings.get("slippage", 0.0))
+    if settings.get("learn_costs", True):  # what your own LIVE market orders really lost to the spread and price movement
+        slip = max(slip, float(settings.get("slip_learned", 0.0) or 0.0))
+    return float(settings.get("fee_pct", 0.6)) / 100, slip / 100
 
 
 # ---------------- market mood ----------------
@@ -3580,6 +3585,65 @@ def warm_islands(coins, start_cash, fee, pct, evolve, params, opts, cap, retire_
         t._remove(worst[0], "farm made smaller")
     t._rate()
     return t
+
+
+# ---------------- crash drills: a bot replayed on the worst stretches in the history ----------------
+CRASHES = [  # (name, first day, last day); about 10 days each, 1-minute candles
+    ("March 2020 Covid crash", "2020-03-06", "2020-03-17"),
+    ("May 2021 crash", "2021-05-11", "2021-05-23"),
+    ("June 2021 slide", "2021-06-16", "2021-06-26"),
+    ("May 2022 LUNA collapse", "2022-05-04", "2022-05-14"),
+    ("June 2022 crash", "2022-06-08", "2022-06-19"),
+    ("November 2022 FTX collapse", "2022-11-05", "2022-11-14"),
+    ("August 2024 drop", "2024-07-31", "2024-08-08"),
+]
+DRILL_WARM = 300  # candles before each stretch that the bot only watches (its studies need a run-up)
+
+
+def crash_drill(g, coins, quote, start_cash, fee, pct, slip, progress=None):
+    """Bot genes g on each crash stretch, on whichever of its coins existed then. -> list of
+    dict(name, ret, hold, edge, coins). Uses the stored history (each stretch downloads once)."""
+    out = []
+    for k, (name, a, z) in enumerate(CRASHES):
+        if progress:
+            progress(f"Crash drill {k + 1}/{len(CRASHES)}: {name}...")
+        t0 = datetime.strptime(a, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()
+        t1 = datetime.strptime(z, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp() + 86400
+        rows = {}
+        for c in coins:
+            try:
+                d = fetch_range(c, 60, t0 - DRILL_WARM * 60, t1, quote)
+            except Exception:
+                continue
+            if d and len(d.get("c") or []) > (t1 - t0) / 60 * 0.8:
+                rows[c] = d
+        if not rows:
+            continue
+        common = sorted(set.intersection(*(set(d["t"]) for d in rows.values())))
+        if len(common) < DRILL_WARM + 500:
+            continue
+        idx = {c: {t: i for i, t in enumerate(d["t"])} for c, d in rows.items()}
+        closes = {c: [rows[c]["c"][idx[c][t]] for t in common] for c in rows}
+        extra = {c: {key: [rows[c][key][idx[c][t]] for t in common] for key in ("h", "l", "v", "t") if rows[c].get(key)}
+                 for c in rows}
+        a_i = next((i for i, t in enumerate(common) if t >= t0), DRILL_WARM)
+        ret = backtest_simple(g, closes, extra, a_i, len(common), start_cash, fee, pct, slip)
+        hold = sum(closes[c][-1] / closes[c][a_i - 1] - 1 for c in closes) / len(closes)
+        out.append(dict(name=name, ret=ret, hold=hold, edge=ret - hold, coins=list(closes)))
+    return out
+
+
+def drill_verdict(res):
+    """(passed, short text) for crash-drill results: it must lose clearly less than holding, on average and in most
+    stretches, and never lose more than 25% in one."""
+    if not res:
+        return None, "No crash stretches with history for these coins."
+    beat = sum(1 for r in res if r["edge"] > 0)
+    avg = sum(r["edge"] for r in res) / len(res)
+    worst = min(r["ret"] for r in res)
+    ok = avg > 0 and beat * 2 >= len(res) and worst > -0.25
+    return ok, (f"Beat holding in {beat} of {len(res)} crashes, {avg * 100:+.1f}% vs holding on average, "
+                f"worst stretch {worst * 100:+.1f}%.")
 
 
 def slice_extra(extra, i):

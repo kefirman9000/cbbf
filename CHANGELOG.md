@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.20.0
+- **Real costs**: after 5 LIVE market orders, CBBF compares each fill with the price when the trade was decided. If
+  your orders typically lose more to the spread and price movement than the Slippage setting assumes, Practice and the
+  bots switch to the real figure, so what they learn carries over to LIVE. Settings > "Learn real costs".
+- **Crash drills**: the Ready for LIVE? checklist has a "Run crash drills" button. It replays the top bot on 7 of the
+  worst stretches since 2020 (Covid, May 2021, LUNA, FTX, August 2024 and more), on whichever of your coins existed
+  then. To pass, it must lose less than holding on average and in most of them, and never lose more than 25% in one.
+  The first run downloads those stretches once.
+- **Coins that move together**: the account never puts more than 50% of your money (adjustable) into a group of coins
+  whose prices have been moving in step, so one bad day for BTC doesn't hit everything at once.
+  Settings > Basics > "Coins that move together".
+
 ## 1.19.1
 - **Start with Windows** is now also in the File menu (it was only on the icon). It runs CBBF as the icon by the clock,
   training on practice prices only. It sets up the icon add-on first if needed.
