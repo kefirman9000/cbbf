@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.16.1
+**Free roam checks history first, test on any coin, and a smoother app**
+
+- **Free roam only studies history that exists**: before picking a stretch it checks each coin's daily history on
+  Coinbase, so it never tries stretches before a coin was listed (HYPE before 2025) or while it was suspended (XRP
+  from early 2021 to mid 2023). No more "Not enough history" loops.
+- **Backtest and Training camp say exactly what's there**: "HYPE: Jan 2025 to now. Pick a stretch inside that, or
+  untick HYPE." A stretch that crosses a hole in a coin's history is trimmed to its longest unbroken part.
+- **Test on any coin**: Backtest and Training camp have a coins box (SOL, ADA, AVAX, LINK...), up to 8, separate from
+  the coins your farm trades.
+- **Smoother**: the chart redraws at most about once a second while prices tick (clicks still redraw at once), and
+  bots on the same pace share one prepared candle summary. In a test with about 50 bots, each price update now takes
+  57 ms instead of 133 ms.
+- Diagnostics no longer copies itself to the clipboard when opened.
+
 ## 1.16.0
 **Everything new from the options farm, made for crypto**
 

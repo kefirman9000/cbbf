@@ -96,11 +96,27 @@ def tail_series(p, tf=1, keep=LOOKBACK):
     return p[start::tf]
 
 
+_TX_CACHE = {}
+
+
 def tail_extra(p, x, tf=1, keep=LOOKBACK):
     """Highs, lows and volumes matching tail_series(p, tf, keep): each tf-bar candle gets the highest
-    high, lowest low and summed volume of its bars. None when the extra data doesn't line up."""
+    high, lowest low and summed volume of its bars. None when the extra data doesn't line up.
+    Many bots ask for the same summary on the same bar, so it's worked out once and shared (read-only)."""
     if not x or len(x.get("h", ())) != len(p) or len(x.get("l", ())) != len(p) or len(x.get("v", ())) != len(p):
         return None
+    key = (id(x["h"]), id(x["v"]), len(p), tf, keep, p[-1] if len(p) else None, x["v"][-1] if len(p) else None)
+    hit = _TX_CACHE.get(key)
+    if hit is not None:
+        return hit
+    if len(_TX_CACHE) > 4096:
+        _TX_CACHE.clear()
+    out = _tail_extra(p, x, tf, keep)
+    _TX_CACHE[key] = out
+    return out
+
+
+def _tail_extra(p, x, tf=1, keep=LOOKBACK):
     if tf <= 1:
         return dict(h=x["h"][-keep:], l=x["l"][-keep:], v=x["v"][-keep:])
     last = len(p) - 1
@@ -397,6 +413,69 @@ def fetch_range(coin, gran, start, end, quote="USD", note=None):
     ts = sorted(rows)
     seq = [rows[t] for t in ts]
     return dict(c=[r[0] for r in seq], h=[r[1] for r in seq], l=[r[2] for r in seq], v=[r[3] for r in seq], t=ts)
+
+
+class NoHistory(RuntimeError):
+    """Coinbase has no (or too little) history for what was asked."""
+
+
+_AVAIL = {}
+
+
+def coin_days(coin, quote="USD", max_age=6 * 3600):
+    """The days (UTC midnight timestamps) on which Coinbase actually has candles for this coin, from its daily
+    history (a handful of requests, then stored like any other history). Coins listed late, or suspended for a
+    while (XRP from 2021 to 2023), simply have no days there."""
+    key = (coin, quote)
+    hit = _AVAIL.get(key)
+    if hit and time.time() - hit[0] < max_age:
+        return hit[1]
+    d = fetch_range(coin, 86400, HIST_START, time.time(), quote)
+    days = sorted({int(t) // 86400 * 86400 for t in d["t"]})
+    _AVAIL[key] = (time.time(), days)
+    return days
+
+
+def common_days(coins, quote="USD"):
+    """Days every one of these coins has history (sorted)."""
+    sets = [set(coin_days(c, quote)) for c in coins]
+    return sorted(set.intersection(*sets)) if sets else []
+
+
+def coverage(days_set, a, b):
+    """Share of the days between a and b that are in days_set."""
+    d0, d1 = int(a) // 86400 * 86400, int(b) // 86400 * 86400
+    n = max(1, (d1 - d0) // 86400 + 1)
+    return sum(1 for d in range(d0, d1 + 1, 86400) if d in days_set) / n
+
+
+def history_text(coin, quote="USD"):
+    """'BTC: Jul 2015 to now' style description of a coin's history, including any long gap."""
+    days = coin_days(coin, quote)
+    if not days:
+        return f"{coin}: no history on Coinbase"
+    gaps = [(days[i - 1], days[i]) for i in range(1, len(days)) if days[i] - days[i - 1] > 7 * 86400]
+    fmt = lambda t: datetime.fromtimestamp(t, timezone.utc).strftime("%b %Y")
+    txt = f"{coin}: {fmt(days[0])} to " + ("now" if time.time() - days[-1] < 3 * 86400 else fmt(days[-1]))
+    if gaps:
+        txt += " (missing " + ", ".join(f"{fmt(a + 86400)} to {fmt(b - 86400)}" for a, b in gaps[:2]) + ")"
+    return txt
+
+
+def longest_run(times, gran):
+    """(start index, end index) of the longest stretch of these bar times with no gap over a day (or 6 candles)."""
+    if not times:
+        return 0, 0
+    lim = max(6 * gran, 86400 + gran)
+    best, start = (0, 1), 0
+    for i in range(1, len(times)):
+        if times[i] - times[i - 1] > lim:
+            if i - start > best[1] - best[0]:
+                best = (start, i)
+            start = i
+    if len(times) - start > best[1] - best[0]:
+        best = (start, len(times))
+    return best
 
 
 def bars_per_day(gran):
