@@ -26,7 +26,7 @@ jobs:
         run: |
           V=${{ steps.v.outputs.version }}
           mkdir -p dist/CBBF
-          cp main.py engine.py icon_data.py VERSION README.md CHANGELOG.md requirements.txt "Run CBBF.bat" dist/CBBF/
+          cp main.py engine.py icon_data.py tray.py VERSION README.md CHANGELOG.md requirements.txt "Run CBBF.bat" dist/CBBF/
           (cd dist && zip -qr "CBBF-$V.zip" CBBF)
           {
             echo "**Download:** \`CBBF-$V.zip\` below. Extract the whole folder and double-click **Run CBBF.bat** (Windows) or run \`python3 main.py\`."

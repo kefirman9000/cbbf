@@ -941,6 +941,7 @@ DEFAULT_SETTINGS = {
     "why_popup": True,           # LIVE: show a small "why did it trade?" note for every real trade
     "weekly_report": True,       # write a weekly report (and send it to Discord / Telegram if set up)
     "bg_mode": True,             # minimized: skip all drawing and check prices less often
+    "tray_autotrain": True,      # started in the background (icon by the clock): train on practice prices right away
     "vetoes": True,              # bots can evolve never-rules, each graded by what the blocked trade would have done
     "prove_live": True,          # a bot can only be Winning after it also made money on prices it hadn't seen yet
     "risk_adjusted": True,       # rank winners by gain per unit of downside swing, not raw gain

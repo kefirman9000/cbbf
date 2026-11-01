@@ -214,6 +214,8 @@ SETTING_GROUPS = [
         ("egg_colors", "Egg colours: by dragon type, or all purple (royal eggs from your own bots are always gold, "
                        "famous strategies silver)", "eggs"),
         ("bg_mode", "Background mode: while CBBF is minimized, skip all drawing and check watchlist prices less often", bool),
+        ("tray_autotrain", "Icon by the clock: start training on practice prices as soon as CBBF starts in the background "
+                           "(File > Run in the background). LIVE never starts by itself", bool),
         ("characters", "Dragons: themed by strategy (fire, ice, lightning, space; resting bots are skeletons) or classic (coloured by status)", "chars"),
     ]),
     ("Alerts", "Get a message on your phone when something happens. Leave blank to turn off.", [
@@ -648,7 +650,8 @@ def read_version():
 
 
 class App:
-    def __init__(self, root):
+    def __init__(self, root, tray=False):
+        self.tray_mode, self.tray = bool(tray), None  # tray: started in the background (icon by the clock)
         # Background learning (Free roam, Slow farm, Training camp) shares Python with the window. Handing control
         # back more often keeps the window responsive while they crunch numbers (default is every 5 ms).
         sys.setswitchinterval(0.0005)
@@ -704,18 +707,23 @@ class App:
         root.after(200, self.drain)
         root.after(5000, self.watchdog)
         root.after(400, self.auto_login)
-        root.after(700, self.maybe_welcome)
+        if not self.tray_mode:  # no pop-ups while starting quietly in the background
+            root.after(700, self.maybe_welcome)
         root.after(4000, self.start_tg_remote)
         if self.cfg.get("fred_key") and time.time() - E.events_fetched() > 7 * 86400:
             root.after(6000, lambda: self.fetch_calendar(quiet=True))
         root.after(20000, self.start_free_roam)
-        root.after(1500, self.maybe_setup)
+        if not self.tray_mode:
+            root.after(1500, self.maybe_setup)
         root.after(4000, self.auto_check_update)
         root.after(1200, self.restore_last_session)
-        root.after(2500, self.auto_resume)
+        root.after(3500 if self.tray_mode else 2500, self.tray_autotrain if self.tray_mode else self.auto_resume)
         if self.migrated:
             root.after(900, lambda: self.write("Welcome to CBBF. Your data from the old Desk Utils folder was copied over.", "good"))
         self.fit_and_center()
+        if self.tray_mode:
+            root.withdraw()
+            root.after(300, self.tray_boot)
 
     # ---------------- state ----------------
     def reset_state(self, cash):
@@ -868,7 +876,11 @@ class App:
             self.shadow_live, self.shadow_curve = None, []
 
     def on_close(self):
-        if self.running and not messagebox.askyesno(
+        if self.tray is not None and not getattr(self, "_quitting", False):
+            return self.hide_to_tray()  # the X hides the window; Quit (in the File menu or on the icon) quits
+        quiet = getattr(self, "_quitting", False) == "tray" and not (self.running and self.live)
+        self._quitting = False
+        if self.running and not quiet and not messagebox.askyesno(
                 "Quit", "The bot is running. Quitting stops it (open positions stay open).\n\nQuit anyway?"):
             return
         self.cfg["was_running"] = bool(self.running)  # closed while running: pick it up next time
@@ -885,7 +897,165 @@ class App:
         except Exception:
             pass
         self.save_state()
+        if self.tray is not None:
+            self.tray.stop()
         self.root.destroy()
+
+    # ---------------- background mode (icon by the clock) ----------------
+    def tray_lib(self):
+        try:
+            import tray as T
+            return T
+        except Exception:
+            return None
+
+    def go_background(self):
+        """File > Run in the background: hide the window to an icon by the clock (installs the icon add-on once)."""
+        T = self.tray_lib()
+        if T is None:
+            return messagebox.showerror("Background mode", "tray.py is missing from the CBBF folder. Updating CBBF puts it back.")
+        if self.tray is not None:
+            return self.hide_to_tray()
+        if T.tray_ready():
+            return self.start_tray(hide=True)
+        if not messagebox.askyesno("Background mode", "Background mode needs two small add-ons (pystray and pillow) "
+                                                      "for the icon by the clock.\n\nInstall them now?"):
+            return
+        self.write("Installing the add-ons for background mode...")
+
+        def work():
+            ok, msg = E.install_packages(T.TRAY_PIP, lambda line: None)
+            self.q.put(("call", lambda: self.start_tray(hide=True) if ok and T.tray_ready() else
+                        self.write("Background mode couldn't be set up: " + msg, "bad")))
+        threading.Thread(target=work, daemon=True).start()
+
+    def tray_boot(self):
+        """Started with --tray (for example when Windows starts): icon by the clock, no window."""
+        T = self.tray_lib()
+        if T is None or not T.tray_ready():
+            self.tray_mode = False
+            self.root.deiconify()
+            return self.write("Background mode needs its add-ons: use File > Run in the background once to set it up.", "warn")
+        self.start_tray(hide=True, quiet=True)
+
+    def start_tray(self, hide=True, quiet=False):
+        T = self.tray_lib()
+        if self.tray is None:
+            import icon_data
+            acts = dict(show=self.show_window, toggle=self.tray_toggle, live=self.tray_live,
+                        autostart=self.tray_autostart, quit=self.tray_quit)
+            self.tray = T.Tray("CBBF", "".join(icon_data.ICON_64), lambda fn: self.q.put(("call", fn)),
+                               lambda: getattr(self, "_tray_st", {}), acts)
+            try:
+                self.tray_tick(loop=False)
+                self.tray.start()
+            except Exception as e:
+                self.tray = None
+                self.root.deiconify()
+                return self.write(f"Background mode couldn't start its icon ({e}).", "bad")
+            self.root.after(10000, self.tray_tick)
+        if hide:
+            self.hide_to_tray(quiet=quiet)
+
+    def hide_to_tray(self, quiet=False):
+        self.root.withdraw()
+        self.apply_awake()
+        if not quiet and not getattr(self, "_tray_told", False):
+            self._tray_told = True
+            self.tray.notify("CBBF keeps working here. Click the icon to open it, right-click for options.")
+        self.write("Running in the background (icon by the clock).")
+
+    def show_window(self):
+        self.root.deiconify()
+        self.root.lift()
+        try:
+            self.root.focus_force()
+        except Exception:
+            pass
+        self.apply_awake()
+        self.on_restore()
+
+    def tray_hidden(self):
+        try:
+            return self.tray is not None and self.root.state() == "withdrawn"
+        except Exception:
+            return False
+
+    def tray_tick(self, loop=True):
+        """Keeps the icon's tooltip and menu up to date (every 10 seconds, cheap)."""
+        T = self.tray_lib()
+        live = bool(self.running and self.live)
+        if self.running and self.session:
+            pl = self.equity() - self.start_cash
+            line = (f"LIVE bot running, {pl:+,.2f}" if live else f"Training on practice prices, {pl:+,.2f}")
+        else:
+            line = "Paused"
+        self._tray_st = dict(line=line, live=bool(self.session and self.live),
+                             toggle=("Stop the LIVE bot" if live else "Pause training") if self.running else
+                             ("Start the LIVE bot..." if self.session and self.live else "Resume training"),
+                             autostart=bool(T and T.autostart_enabled("CBBF")))
+        if self.tray is not None:
+            self.tray.set_title(f"CBBF: {line}")
+            self.tray.refresh_menu()
+            if loop:
+                self.root.after(10000, self.tray_tick)
+
+    def tray_autotrain(self):
+        """Background start: train on practice prices. A LIVE session is never started from here."""
+        if self.cfg.get("last_mode") == "live" and self.cfg.get("was_running") and self.tray is not None:
+            self.tray.notify("Your LIVE bot was running when CBBF last closed. It stays paused until you choose "
+                             "Go LIVE on this icon (you'll type LIVE).")
+        if self.running or (self.session and self.live) or not self.settings.get("tray_autotrain", True):
+            return
+        if not self.session:
+            self.mode_var.set("paper")
+            self.wild_var.set(True)
+            self.toggle_wild()
+        self._auto_resume = True
+        try:
+            self.toggle()
+        finally:
+            self._auto_resume = False
+        if self.running:
+            self.write("Background mode: the bots are training on practice prices.", "good")
+        self.tray_tick(loop=False)
+
+    def tray_toggle(self):
+        if not self.running and self.session and self.live:
+            self.show_window()  # starting LIVE always goes through the window (type LIVE)
+        self.toggle()
+        self.tray_tick(loop=False)
+
+    def tray_live(self):
+        self.show_window()
+        if not (self.session and self.live):
+            self.switch_mode("live")  # asks first
+        if self.mode_var.get() == "live" and not self.running:
+            self.toggle()  # asks you to type LIVE
+        self.tray_tick(loop=False)
+
+    def tray_autostart(self):
+        T = self.tray_lib()
+        if T is None:
+            return
+        on = not T.autostart_enabled("CBBF")
+        if T.set_autostart("CBBF", on, os.path.join(HERE, "main.py")):
+            self.write("CBBF will start in the background when you log in to Windows (practice training only)."
+                       if on else "CBBF won't start with Windows any more.", "good")
+        else:
+            self.write("Couldn't change the Windows start-up setting.", "bad")
+        self.tray_tick(loop=False)
+
+    def tray_quit(self):
+        self._quitting = "tray"
+        self.on_close()
+
+    def poll_show(self):
+        """Another copy of CBBF was opened: show this one instead (checked every 2 seconds)."""
+        T = self.tray_lib()
+        if T and T.show_requested(E.HOME_DIR):
+            self.show_window()
+        self.root.after(2000, self.poll_show)
 
     # ---------------- UI ----------------
     def build_ui(self):
@@ -1280,7 +1450,8 @@ class App:
         m.add_command(label="Open data folder", command=self.open_data_folder)
         m.add_separator()
         m.add_command(label="Reset...", command=self.open_reset)
-        m.add_command(label="Quit", command=self.on_close)
+        m.add_command(label="Run in the background (icon by the clock)", command=self.go_background)
+        m.add_command(label="Quit", command=lambda: (setattr(self, "_quitting", True), self.on_close()))
         bar.add_cascade(label="File", menu=m)
         m = tk.Menu(bar, tearoff=0)
         m.add_command(label="Log in to Coinbase...", command=self.open_login)
@@ -1912,10 +2083,16 @@ class App:
         self.update_status()
 
     def apply_awake(self):
-        if self.running and self.settings.get("keep_awake", True):
+        quiet_bg = self.tray_hidden() and not (self.running and self.live)
+        if self.running and self.settings.get("keep_awake", True) and not quiet_bg:
             self.awake.on()
         else:
-            self.awake.off()
+            self.awake.off()  # background practice training never keeps the computer awake
+        if self.tray is not None and getattr(self, "_low_prio", None) != quiet_bg:
+            self._low_prio = quiet_bg
+            T = self.tray_lib()
+            if T:
+                T.set_low_priority(quiet_bg)  # whatever you're doing on the computer comes first
 
     def update_status(self):
         live = self.live if self.session else self.mode_var.get() == "live"
@@ -6177,10 +6354,19 @@ class App:
 
     def restart_app(self):
         try:
+            self._quitting = True
             self.on_close()
         except Exception:
             pass
+        self.release_lock()
         os.execv(sys.executable, [sys.executable] + sys.argv)
+
+    def release_lock(self):
+        if self.tray is not None:
+            self.tray.stop()
+        T = self.tray_lib()
+        if T:
+            T.release_single()
 
     # ---------------- phone remote (Telegram) ----------------
     def start_tg_remote(self):
@@ -6536,7 +6722,7 @@ class App:
     def in_bg(self):
         """True while minimized with Background mode on: screens skip their redraws until you come back."""
         try:
-            return bool(self.settings.get("bg_mode", True)) and self.root.state() == "iconic"
+            return (bool(self.settings.get("bg_mode", True)) and self.root.state() == "iconic") or self.tray_hidden()
         except Exception:
             return False
 
@@ -10622,6 +10808,7 @@ class App:
             self.root.destroy()
         except Exception:
             pass
+        self.release_lock()
         os.execv(sys.executable, [sys.executable, os.path.join(HERE, "main.py")])
 
 
@@ -10644,9 +10831,20 @@ def _report_crash():
 
 if __name__ == "__main__":
     try:
+        tray_start = "--tray" in sys.argv
+        try:
+            import tray as _T
+        except Exception:
+            _T = None
+        if _T and not _T.acquire_single(E.HOME_DIR):  # CBBF is already open (maybe as the icon by the clock)
+            if not tray_start:
+                _T.ask_running_copy_to_show(E.HOME_DIR)
+            sys.exit(0)
         root = tk.Tk()
         root.report_callback_exception = lambda *a: __import__("traceback").print_exception(*a)
-        App(root)
+        app = App(root, tray=tray_start)
+        if _T:
+            root.after(2000, app.poll_show)
         root.mainloop()
     except SystemExit:
         raise

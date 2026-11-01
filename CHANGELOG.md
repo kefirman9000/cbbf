@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.18.0
+- **Background mode (icon by the clock)**: File > "Run in the background" hides CBBF to a small icon next to the
+  clock. It keeps training the bots on practice prices at a lower priority (anything you're doing comes first), skips
+  all drawing, and never keeps the computer awake. Click the icon to open the window; right-click for Pause/Resume,
+  Go LIVE, "Start when Windows starts" and Quit. The first time, CBBF installs two small add-ons for the icon.
+- **Start with Windows**: tick it on the icon's menu and CBBF starts as the icon whenever you log in, training on
+  practice prices. LIVE never starts by itself: choose Go LIVE on the icon and type LIVE, once after each restart.
+- While CBBF is in the background, the window's X hides it back to the icon; Quit is in the File menu and on the icon.
+- Opening CBBF a second time brings up the copy that's already running instead of starting another one.
+
 ## 1.17.2
 - **Luck check**: a bot's score now counts for less while it rests on only a few trades (3 trades counts about a
   third, 40 trades almost fully). This applies to which bots steer your account and which ones breed, so a few lucky

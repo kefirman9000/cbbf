@@ -1,2 +1,4 @@
 coinbase-advanced-py>=1.7.0
 keyring>=24.0
+pystray>=0.19
+pillow>=9.0
