@@ -59,6 +59,7 @@ import engine as E
 UPDATE_REPO = "kefirman9000/cbbf"
 UPDATE_BRANCH = "main"
 HERE = os.path.dirname(os.path.abspath(__file__))
+APP_SHORT = "CBBF"
 CONFIG_PATH = os.path.join(E.HOME_DIR, "config.json")
 
 COINS = ["BTC", "ETH", "SOL", "XRP", "DOGE", "ADA", "AVAX", "LINK", "LTC", "DOT"]
@@ -172,6 +173,8 @@ SETTING_GROUPS = [
         ("seasons", "Seasons: a champion per market mood, woken when that mood returns", bool),
         ("coin_prefs", "Favourite coins: skip coins it keeps losing on (re-checked in hindsight)", bool),
         ("post_review", "Post-trade review: losing trades teach which never-rules to try next", bool),
+        ("learn_losses", "Learn from its own losses: a bot takes on a never-rule that would have stopped several of its "
+                         "losing trades (and few winners)", bool),
         ("multicore", "Learn on several processor cores at once at the start (faster warm-up)", bool),
     ]),
     ("Library & Hall of Fame", "The Bot Library keeps every bot you save, plus long-term winners the farm saves for you. "
@@ -213,6 +216,9 @@ SETTING_GROUPS = [
         ("animations", "Animations (Light uses less computer power)", "anim"),
         ("egg_colors", "Egg colours: by dragon type, or all purple (royal eggs from your own bots are always gold, "
                        "famous strategies silver)", "eggs"),
+        ("daily_recap", "Daily recap: once a day, how the bots did against just holding (in the log, and as a note on the "
+                        "icon by the clock)", bool),
+        ("auto_backup", "Weekly backup: keep a copy of your bots, farms and settings in the data folder (last 4 kept, no keys)", bool),
         ("bg_mode", "Background mode: while CBBF is minimized, skip all drawing and check watchlist prices less often", bool),
         ("tray_autotrain", "Icon by the clock: start training on practice prices as soon as CBBF starts in the background "
                            "(File > Run in the background). LIVE never starts by itself", bool),
@@ -718,6 +724,7 @@ class App:
             root.after(1500, self.maybe_setup)
         root.after(4000, self.auto_check_update)
         root.after(1200, self.restore_last_session)
+        root.after(90000, self.hourly)  # weekly backup, daily recap
         root.after(3500 if self.tray_mode else 2500, self.tray_autotrain if self.tray_mode else self.auto_resume)
         if self.migrated:
             root.after(900, lambda: self.write("Welcome to CBBF. Your data from the old Desk Utils folder was copied over.", "good"))
@@ -916,6 +923,104 @@ class App:
             self.save_state()
         except Exception:
             pass
+
+    def hourly(self):
+        """Light housekeeping once an hour: the weekly backup, the daily recap, and (in the background) the update check."""
+        for fn in (self.auto_backup, self.daily_recap):
+            try:
+                fn()
+            except Exception:
+                pass
+        if self.tray_hidden():
+            try:
+                self.auto_check_update()
+            except Exception:
+                pass
+        self.root.after(3600 * 1000, self.hourly)
+
+    def recap_base(self):
+        beasts = sum(1 for r in self.tourn.board() if self.tier(r) == "beast") if self.tourn else 0
+        return dict(day=date.today().isoformat(), eq=self.equity(), hold=self.bench_equity(), beasts=beasts,
+                    live=bool(self.live))
+
+    def daily_recap(self):
+        """Once a day: how the bots did yesterday against just holding (a note on the icon, and in the log)."""
+        if not self.settings.get("daily_recap", True) or not (self.session and self.running):
+            return
+        base = self.cfg.get("recap_base")
+        today = date.today().isoformat()
+        if isinstance(base, dict) and base.get("day") == today and base.get("live") == bool(self.live):
+            return
+        now = self.recap_base()
+        if isinstance(base, dict) and base.get("live") == bool(self.live) and base.get("eq"):
+            got = (now["eq"] / base["eq"] - 1) * 100
+            hold = (now["hold"] / base["hold"] - 1) * 100 if base.get("hold") else 0.0
+            new = now["beasts"] - int(base.get("beasts", 0))
+            where = "LIVE" if self.live else "practice"
+            msg = (f"Since {base['day']}: the bots made {got:+.2f}% on {where} vs {hold:+.2f}% just holding"
+                   + (f", {new} new BEAST{'S' if new != 1 else ''}" if new > 0 else "") + ".")
+            self.write("Daily recap: " + msg, "good" if got >= hold else None)
+            if self.tray is not None:
+                self.tray.notify(msg, f"{APP_SHORT} daily recap")
+        self.cfg["recap_base"] = now
+        try:
+            E.save_json(CONFIG_PATH, self.cfg)
+        except OSError:
+            pass
+
+    def live_checks(self):
+        """(passed, label, detail) evidence that the practice farm is ready for real money."""
+        t, out = self.tourn, []
+        if not (self.session and t and t.vars):
+            return [(False, "A practice farm is running", "Start the practice bot with Wildcard on and let it learn.")]
+        live_now = bool(self.live)
+        out.append((not live_now, "You're looking at the practice farm", "Switch to Practice to judge it." if live_now else "Yes."))
+        out.append((t.n >= 2000, "The farm has had time to learn", f"{t.n:,} decisions so far (want 2,000+)."))
+        act = list(t.active)
+        out.append((bool(act), "There are Winning bots steering the account", f"{len(act)} Winning right now."))
+        top = act[0] if act else None
+        if top:
+            d = t.info.get(id(top), {})
+            out.append((d.get("edge") is not None and d["edge"] > 0, "The top bot beats just holding",
+                        f"{(d.get('edge') or 0) * 100:+.1f}% vs holding over its recent window."))
+            n = len(top.sim.tbars)
+            out.append((E.luck_factor(top) >= 0.75 if hasattr(E, "luck_factor") else n >= 20,
+                        "The top bot's record rests on enough trades", f"{n} trades in its window (want about 20+)."))
+            out.append((top.twin is not None and top.twin > 0, "The top bot passed its twin test",
+                        "Not tested yet." if top.twin is None else f"{top.twin * 100:+.1f}% vs holding on older prices."))
+            dd = t.drawdown(top) * 100
+            out.append((dd < 10, "The top bot isn't in a deep slump", f"{dd:.1f}% below its recent best (want under 10%)."))
+        pl, hold = self.equity() - self.start_cash, self.bench_equity() - self.start_cash
+        out.append((pl > 0 and pl >= hold, "The practice account is beating just holding",
+                    f"{pl:+,.2f} vs {hold:+,.2f} holding this session."))
+        return out
+
+    def open_live_check(self):
+        """Account > Ready for LIVE?: a plain checklist of evidence, not a promise."""
+        w = tk.Toplevel(self.root)
+        w.title("Ready for LIVE?")
+        w.configure(bg=BG)
+        w.transient(self.root)
+        f = ttk.Frame(w, padding=16)
+        f.pack(fill="both", expand=True)
+        checks = self.live_checks()
+        good = sum(1 for c in checks if c[0])
+        verdict = ("Looks ready to try LIVE with a small amount." if good == len(checks) else
+                   "Not yet: keep it training on practice." if good < len(checks) - 2 else
+                   "Close. Give it more time on practice.")
+        ttk.Label(f, text=f"{good} of {len(checks)} checks passed. {verdict}", font=("", 12, "bold")).pack(anchor="w")
+        for ok, label, detail in checks:
+            row = ttk.Frame(f)
+            row.pack(fill="x", pady=3)
+            tk.Label(row, text="\u2713" if ok else "\u2717", fg=GREEN if ok else RED, bg=BG, font=("", 13, "bold"),
+                     width=2).pack(side="left", anchor="n")
+            col = ttk.Frame(row)
+            col.pack(side="left", fill="x")
+            ttk.Label(col, text=label, font=("", 10, "bold")).pack(anchor="w")
+            ttk.Label(col, text=detail, foreground=MUTED, wraplength=440).pack(anchor="w")
+        ttk.Label(f, text="Past results never guarantee future ones. Start LIVE small and keep the safety stops on.",
+                  foreground=MUTED, wraplength=470).pack(anchor="w", pady=(10, 4))
+        ttk.Button(f, text="Close", command=w.destroy).pack(anchor="e")
 
     # ---------------- background mode (icon by the clock) ----------------
     def tray_lib(self):
@@ -1475,6 +1580,8 @@ class App:
         m.add_separator()
         m.add_command(label="Sell everything now", command=self.sell_all)
         m.add_command(label="KILL SWITCH (stop, cancel, sell all, lock Live)", command=self.kill_switch)
+        m.add_separator()
+        m.add_command(label="Ready for LIVE? (checklist)...", command=self.open_live_check)
         bar.add_cascade(label="Account", menu=m)
         m = tk.Menu(bar, tearoff=0)
         m.add_command(label="Learning: backtests, Training camp, Free roam...", command=self.open_learning, accelerator="Ctrl+L")
@@ -6311,10 +6418,17 @@ class App:
             return
         self.save_state()
         self.save_farm(force=True)
+        n = self.write_backup(p)
+        self.write(f"Backed up {n} files (Library, Hall of Fame, farms, sessions, settings, trades) to {p}. "
+                   f"Your Coinbase login is not in it.", "good")
+        return p
+
+    def write_backup(self, p, skip=("cache", "backups", "auto-backups")):
+        """Zips the data folder to p, without any keys. Returns the number of files."""
         n = 0
         with zipfile.ZipFile(p, "w", zipfile.ZIP_DEFLATED) as z:
             for root_, dirs, files in os.walk(E.HOME_DIR):
-                dirs[:] = [d for d in dirs if d not in ("cache", "backups")]
+                dirs[:] = [d for d in dirs if d not in skip]
                 for fn in files:
                     full = os.path.join(root_, fn)
                     if fn == "config.json":  # never put keys in a backup, even when the keychain isn't available
@@ -6332,11 +6446,34 @@ class App:
                         except Exception:
                             pass
                         continue
+                    if fn.endswith(".lock") or fn.endswith(".flag"):
+                        continue
                     z.write(full, os.path.relpath(full, E.HOME_DIR))
                     n += 1
-        self.write(f"Backed up {n} files (Library, Hall of Fame, farms, sessions, settings, trades) to {p}. "
-                   f"Your Alpaca login is not in it.", "good")
-        return p
+        return n
+
+    def auto_backup(self):
+        """Once a week: a copy of the bots, farms, sessions and settings in auto-backups/ (the last 4 are kept).
+        Price history is left out (it downloads again by itself), so each copy stays small."""
+        if not self.settings.get("auto_backup", True):
+            return
+        if time.time() - float(self.cfg.get("last_auto_backup", 0) or 0) < 7 * 86400:
+            return
+        folder = os.path.join(E.HOME_DIR, "auto-backups")
+        try:
+            os.makedirs(folder, exist_ok=True)
+            self.save_farm(force=True)
+            self.save_state()
+            p = os.path.join(folder, f"{APP_SHORT.lower()}-auto-{datetime.now():%Y%m%d-%H%M}.zip")
+            n = self.write_backup(p, skip=("cache", "backups", "auto-backups", "history", "saved-farms"))
+            old = sorted(f for f in os.listdir(folder) if f.endswith(".zip"))
+            for f in old[:-4]:
+                os.remove(os.path.join(folder, f))
+            self.cfg["last_auto_backup"] = time.time()
+            E.save_json(CONFIG_PATH, self.cfg)
+            self.write(f"Weekly backup saved ({n} files, no keys) in your data folder under auto-backups.", "good")
+        except Exception as e:
+            self.write(f"The weekly backup couldn't be saved ({e}).", "warn")
 
     def restore_all(self):
         p = filedialog.askopenfilename(title="Restore a CBBF backup", filetypes=[("Zip", "*.zip")])
@@ -10742,6 +10879,10 @@ class App:
             self.upd_btn.config(text=f"\u2b06 Update to {remote}", bg=GREEN, fg="white", activebackground=GREEN,
                                 activeforeground="white")
             self.write(f"Version {remote} is available. Click 'Update' at the top to see what's new.", "good")
+            if self.tray_hidden() and getattr(self, "_tray_upd_told", None) != remote:
+                self._tray_upd_told = remote
+                self.tray.notify(f"Version {remote} is available. Open {APP_SHORT} and click Update to see what's new "
+                                 "(nothing installs until you say yes).")
             if not silent:
                 self.show_update()
             return

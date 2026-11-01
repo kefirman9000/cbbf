@@ -912,6 +912,7 @@ DEFAULT_SETTINGS = {
     "ctx_studies": True,         # bots can evolve studies on the watched coins (BTC dropping = careful buying...)
     "htf_studies": True,         # bots can evolve a slower-timeframe study (the bigger trend) that must agree before buying
     "lead_study": True,          # bots can evolve a "Bitcoin leads" study: BTC's recent move votes on other coins
+    "learn_losses": True,        # a bot takes on a never-rule itself when that rule would have stopped several of its losses
     "post_review": True,         # after losing trades the farm notes which never-rule would have helped, and tries those more
     "islands": 3,                # separate sub-farms that only swap a champion now and then (1 = one big farm)
     "time_habits": True,         # bots can learn quiet hours and weekends (never-rules graded in hindsight)
@@ -942,6 +943,8 @@ DEFAULT_SETTINGS = {
     "weekly_report": True,       # write a weekly report (and send it to Discord / Telegram if set up)
     "bg_mode": True,             # minimized: skip all drawing and check prices less often
     "tray_autotrain": True,      # started in the background (icon by the clock): train on practice prices right away
+    "daily_recap": True,         # once a day: how the bots did vs holding (log + icon note)
+    "auto_backup": True,         # weekly copy of bots/farms/settings in auto-backups/ (last 4, no keys)
     "vetoes": True,              # bots can evolve never-rules, each graded by what the blocked trade would have done
     "prove_live": True,          # a bot can only be Winning after it also made money on prices it hadn't seen yet
     "risk_adjusted": True,       # rank winners by gain per unit of downside swing, not raw gain
@@ -1248,7 +1251,7 @@ def tournament_opts(settings):
                 seasons=bool(settings.get("seasons", True)),
                 htf_studies=bool(settings.get("htf_studies", True)), lead_study=bool(settings.get("lead_study", True)),
                 ctx=[c for c in (settings.get("ctx_tickers") or []) if valid_coin(c)] if settings.get("ctx_studies", True) else [],
-                post_review=bool(settings.get("post_review", True)), islands=max(1, min(6, int(settings.get("islands", 3) or 1))),
+                post_review=bool(settings.get("post_review", True)), learn_losses=bool(settings.get("learn_losses", True)), islands=max(1, min(6, int(settings.get("islands", 3) or 1))),
                 adapt_exits=bool(settings.get("adapt_exits", True)), mut_memory=bool(settings.get("mut_memory", True)),
                 time_habits=bool(settings.get("time_habits", True)), scale_out=bool(settings.get("scale_out", True)),
                 agree_sizing=bool(settings.get("agree_sizing", True)),
@@ -1869,6 +1872,7 @@ class Variant:
         self.island = 0       # which sub-farm it lives on
         self.review = True    # note which never-rules would have stopped its losing buys (post-trade review)
         self.entry_flags = {} # coin -> never-rules that would have blocked the open position's first buy
+        self.own_review = {}  # its own losses: never-rule -> [its losing buys it would have blocked, winning buys]
         self.swing_ref, self.adapt_k = {}, {}  # adaptive stops: usual swing per coin, current stop scale
         self.mut_kinds = []   # what changed from its parent (mutation memory)
         self.credited = False # counted as a winner in the mutation memory
@@ -2055,6 +2059,31 @@ class Tournament:
             return 1.0
         avg = (sum(x[1] for x in self.mut_stats.values()) + 1) / (tb + 2)
         return min(2.0, max(0.5, ((st[1] + 1) / (st[0] + 2)) / avg))
+
+    def rule_allowed(self, k):
+        return ((k not in EVENT_VETOES or events()) and (k not in TIME_VETOES or self.o.get("time_habits", True))
+                and (k != "tiny" or self.o.get("fee_aware", True)))
+
+    def learn_from_losses(self, v, t):
+        """A bot learns from its OWN losing trades while it lives: when one never-rule would have blocked at least
+        3 of its losing buys and clearly fewer winners, the bot takes that rule on itself. The rule is then graded
+        like any other, so it fades if it starts blocking good trades."""
+        for k in t["flags"]:
+            st = v.own_review.setdefault(k, [0, 0])
+            st[0 if t["pl"] <= 0 else 1] += 1
+        if len(v.vetoes) >= MAX_VETOES:
+            return
+        best = max(((st[0] - 2 * st[1], k) for k, st in v.own_review.items()
+                    if k not in v.vetoes and st[0] >= 3 and st[0] > 2 * st[1] and self.rule_allowed(k)), default=None)
+        if not best:
+            return
+        k = best[1]
+        spec = VETOES[k]
+        v.vetoes = clean_vetoes(dict(v.vetoes, **{k: (spec["lo"] + spec["hi"]) / 2}))
+        v.own_review.pop(k, None)
+        if k in v.vetoes:
+            v.mut_kinds = list(v.mut_kinds) + ["self_review"]
+            self.events.append(f"{v.label} learned from its losses: {spec['text'](v.vetoes[k])}")
 
     def review_pick(self, pool):
         """Post-trade review: a new never-rule is more likely to be one that would have stopped recent losing buys."""
@@ -2341,6 +2370,8 @@ class Tournament:
                 if t.get("flags") and not self.replaying:
                     for k in t["flags"]:
                         self.review.setdefault(k, [0, 0])[0 if t["pl"] <= 0 else 1] += 1
+                    if self.o.get("learn_losses", True):
+                        self.learn_from_losses(v, t)
             if self.recording:
                 self.shadow.append(dict(t, name=v.name, params=dict(v.params), tf=v.tf, uid=v.uid))
             if self.on_trade:
@@ -3044,7 +3075,7 @@ class Tournament:
                 "peak", "maxdd", "mood_gain", "mood_n", "live_n", "live_eq0", "hi", "since", "entries", "sold_at",
                 "fee_guard", "rt_cost", "vetoes", "veto_stats", "lost_at", "power", "live_high", "layers", "layer_stats",
                 "conf_last", "coin_pl", "twin", "island", "entry_flags", "swing_ref", "mut_kinds", "credited",
-                "backtests")
+                "backtests", "own_review")
 
     def to_state(self):
         """Everything needed to bring this farm back exactly as it is (plain data, JSON-ready)."""
@@ -3111,6 +3142,7 @@ class Tournament:
                 v.conf_last = dict(v.conf_last or {})
                 v.coin_pl = {c: list(x) for c, x in (v.coin_pl or {}).items()}
                 v.entry_flags = {c: list(x) for c, x in (v.entry_flags or {}).items()}
+                v.own_review = {k: list(x) for k, x in (v.own_review or {}).items() if k in VETOES}
                 v.swing_ref = dict(v.swing_ref or {})
                 v.mut_kinds = list(v.mut_kinds or [])
                 v.island = int(v.island or 0) % max(1, int(self.o.get("islands", 1) or 1))
