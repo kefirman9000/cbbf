@@ -916,7 +916,8 @@ DEFAULT_SETTINGS = {
     "islands": 3,                # separate sub-farms that only swap a champion now and then (1 = one big farm)
     "time_habits": True,         # bots can learn quiet hours and weekends (never-rules graded in hindsight)
     "scale_out": True,           # bots can learn to sell half at a gain and let the rest run
-    "agree_sizing": True,        # the account trades bigger when several different strategies agree, smaller when split
+    "agree_sizing": True,
+    "luck_check": True,          # a bot's score counts for less when it rests on only a few trades        # the account trades bigger when several different strategies agree, smaller when split
     "adapt_exits": True,         # bots can evolve stops and targets that widen in wild markets and tighten in calm ones
     "mut_memory": True,          # the farm remembers which kinds of change make winners and does more of those
     "multicore": True,           # warm up the islands on several processor cores at once
@@ -1249,7 +1250,8 @@ def tournament_opts(settings):
                 post_review=bool(settings.get("post_review", True)), islands=max(1, min(6, int(settings.get("islands", 3) or 1))),
                 adapt_exits=bool(settings.get("adapt_exits", True)), mut_memory=bool(settings.get("mut_memory", True)),
                 time_habits=bool(settings.get("time_habits", True)), scale_out=bool(settings.get("scale_out", True)),
-                agree_sizing=bool(settings.get("agree_sizing", True)))
+                agree_sizing=bool(settings.get("agree_sizing", True)),
+                luck_check=bool(settings.get("luck_check", True)))
 
 
 RISK_BOUNDS = {"sl": (0.5, 30.0), "tp": (0.5, 100.0)}  # a bot's own stop-loss / take-profit, % (0 = none)
@@ -1339,6 +1341,8 @@ VETOES = {
                     text=lambda x: f"never buys between {_local_hour(x - 1)} and {_local_hour(x + 5)} (your time)"),
     "weekend": dict(lo=1, hi=1, side="buy", name="No weekend buying",
                     text=lambda x: "never buys on weekends (Saturday and Sunday, UTC)"),
+    "tiny":    dict(lo=1.5, hi=6.0, side="buy", name="No penny moves",
+                    text=lambda x: f"never buys a coin whose recent swing is under {x:g}x the round-trip fees"),
     "panic":   dict(lo=0.5, hi=5.0, side="sell", name="No panic selling",
                     text=lambda x: f"never sells on its strategy right after a {x:g}%+ one-bar drop (stops still work)"),
 }
@@ -1423,7 +1427,18 @@ def _veto(v, k, x, c, closes, n, extra, coins):
         return bool(moves) and sum(moves) / len(moves) * 100 <= -x
     if k == "panic":
         return (p[-1] / p[-2] - 1) * 100 <= -x
+    if k == "tiny":  # the coin barely moves over a typical hold: even a good call can't beat the fees
+        seg = p[-L - 1:]
+        return v.rt_cost > 0 and p[-1] > 0 and (max(seg) - min(seg)) / p[-1] < x * v.rt_cost
     return False
+
+
+def luck_factor(v):
+    """0..1: how much to trust a bot's score given how many trades it rests on. 3 trades = mostly luck,
+    40 trades = mostly skill. Slow bots trade rarely by design, so they need fewer."""
+    n = len(v.sim.tbars)
+    k = 6 if v.tf < 10 else 2
+    return n / (n + k) if n else 0.0
 
 
 def _grade_vetoes(v, closes, n):
@@ -2003,6 +2018,8 @@ class Tournament:
         if not self.o.get("time_habits", True):
             for k in TIME_VETOES:
                 (v.vetoes or {}).pop(k, None)
+        if not self.o.get("fee_aware", True):
+            (v.vetoes or {}).pop("tiny", None)
         if not self.o.get("htf_studies", True):
             v.layers.pop("htf", None)
         if not self.o.get("lead_study", True):
@@ -2184,7 +2201,8 @@ class Tournament:
         out = {}
         for _ in range(self.rng.randint(1, 2)):
             k = self.review_pick([k for k in VETOES if k not in out and (k not in EVENT_VETOES or events())
-                                  and (k not in TIME_VETOES or self.o.get("time_habits", True))])
+                                  and (k not in TIME_VETOES or self.o.get("time_habits", True))
+                                  and (k != "tiny" or self.o.get("fee_aware", True))])
             out[k] = self.rng.uniform(VETOES[k]["lo"], VETOES[k]["hi"])
         return clean_vetoes(out)
 
@@ -2212,7 +2230,8 @@ class Tournament:
                 stats[k] = [st[0] / 2, st[1] / 2]
         if len(out) < MAX_VETOES and self.rng.random() < 0.15 * self.mut_bias("rules"):
             k = self.review_pick([k for k in VETOES if k not in out and (k not in EVENT_VETOES or events())
-                                  and (k not in TIME_VETOES or self.o.get("time_habits", True))])
+                                  and (k not in TIME_VETOES or self.o.get("time_habits", True))
+                                  and (k != "tiny" or self.o.get("fee_aware", True))])
             out[k] = self.rng.uniform(VETOES[k]["lo"], VETOES[k]["hi"])
         out = clean_vetoes(out)
         return out, {k: s for k, s in stats.items() if k in out}
@@ -2508,6 +2527,8 @@ class Tournament:
                 w *= 1 + v.power / 10  # proven power: a bigger say
             if w > 0 and v.twin is not None and v.twin <= 0:
                 w *= 0.6  # failed its twin test: probably lucky, so it counts for less
+            if w > 0 and o.get("luck_check", True):
+                w *= luck_factor(v)  # a great score from a handful of trades counts for less than one from many
             if w > 0 and o["regime_aware"]:
                 fit = self.mood_fit(v)
                 if fit is not None:
@@ -2540,6 +2561,9 @@ class Tournament:
 
     def ranking(self):
         r = [(v, self.score(v)) for v in self.vars]
+        if self.o.get("luck_check", True):  # breeding and culling also trust long records over short lucky ones
+            return sorted([x for x in r if x[1] is not None],
+                          key=lambda x: -(x[1] * luck_factor(x[0]) if x[1] > 0 else x[1]))
         return sorted([x for x in r if x[1] is not None], key=lambda x: -x[1])
 
     def drivers(self):

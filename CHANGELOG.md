@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.17.2
+- **Luck check**: a bot's score now counts for less while it rests on only a few trades (3 trades counts about a
+  third, 40 trades almost fully). This applies to which bots steer your account and which ones breed, so a few lucky
+  trades can't fill the farm with copies. Settings > Learning > "Luck check".
+- **Fee-aware buying**: bots can learn a new never-rule, "No penny moves": skip coins whose recent swing is too small
+  to beat the round-trip fees. Like the other never-rules, each skipped buy is graded afterwards, so it only spreads if
+  it actually saves money. Part of the Fee-aware setting.
+
 ## 1.17.1
 - **Snappier window**: background work (Free roam, warm-up, history loading) no longer makes the window stutter.
   The longest freezes while Free roam runs dropped from about 1.5 seconds to under 0.2.

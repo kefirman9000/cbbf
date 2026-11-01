@@ -166,6 +166,7 @@ SETTING_GROUPS = [
         ("time_habits", "Time habits: bots can learn quiet hours and no-weekend rules (graded in hindsight)", bool),
         ("agree_sizing", "Crowd confidence: your account trades bigger when several different strategies agree, smaller "
                          "when the farm is split", bool),
+        ("luck_check", "Luck check: a bot's great score counts for less while it rests on only a few trades", bool),
         ("confidence_sizing", "Confidence sizing: bigger when its studies clearly agree", bool),
         (None, "Memory", "head"),
         ("seasons", "Seasons: a champion per market mood, woken when that mood returns", bool),
@@ -199,7 +200,7 @@ SETTING_GROUPS = [
                         "(empty = any time). The bots keep learning and safety stops always run", str),
         ("weekdays_only", "...and only Monday to Friday", bool),
         ("fee_aware", "Fee-aware: bots and the account don't sell for a profit too small to cover the round-trip fees "
-                      "(losses, stops and Sell everything still sell)", bool),
+                      "(losses, stops and Sell everything still sell), and bots can learn not to buy coins that barely move", bool),
         ("bot_stops", "Wildcard: let the winning bots set the Safety stop and Lock-in-profit levels they learned "
                       "(your Basics numbers are used when they don't)", bool),
         ("fee_pct", "Market order fee used in Practice mode (%)", float),
