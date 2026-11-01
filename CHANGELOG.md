@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.20.1
+- **No more black command window**: Run CBBF.bat now starts CBBF with Python's windowless version and closes right away.
+  There's also a new CBBF.pyw in the folder: double-click it to start with no window flashing at all (you can pin a
+  shortcut to it). If Python can't start CBBF, a message box explains why instead of the command window.
+
 ## 1.20.0
 - **Real costs**: after 5 LIVE market orders, CBBF compares each fill with the price when the trade was decided. If
   your orders typically lose more to the spread and price movement than the Slippage setting assumes, Practice and the

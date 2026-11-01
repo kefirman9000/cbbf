@@ -9,6 +9,13 @@ import sys
 
 def _stay_open(msg):
     """Print a problem and keep the window open so it can be read (Windows closes it otherwise)."""
+    if sys.stdout is None and sys.platform.startswith("win"):  # started without a console (pythonw): show a box
+        try:
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(None, msg, "CBBF could not start", 0x10)
+        except Exception:
+            pass
+        sys.exit(1)
     print("\n" + "=" * 60 + "\nCBBF could not start\n" + "=" * 60 + "\n" + msg + "\n")
     try:
         input("Press Enter to close this window...")
