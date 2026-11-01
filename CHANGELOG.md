@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.19.1
+- **Start with Windows** is now also in the File menu (it was only on the icon). It runs CBBF as the icon by the clock,
+  training on practice prices only. It sets up the icon add-on first if needed.
+- **Even lighter in the background**: after Windows starts, CBBF waits 2 minutes before training so it never slows your
+  start-up, and the start-up warm-up uses one processor core instead of several while running as the icon.
+
 ## 1.19.0
 - **Update alerts on the icon**: while CBBF runs in the background it still checks for updates and shows a small note
   when one is out. Nothing installs until you open CBBF and say yes.
