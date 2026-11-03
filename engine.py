@@ -3346,6 +3346,15 @@ def backtest_bot(g, closes, extra=None, start_cash=1000.0, fee=0.006, pct=0.1, s
         bars=L - start, fees=b.sim.fees)
 
 
+def rel_edge(ret, hold):
+    """How the bot did compared with just holding, as money: (1 + its return) / (1 + holding's return) - 1.
+    -50% = it ended with half as much money as holding would have; it can never be below -100%. (Simply subtracting the
+    two returns can show -300% when holding rallied 400% over a long stretch, which reads like an impossible loss.)"""
+    if hold is None or hold <= -1:
+        return ret
+    return (1 + ret) / (1 + hold) - 1
+
+
 def backtest_simple(g, closes, extra, a, z, start_cash, fee, pct, slip):
     """Return of bot genes g traded from bar a to bar z (exclusive)."""
     coins = list(closes)

@@ -5462,7 +5462,8 @@ class App:
             for v, r in out:
                 if v in t.vars:
                     E.remember_backtest(v, r, t)
-                res.append((E.bot_nickname(v.key()), round(r["edge"] * 100, 2), r["trades"]))
+                res.append((E.bot_nickname(v.key()), round(E.rel_edge(r["ret"], r["hold"]) * 100, 2), r["trades"],
+                            round(r["ret"] * 100, 2)))
             good = sum(1 for x in res if x[1] > 0)
             rec = dict(time=time.time(), kind="Self-test", start=info["start"], end=info["end"], gran=info["gran"],
                        bars=info["bars"], hold=round(info["hold"] * 100, 2), mood=info["mood"], results=res,
@@ -5517,10 +5518,16 @@ class App:
                     self.refresh_board()
             gen = max((v.gen for v in res["tourn"].vars), default=0)
             top = sorted(res["results"], key=lambda r: -((r["exam_edge"] if r["exam_edge"] is not None else r["train_edge"]) or 0))[:5]
+
+            def vs_hold(r):  # (vs holding as money, its own return) on the exam if it sat one, else on training
+                if r["exam_ret"] is not None and res.get("exam_hold") is not None:
+                    return E.rel_edge(r["exam_ret"], res["exam_hold"]), r["exam_ret"]
+                hold_ = r["train_ret"] - r["train_edge"] if r["train_edge"] is not None else None
+                return E.rel_edge(r["train_ret"], hold_), r["train_ret"]
             rec = dict(time=time.time(), kind="Practice farm", start=info["start"], end=info["end"], gran=info["gran"],
                        bars=info["bars"], hold=round(info["hold"] * 100, 2), mood=info["mood"],
-                       results=[(E.bot_nickname(r["v"].key()), round(((r["exam_edge"] if r["exam_edge"] is not None else r["train_edge"]) or 0) * 100, 2),
-                                 r["trades"]) for r in top],
+                       results=[(E.bot_nickname(r["v"].key()), round(vs_hold(r)[0] * 100, 2), r["trades"],
+                                 round(vs_hold(r)[1] * 100, 2)) for r in top],
                        passed=len(passed), graduate=grad,
                        summary=f"{gen} generations, {len(passed)} passed the exam" + (f"; {grad} joined your farm" if grad else ""))
             self._roam_finish(rec, cur)
@@ -5544,11 +5551,21 @@ class App:
             self.roam_btn.config(text="◇ Free roam: ON" if on else "◇ Free roam")
         self.start_free_roam()
 
+    @staticmethod
+    def roam_result(r, x):
+        """(bot, vs holding %, trades) of one Free roam result. Entries saved before 1.20.3 subtracted holding's return
+        from the bot's (which can read -300% after a long rally); they're converted to the money comparison here."""
+        nm, e, tr = x[0], x[1], x[2]
+        if len(x) < 4 and r.get("kind") in ("Self-test", "Practice farm") and r.get("hold") is not None:
+            hold = r["hold"] / 100
+            e = round(E.rel_edge(e / 100 + hold, hold) * 100, 2)
+        return nm, max(-100.0, e), tr
+
     def roam_bots(self):
         """Every bot Free roam has tested, best first: [dict(name, n, wins, avg, best, worst, last, farm)]."""
         agg = {}
         for r in self.roam_log:
-            for nm, e, tr in r.get("results", []):
+            for nm, e, tr in (self.roam_result(r, x) for x in r.get("results", [])):
                 a = agg.setdefault(nm, dict(name=nm, n=0, wins=0, tot=0.0, best=None, worst=None, last=0, trades=0, kinds=set()))
                 a["n"] += 1
                 a["wins"] += e > 0
@@ -5669,6 +5686,8 @@ class App:
             "graduate' (it still has to prove itself on live prices).\n"
             "   • Your farm also learns the practice farm's memory: its elders, season champions, post-trade review and "
             "which kinds of mutation made winners.\n\n"
+            "HOW THE % IS MEASURED  The money the bot ended with compared with what just holding the same coins would "
+            "have ended with: +20% = 20% more than holding, -50% = half as much. It can't go below -100% (losing everything).\n\n"
             "HOW TO READ THE 'BEST TO WORST' TAB  Green bots beat holding in at least half their tests and on average: "
             "they're your strongest candidates for the Hall of Fame. Orange = mixed (could be luck). Red = usually worse "
             "than holding. 'Now' shows whether the bot is still in your farm. One good test can be luck; look for bots "
@@ -5701,7 +5720,7 @@ class App:
             draw_price(cur)
             fill_feed()
             L_ = self.roam_log
-            res = [x for r in L_ for x in r.get("results", [])]
+            res = [self.roam_result(r, x) for r in L_ for x in r.get("results", [])]
             grads = [r["graduate"] for r in L_ if r.get("graduate")]
             stats.config(text=(f"Studies: {getattr(self, 'roam_n', 0)}   |   past covered: {covered_days():.0f} days   |   "
                                f"bot tests: {len(res)} ({sum(1 for x in res if x[1] > 0)} beat holding)   |   "
@@ -5727,7 +5746,8 @@ class App:
                 if (f_ == "Good finds" and v_ != "good") or (f_ == "Bad results" and v_ != "bad") or \
                         (f_ == "Self-tests" and r["kind"] != "Self-test") or (f_ == "Practice farms" and r["kind"] != "Practice farm"):
                     continue
-                ex = r["summary"] + (":  " + ",  ".join(f"{n} {e:+.1f}%" for n, e, _ in r.get("results", [])[:4]) if r.get("results") else "")
+                ex = r["summary"] + (":  " + ",  ".join(f"{n} {e:+.1f}%" for n, e, _ in (self.roam_result(r, x) for x in r.get("results", [])[:4]))
+                                     if r.get("results") else "")
                 log.insert("", "end", tags=(v_,), values=(
                     datetime.fromtimestamp(r["time"]).strftime("%b %d %H:%M"), r["kind"],
                     f"{self._when(r['start'], True)} to {self._when(r['end'], True)}", E.fmt_bar(r["gran"] / 60),
