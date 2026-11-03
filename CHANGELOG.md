@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.20.4
+- **Training shows each bot's own results**: Free roam and the Training camp no longer compare bots with simply holding.
+  - Free roam's "best to worst" list: tests, how many made money, average return, total trades, win rate, and each
+    bot's single best and worst trade (% of what it paid). The study log shows each bot's own return.
+  - Training camp: training return, exam return, trades, win rate, best trade and worst trade for every bot.
+  - Older Free roam results are shown as each bot's own return too (best / worst trade and win rate start with new
+    studies).
+
 ## 1.20.3
 - **Free roam's numbers are fair now**: "Avg / Best / Worst vs holding" compare the money a bot ended with to what just
   holding would have ended with, so they can never read below -100%. Before, the two returns were subtracted, so a bot
