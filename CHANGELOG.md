@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.20.3
+- **Free roam's numbers are fair now**: "Avg / Best / Worst vs holding" compare the money a bot ended with to what just
+  holding would have ended with, so they can never read below -100%. Before, the two returns were subtracted, so a bot
+  that made +20% while holding rallied +400% over a long stretch showed -380%, which looked like an impossible loss.
+  Older study results are converted the same way.
+
 ## 1.20.2
 - **Free roam no longer gets stuck on a coin with a short or patchy history** (a new listing, or one with days
   without a single trade): it fits each journey to the history your coins actually share and tries more starting
