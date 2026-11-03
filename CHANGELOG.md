@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.20.2
+- **Free roam no longer gets stuck on a coin with a short or patchy history** (a new listing, or one with days
+  without a single trade): it fits each journey to the history your coins actually share and tries more starting
+  points. If one coin still leaves no clean stretch, Free roam studies the others without it for now and says so once
+  (the farm still trades it as usual). Before, it could fail with "no stretch that long where every coin was trading"
+  every few minutes.
+- **No more error reports when CBBF closes or restarts**: messages that arrive after the window is gone are skipped
+  instead of trying to update screens that no longer exist ("invalid command name ..." in the crash log). Nothing was
+  ever lost; it only cluttered the log.
+
 ## 1.20.1
 - **No more black command window**: Run CBBF.bat now starts CBBF with Python's windowless version and closes right away.
   There's also a new CBBF.pyw in the folder: double-click it to start with no window flashing at all (you can pin a
