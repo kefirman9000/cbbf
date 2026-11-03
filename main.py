@@ -918,6 +918,7 @@ class App:
         self.save_state()
         if self.tray is not None:
             self.tray.stop()
+        self._gone = True
         self.root.destroy()
 
     def on_shutdown(self):
@@ -2469,6 +2470,8 @@ class App:
                 f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S}  {E.redact(msg)}\n")
         except Exception:
             pass
+        if self.closing():
+            return
         self.log.config(state="normal")
         self.log.insert("end", f"{datetime.now():%H:%M}  {msg}\n", tag)
         self.log.see("end")
@@ -4091,6 +4094,8 @@ class App:
         """Handles messages from background threads. One bad message can no longer stop the loop."""
         try:
             for _ in range(300):
+                if self.closing():  # the window is gone (quitting / restarting): nothing left to update
+                    return
                 try:
                     kind, data = self.q.get_nowait()
                 except queue.Empty:
@@ -4098,11 +4103,23 @@ class App:
                 try:
                     self._handle_msg(kind, data)
                 except Exception:
+                    if self.closing():
+                        return
                     msg = self._record_error(f"handling '{kind}'")
                     if msg:
                         self.write(msg, "bad")
         finally:
-            self.root.after(200, self.drain)
+            if not self.closing():
+                self.root.after(200, self.drain)
+
+    def closing(self):
+        """True once the main window has been destroyed (the app is quitting or restarting)."""
+        if getattr(self, "_gone", False):
+            return True
+        try:
+            return not self.root.winfo_exists()
+        except Exception:
+            return True
 
     def _handle_msg(self, kind, data):
         if kind == "log":
@@ -5317,21 +5334,46 @@ class App:
         covered = [(x["start"], x["end"]) for x in self.roam_log[-150:]]
         self.roam_now = dict(kind="Getting ready", phase="download", gran=None, coins=coins, start=None, end=None,
                              text="Checking which stretches of history your coins have", t0=time.time(), done=0, total=1)
+        coins, left_out = list(coins), []
         days = [d for d in E.common_days(coins, self.quote) if d >= earliest - 86400]
         self.roam_check_on()
+
+        def room(ds):  # whole days of history these coins share
+            return (ds[-1] - ds[0]) / 86400 + 1 if len(ds) >= 3 else 0
+        # a coin listed much later than the others can leave too little shared history: study the rest this time
+        while len(coins) > 1 and room(days) * E.bars_per_day(self.ROAM_CANDLES[0]) * 0.9 < min_bars:
+            short = min(coins, key=lambda c: len(E.coin_days(c, self.quote)))
+            coins.remove(short)
+            left_out.append(short)
+            days = [d for d in E.common_days(coins, self.quote) if d >= earliest - 86400]
         if len(days) < 3:
-            raise E.NoHistory("Your coins don't share enough history on Coinbase to study: "
-                              + "; ".join(E.history_text(c, self.quote) for c in coins))
+            raise E.NoHistory("Your coins don't share enough history to study: "
+                              + "; ".join(E.history_text(c, self.quote) for c in list(self.session_coins)))
         dset = set(days)
         last_err = None
-        for _attempt in range(4):
-            gran = rng.choice(self.ROAM_CANDLES)
-            n = rng.randint(min_bars, max(min_bars, 1500))
+        fits = [g for g in self.ROAM_CANDLES if room(days) * E.bars_per_day(g) / (1.02 / 1.0) * 0.9 >= min_bars]
+        for _attempt in range(10):
+            if _attempt and _attempt % 5 == 0 and len(coins) > 1:
+                # 5 tries without a clean stretch: a coin with gaps in its history (days without a single trade) or a
+                # short one is in the way. Leave out the one that costs the shared history most, and try again.
+                def cost(c):
+                    rest = [x for x in coins if x != c]
+                    return -len([d for d in E.common_days(rest, self.quote) if d >= earliest - 86400])
+                worst = min(coins, key=cost)
+                coins.remove(worst)
+                left_out.append(worst)
+                days = [d for d in E.common_days(coins, self.quote) if d >= earliest - 86400]
+                if len(days) < 3:
+                    break
+                dset = set(days)
+                fits = [g for g in self.ROAM_CANDLES if room(days) * E.bars_per_day(g) / (1.02 / 1.0) * 0.9 >= min_bars]
+            gran = rng.choice(fits or self.ROAM_CANDLES[:1])
+            most = int(room(days) * E.bars_per_day(gran) / (1.02) * 0.9)  # never longer than the shared history
+            n = rng.randint(min(min_bars, most), max(min(min_bars, most), min(1500, most)))
             span = n / E.bars_per_day(gran) * 1.02 * 86400
-            span = min(span, (days[-1] - days[0]) + 86400)
-            # start days where the whole window has history (all coins traded on at least 98% of its days)
-            starts = [d for d in rng.sample(days, min(len(days), 60))
-                      if d + span <= now + 86400 and E.coverage(dset, d, d + span) >= 0.98]
+            # start days where the whole window has history (every coin traded on nearly all of its days)
+            ok = [d for d in days if d + span <= min(now, days[-1] + 86400) + 86400]
+            starts = [d for d in rng.sample(ok, min(len(ok), 120)) if E.coverage(dset, d, d + span) >= 0.98]
             if not starts:
                 last_err = E.NoHistory("no stretch that long where every coin was trading")
                 continue
@@ -5351,6 +5393,11 @@ class App:
                 last_err = e
         else:
             raise last_err or E.NoHistory("couldn't find a stretch of history to study")
+        if left_out and time.time() - getattr(self, "_roam_left_note", 0) > 6 * 3600:
+            self._roam_left_note = time.time()
+            self.q.put(("log", (f"\u25c7 Free roam: {', '.join(left_out)} only has a short or patchy history (days without trades), so Free roam studies the "
+                                f"other coins' longer past without {'it' if len(left_out) == 1 else 'them'} (the farm still "
+                                f"trades {'it' if len(left_out) == 1 else 'them'} as usual).", "info")))
         times = next(iter(extra.values()))["t"]
         span = len(times)
         hold = sum(closes[c][-1] / closes[c][0] for c in coins) / len(coins) - 1
@@ -11139,6 +11186,7 @@ class App:
         except Exception:
             pass
         try:
+            self._gone = True
             self.root.destroy()
         except Exception:
             pass
