@@ -5022,7 +5022,7 @@ class App:
             "A whole farm lives through a stretch of past prices, as many times as you like: hatching, competing, breeding "
             "and learning the whole way (between passes the bots keep their genes and lessons, with fresh money). The most "
             "recent part is held back as a final exam: the best bots are frozen and tested on prices they never saw. "
-            "Only the ones that beat just holding in training AND in the exam pass.")).grid(row=1, column=0, columnspan=6,
+            "Only the ones that do well in training AND in the exam pass.")).grid(row=1, column=0, columnspan=6,
                                                                                            sticky="w", pady=(2, 10))
         c = self.cfg
         pf = ttk.Frame(f)
@@ -5077,7 +5077,8 @@ class App:
         tbox.pack(fill="both", expand=True, padx=12)
         tree = self.make_tree(tbox, ("name", "strategy", "pace", "train", "exam", "trades", "wr", "passed"),
                               (150, 190, 90, 110, 110, 60, 60, 80),
-                              ("Bot", "Strategy", "Decides", "Training vs hold", "Exam vs hold", "Trades", "Win rate", "Result"))
+                              ("Bot", "Strategy", "Decides", "Training return", "Exam return", "Trades", "Win rate", "Best trade",
+                               "Worst trade", "Result"))
         tree.configure(selectmode="extended")
         tree.tag_configure("pass", foreground=GREEN)
         tree.tag_configure("fail", foreground=MUTED)
@@ -5176,14 +5177,16 @@ class App:
             passed = sum(1 for r in res["results"] if r["passed"])
             gen = max((v.gen for v in t.vars), default=0)
             finish(f"Done: {res['passes_done']} pass(es) over {res['train_bars']:,} candles, {gen} generations, "
-                   f"{len(t.lineage)} bots lived. " + (f"Exam on the last {res['exam_bars']:,} candles: {passed} passed "
-                                                     f"(holding did {res['exam_hold'] * 100:+.1f}%)." if res["exam_bars"] else ""))
+                   f"{len(t.lineage)} bots lived. " + (f"Exam on the last {res['exam_bars']:,} candles: {passed} passed."
+                                                     if res["exam_bars"] else ""))
             for i, r in enumerate(res["results"]):
                 g = r["genes"]
                 tree.insert("", "end", iid=str(i), tags=("pass" if r["passed"] else "fail",), values=(
                     E.bot_nickname(r["v"].key()), STRAT_LABELS.get(g["name"], g["name"]), E.fmt_bar(g["tf"] * res["gran"] / 60),
-                    pct_txt(r["train_edge"]), pct_txt(r["exam_edge"]), r["trades"],
+                    pct_txt(r["train_ret"]), pct_txt(r["exam_ret"]), r["trades"],
                     "-" if r["winrate"] is None else f"{r['winrate'] * 100:.0f}%",
+                    "-" if r.get("best_trade") is None else f"{r['best_trade']:+.1f}%",
+                    "-" if r.get("worst_trade") is None else f"{r['worst_trade']:+.1f}%",
                     "✓ passed" if r["passed"] else ("no exam" if r["passed"] is None else "failed")))
             for b in (b_bring, b_teach, b_lib):
                 b.config(state="normal")
@@ -5462,16 +5465,16 @@ class App:
             for v, r in out:
                 if v in t.vars:
                     E.remember_backtest(v, r, t)
-                res.append((E.bot_nickname(v.key()), round(E.rel_edge(r["ret"], r["hold"]) * 100, 2), r["trades"],
-                            round(r["ret"] * 100, 2)))
+                res.append((E.bot_nickname(v.key()), round(r["ret"] * 100, 2), r["trades"], round(r["ret"] * 100, 2),
+                            r.get("closed", 0), r.get("wins", 0), r.get("best_trade"), r.get("worst_trade")))
             good = sum(1 for x in res if x[1] > 0)
             rec = dict(time=time.time(), kind="Self-test", start=info["start"], end=info["end"], gran=info["gran"],
                        bars=info["bars"], hold=round(info["hold"] * 100, 2), mood=info["mood"], results=res,
-                       summary=f"{good} of {len(res)} beat holding")
+                       summary=f"{good} of {len(res)} made money")
             self._roam_finish(rec, cur)
             if False:
                 self.write(f"◇ Free roam: {len(res)} bots tested themselves on {self._when(info['start'], True)} to "
-                           f"{self._when(info['end'], True)}; {good} beat holding. Lessons saved.")
+                           f"{self._when(info['end'], True)}; {good} made money. Lessons saved.")
         self.q.put(("call", apply))
 
     def _roam_camp(self, t):
@@ -5526,8 +5529,9 @@ class App:
                 return E.rel_edge(r["train_ret"], hold_), r["train_ret"]
             rec = dict(time=time.time(), kind="Practice farm", start=info["start"], end=info["end"], gran=info["gran"],
                        bars=info["bars"], hold=round(info["hold"] * 100, 2), mood=info["mood"],
-                       results=[(E.bot_nickname(r["v"].key()), round(vs_hold(r)[0] * 100, 2), r["trades"],
-                                 round(vs_hold(r)[1] * 100, 2)) for r in top],
+                       results=[(E.bot_nickname(r["v"].key()), round(vs_hold(r)[1] * 100, 2), r["trades"],
+                                 round(vs_hold(r)[1] * 100, 2), r.get("closed", 0), r.get("wins", 0), r.get("best_trade"),
+                                 r.get("worst_trade")) for r in top],
                        passed=len(passed), graduate=grad,
                        summary=f"{gen} generations, {len(passed)} passed the exam" + (f"; {grad} joined your farm" if grad else ""))
             self._roam_finish(rec, cur)
@@ -5553,26 +5557,40 @@ class App:
 
     @staticmethod
     def roam_result(r, x):
-        """(bot, vs holding %, trades) of one Free roam result. Entries saved before 1.20.3 subtracted holding's return
-        from the bot's (which can read -300% after a long rally); they're converted to the money comparison here."""
+        """One Free roam result as a dict: name, ret (the bot's own return %, or the scalps' profit on what they paid),
+        trades, closed, wins, best and worst trade (% of what it paid; None when not known). Entries from older versions
+        are read too (best / worst trade and wins weren't kept then)."""
         nm, e, tr = x[0], x[1], x[2]
-        if len(x) < 4 and r.get("kind") in ("Self-test", "Practice farm") and r.get("hold") is not None:
-            hold = r["hold"] / 100
-            e = round(E.rel_edge(e / 100 + hold, hold) * 100, 2)
-        return nm, max(-100.0, e), tr
+        if len(x) >= 4:
+            ret = x[3]
+        elif r.get("kind") in ("Self-test", "Practice farm") and r.get("hold") is not None:
+            ret = e + r["hold"]  # older versions stored was the return minus the market's
+        else:
+            ret = e
+        out = dict(name=nm, ret=ret, trades=tr, closed=None, wins=None, best=None, worst=None)
+        if len(x) >= 8:
+            out.update(closed=x[4], wins=x[5], best=x[6], worst=x[7])
+        return out
 
     def roam_bots(self):
-        """Every bot Free roam has tested, best first: [dict(name, n, wins, avg, best, worst, last, farm)]."""
+        """Every bot Free roam has tested, best first: its tests, how many made money, its average return, trades,
+        win rate and its single best and worst trade."""
         agg = {}
         for r in self.roam_log:
-            for nm, e, tr in (self.roam_result(r, x) for x in r.get("results", [])):
-                a = agg.setdefault(nm, dict(name=nm, n=0, wins=0, tot=0.0, best=None, worst=None, last=0, trades=0, kinds=set()))
+            for x in (self.roam_result(r, x) for x in r.get("results", [])):
+                nm = x["name"]
+                a = agg.setdefault(nm, dict(name=nm, n=0, made=0, tot=0.0, trades=0, closed=0, wins=0, best=None, worst=None,
+                                            last=0, kinds=set()))
                 a["n"] += 1
-                a["wins"] += e > 0
-                a["tot"] += e
-                a["trades"] += tr
-                a["best"] = e if a["best"] is None else max(a["best"], e)
-                a["worst"] = e if a["worst"] is None else min(a["worst"], e)
+                a["made"] += x["ret"] > 0
+                a["tot"] += x["ret"]
+                a["trades"] += x["trades"] or 0
+                if x["closed"] is not None:
+                    a["closed"] += x["closed"]
+                    a["wins"] += x["wins"] or 0
+                if x["best"] is not None:
+                    a["best"] = x["best"] if a["best"] is None else max(a["best"], x["best"])
+                    a["worst"] = x["worst"] if a["worst"] is None else min(a["worst"], x["worst"])
                 a["last"] = max(a["last"], r["time"])
                 a["kinds"].add(r["kind"])
                 if r.get("graduate") == nm:
@@ -5583,7 +5601,7 @@ class App:
             a["avg"] = a["tot"] / a["n"]
             a["farm"] = a["name"] in alive
             out.append(a)
-        return sorted(out, key=lambda a: (-(a["avg"] > 0 and a["wins"] * 2 >= a["n"]), -a["avg"]))
+        return sorted(out, key=lambda a: (-(a["avg"] > 0 and a["made"] * 2 >= a["n"]), -a["avg"]))
 
     def open_roam(self, parent=None):
         """The Free roam screen: an in-session banner, where in the past it's learning, the trades as they happen,
@@ -5654,7 +5672,8 @@ class App:
         nb.add(t3, text="  What the results do  ")
         bots = self.make_tree(t1, ("who", "n", "wins", "avg", "best", "worst", "mode", "why"),
                               (130, 50, 90, 90, 70, 70, 90, 420),
-                              ("Bot", "Tests", "Beat holding", "Avg vs holding", "Best", "Worst", "Now", "What it means"))
+                              ("Bot", "Tests", "Made money", "Avg return", "Trades", "Win rate", "Best trade", "Worst trade", "Now",
+                               "What it means"))
         bots.tag_configure("good", foreground=GREEN)
         bots.tag_configure("mixed", foreground="#f59e0b")
         bots.tag_configure("bad", foreground=RED)
@@ -5674,23 +5693,24 @@ class App:
         tk.Label(t3, bg=BG, fg=TEXT, justify="left", anchor="nw", wraplength=1100, padx=8, pady=8, font=("", 9), text=(
             "Free roam never trades your account. It works on your farm's bots and memory:\n\n"
             "SELF-TEST  A few of your bots (always including the leader) trade a stretch of the past on their own.\n"
-            "   • Beat just holding (with 4+ trades): the bot becomes an ELDER, so new eggs are more likely to copy it, and "
+            "   • Did well (with 4+ trades): the bot becomes an ELDER, so new eggs are more likely to copy it, and "
             "its rules gain evidence and spread to its children.\n"
-            "   • Did worse than holding: nothing is deleted, but its costly rules and the coins it struggles with are "
+            "   • Did badly: nothing is deleted, but its costly rules and the coins it struggles with are "
             "written into its memory, so its children drop those rules, and the farm's post-trade review learns which "
             "never-rules would have stopped its losing buys.\n"
             "   • Every result is also kept in the bot's memory (its card shows its tests).\n\n"
             "PRACTICE FARM  A small farm, started from your leaders, lives through a stretch, breeding as it goes, then "
             "sits an exam on the last quarter it never trained on.\n"
-            "   • Bots that beat holding in training AND the exam pass. The best one joins your farm as a 'Free roam "
+            "   • Bots that do well in training AND the exam pass. The best one joins your farm as a 'Free roam "
             "graduate' (it still has to prove itself on live prices).\n"
             "   • Your farm also learns the practice farm's memory: its elders, season champions, post-trade review and "
             "which kinds of mutation made winners.\n\n"
-            "HOW THE % IS MEASURED  The money the bot ended with compared with what just holding the same coins would "
-            "have ended with: +20% = 20% more than holding, -50% = half as much. It can't go below -100% (losing everything).\n\n"
-            "HOW TO READ THE 'BEST TO WORST' TAB  Green bots beat holding in at least half their tests and on average: "
-            "they're your strongest candidates for the Hall of Fame. Orange = mixed (could be luck). Red = usually worse "
-            "than holding. 'Now' shows whether the bot is still in your farm. One good test can be luck; look for bots "
+            "THE NUMBERS  Avg return: what a bot made or lost on average per test. Best / Worst trade: its single best and "
+            "worst trade, as % of what it paid. Win rate: the share of its trades that made money. Made money: in how many "
+            "of its tests it ended up.\n\n"
+            "HOW TO READ THE 'BEST TO WORST' TAB  Green bots made money in at least half their tests and on average: "
+            "they're your strongest candidates for the Hall of Fame. Orange = mixed (could be luck). Red = usually loses "
+            "money. 'Now' shows whether the bot is still in your farm. One good test can be luck; look for bots "
             "that win across many different stretches and market moods.")).pack(fill="both", expand=True)
 
         st = dict(n=-1, flt="", feed=0, phase=0.0, fb=None)
@@ -5721,9 +5741,12 @@ class App:
             fill_feed()
             L_ = self.roam_log
             res = [self.roam_result(r, x) for r in L_ for x in r.get("results", [])]
+            cl_ = sum(x["closed"] or 0 for x in res)
+            wn_ = sum(x["wins"] or 0 for x in res)
             grads = [r["graduate"] for r in L_ if r.get("graduate")]
             stats.config(text=(f"Studies: {getattr(self, 'roam_n', 0)}   |   past covered: {covered_days():.0f} days   |   "
-                               f"bot tests: {len(res)} ({sum(1 for x in res if x[1] > 0)} beat holding)   |   "
+                               f"bot tests: {len(res)} ({sum(1 for x in res if x['ret'] > 0)} made money)   |   "
+                               + (f"trades won: {wn_ / cl_ * 100:.0f}%   |   " if cl_ else "") +
                                f"graduates adopted: {len(grads)}   |   trades this session: {getattr(self, 'roam_trades', 0):,}"))
             if len(L_) != st["n"] or flt.get() != st["flt"]:
                 st["n"], st["flt"] = len(L_), flt.get()
@@ -5735,7 +5758,7 @@ class App:
             res = r.get("results") or []
             if r["kind"] == "Practice farm":
                 return "good" if r.get("passed") else "bad"
-            good = sum(1 for x in res if x[1] > 0)
+            good = sum(1 for x in res if self.roam_result(r, x)["ret"] > 0)
             return "good" if good * 2 > len(res) else "bad" if good == 0 else "mixed"
 
         def fill_log():
@@ -5746,7 +5769,7 @@ class App:
                 if (f_ == "Good finds" and v_ != "good") or (f_ == "Bad results" and v_ != "bad") or \
                         (f_ == "Self-tests" and r["kind"] != "Self-test") or (f_ == "Practice farms" and r["kind"] != "Practice farm"):
                     continue
-                ex = r["summary"] + (":  " + ",  ".join(f"{n} {e:+.1f}%" for n, e, _ in (self.roam_result(r, x) for x in r.get("results", [])[:4]))
+                ex = r["summary"] + (":  " + ",  ".join(f"{x['name']} {x['ret']:+.1f}%" for x in (self.roam_result(r, x) for x in r.get("results", [])[:4]))
                                      if r.get("results") else "")
                 log.insert("", "end", tags=(v_,), values=(
                     datetime.fromtimestamp(r["time"]).strftime("%b %d %H:%M"), r["kind"],
@@ -5756,16 +5779,18 @@ class App:
         def fill_bots():
             bots.delete(*bots.get_children())
             for a in self.roam_bots():
-                good = a["avg"] > 0 and a["wins"] * 2 >= a["n"]
-                tag = "good" if good else "bad" if a["wins"] == 0 or a["avg"] < -1 else "mixed"
-                means = ("Strong: beats holding across stretches. Elder; a Hall of Fame candidate." if good and a["n"] >= 3 else
-                         "Promising: beat holding, but needs more tests to rule out luck." if good else
-                         "Mixed: wins sometimes. Its weak rules are being weeded out." if tag == "mixed" else
-                         "Usually loses to holding. Its costly rules fade in its children.")
+                good = a["avg"] > 0 and a["made"] * 2 >= a["n"]
+                tag = "good" if good else "bad" if a["made"] == 0 or a["avg"] < -1 else "mixed"
+                means = ("Strong: makes money across many stretches. A Hall of Fame candidate." if good and a["n"] >= 3 else
+                         "Promising: made money, but needs more tests to rule out luck." if good else
+                         "Mixed: makes money sometimes. Its weak rules are being weeded out." if tag == "mixed" else
+                         "Usually loses money. Its costly rules fade in its children.")
                 if a.get("grad"):
-                    means = "Practice-farm graduate. " + means
+                    means = "Graduate. " + means
                 bots.insert("", "end", tags=(tag,), values=(
-                    a["name"], a["n"], f"{a['wins']} of {a['n']}", f"{a['avg']:+.1f}%", f"{a['best']:+.1f}%", f"{a['worst']:+.1f}%",
+                    a["name"], a["n"], f"{a['made']} of {a['n']}", f"{a['avg']:+.1f}%", a["trades"],
+                    f"{a['wins'] / a['closed'] * 100:.0f}%" if a["closed"] else "-",
+                    "-" if a["best"] is None else f"{a['best']:+.1f}%", "-" if a["worst"] is None else f"{a['worst']:+.1f}%",
                     "in farm" if a["farm"] else "gone", means))
 
         def fill_feed():

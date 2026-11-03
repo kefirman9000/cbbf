@@ -1905,6 +1905,7 @@ class Variant:
         self.live_n = 0          # decisions made on prices that came in after the bot was created
         self.live_eq0 = None     # its equity when it started trading live (after any replay)
         self.log = deque(maxlen=300)  # (decision number, coin, side, price) of this bot's own trades, for charts
+        self.best_tr = self.worst_tr = None  # its best and worst finished trade, % of what it paid
 
     @property
     def label(self):
@@ -2372,6 +2373,11 @@ class Tournament:
                     v.wins += 1
                 else:
                     v.losses += 1
+                paid_ = t["usd"] - t["pl"]
+                if paid_ > 0:
+                    pc_ = t["pl"] / paid_ * 100
+                    v.best_tr = pc_ if v.best_tr is None else max(v.best_tr, pc_)
+                    v.worst_tr = pc_ if v.worst_tr is None else min(v.worst_tr, pc_)
                 if t.get("flags") and not self.replaying:
                     for k in t["flags"]:
                         self.review.setdefault(k, [0, 0])[0 if t["pl"] <= 0 else 1] += 1
@@ -3339,7 +3345,8 @@ def backtest_bot(g, closes, extra=None, start_cash=1000.0, fee=0.006, pct=0.1, s
     wins = sum(1 for r in rets if r > 0)
     return dict(
         ret=ret, hold=hold, edge=ret - hold, maxdd=dd, trades=len(marks), winrate=wins / len(rets) if rets else None,
-        closed=len(rets), sortino=sortino, eq=eq, hold_eq=[x * start_cash for x in hold_eq], marks=marks, start=start,
+        closed=len(rets), wins=wins, best_trade=max(rets) * 100 if rets else None,
+        worst_trade=min(rets) * 100 if rets else None, sortino=sortino, eq=eq, hold_eq=[x * start_cash for x in hold_eq], marks=marks, start=start,
         by_coin=by_coin, by_mood=by_mood, layer_stats={k: list(v) for k, v in b.layer_stats.items()},
         veto_stats={k: list(v) for k, v in b.veto_stats.items()}, coin_pl={k: list(v) for k, v in b.coin_pl.items()},
         segments=segs, mc_dd95=dds[int(len(dds) * 0.95)] if dds else None, fees2x=f2, review=review,
@@ -3498,6 +3505,8 @@ def train_farm(closes, extra, opts, cap=40, passes=2, exam_frac=0.25, seed_genes
     for v in picked[:max(12, cap // 3)]:
         lf = t.life(v)
         r = dict(v=v, genes=_genes(v), train_ret=lf["ret"], train_edge=lf["edge"], trades=lf["trades"], winrate=lf["winrate"],
+                 closed=lf["wins"] + lf["losses"], wins=lf["wins"], best_trade=getattr(v, "best_tr", None),
+                 worst_trade=getattr(v, "worst_tr", None),
                  exam_ret=None, exam_edge=None, passed=None, layer_stats={k: list(x) for k, x in v.layer_stats.items()},
                  veto_stats={k: list(x) for k, x in v.veto_stats.items()})
         if cut < L:
