@@ -152,6 +152,39 @@ def clamp_tf(tf):
     return min(TIMEFRAMES, key=lambda t: abs(t - tf))
 
 
+# ---------------- Free roam: reuse downloaded history ----------------
+class StretchPool:
+    """Stretches of history Free roam has downloaded, kept in memory so each one can be studied a few times before a
+    new one is fetched (far fewer downloads). Only the first visit is on prices the farm hasn't seen, so every later
+    visit is handed out with info["revisit"] True: those studies may teach, but never promote (no exams, graduates or
+    hatched eggs). Each caller gets its own copy, so one study can't change another's prices."""
+
+    def __init__(self, keep=4):
+        self.keep = keep
+        self.items = []
+
+    def take(self, key, reuse, min_bars=0, gran=None):
+        """A stretch for another visit -> (closes, extra, info), or None when a new one should be downloaded."""
+        import copy
+        reuse = max(1, int(reuse))
+        self.items = [x for x in self.items if x["key"] == key and x["uses"] < reuse]  # new session: start afresh
+        fit = [x for x in self.items if x["info"].get("bars", 0) >= min_bars and (gran is None or x["info"].get("gran") == gran)]
+        if not fit:
+            return None
+        x = min(fit, key=lambda x: x["uses"])  # the least-visited first
+        x["uses"] += 1
+        return copy.deepcopy(x["closes"]), copy.deepcopy(x["extra"]), dict(x["info"], revisit=True, visit=x["uses"])
+
+    def add(self, key, reuse, closes, extra, info):
+        """A freshly downloaded stretch (its first visit). -> info marked as a first visit."""
+        import copy
+        info = dict(info, revisit=False, visit=1)
+        if int(reuse) > 1:
+            self.items.append(dict(key=key, uses=1, closes=copy.deepcopy(closes), extra=copy.deepcopy(extra), info=info))
+            del self.items[:-self.keep]
+        return info
+
+
 # ---------------- errors the app recovered from ----------------
 _noted = {}
 
@@ -957,6 +990,7 @@ DEFAULT_SETTINGS = {
     "tg_remote": False,          # control CBBF from Telegram: /status /pause /resume /report /kill
     "free_roam": False,          # when the farm is idle, it backtests its own bots and runs small training camps by itself
     "free_roam_running": False,  # ...also while the bot runs (uses a little more computer power and network)
+    "roam_reuse": 3,             # Free roam studies each downloaded stretch this many times before fetching a new one
     "slow_trades_account": False,  # the slow farm (hourly candles) may also trade your account
     "slow_size": 30,             # bots on the slow farm
     "coin_prefs": True,          # bots learn which coins they're bad at and skip them (re-checked in hindsight)

@@ -1,6 +1,10 @@
 # Changelog
 
 ## 1.20.5
+- **Free roam downloads much less**: each stretch of history it downloads is now studied 3 times before it
+  fetches a new one (Settings > Learning, "Free roam studies each stretch..."; 1 = always new). Only the first
+  visit is on prices the farm hasn't seen, so only it can promote bots (graduates); repeat visits still teach
+  and show as "(again)" in the study log.
 - **Restart works in folders with spaces on Windows**: CBBF now restarts the way OBF does. It also keeps running as the
   icon after an update if it was started as the icon. (There were two restart routines; the older one won.)
 - **The farm keeps to its size** (from OBF): graduates, designed eggs and woken season champions now make room first.
