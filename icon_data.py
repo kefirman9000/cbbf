@@ -1,4 +1,4 @@
-"""CBBF window icons (a small dragon), as embedded PNG data."""
+"""Window icons (a small dragon), as embedded PNG data. Shared as-is by OBF and CBBF."""
 ICON_64 = (
     "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAczklEQVR4XrV7CZRV1Znut/c+073nTjVRxYwiICJqUJxoowgmHdPp"
     "aFSIEV3iEDVJR01nWCvJC9h2+uV1d9JJMDEKjjEOmPheOlFbExFNk3aI4oQTQ4GA1Fx1h3Onc87eb/373FsURRVV0Pa/1oFbd9j7"

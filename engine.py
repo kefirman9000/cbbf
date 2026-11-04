@@ -152,6 +152,32 @@ def clamp_tf(tf):
     return min(TIMEFRAMES, key=lambda t: abs(t - tf))
 
 
+# ---------------- errors the app recovered from ----------------
+_noted = {}
+
+
+def note_error(where):
+    """Records the exception being handled in errors.log, for errors the app carries on after (a failed save, a
+    dropped connection). Each kind is written at most once every 10 minutes and the file stays under ~1 MB, so a
+    repeating problem can't flood it. Never raises."""
+    try:
+        import traceback
+        et, ev, _ = sys.exc_info()
+        key = (where, et.__name__ if et else "")
+        now = time.time()
+        if now - _noted.get(key, 0) < 600:
+            return
+        _noted[key] = now
+        os.makedirs(HOME_DIR, exist_ok=True)
+        path = os.path.join(HOME_DIR, "errors.log")
+        if os.path.exists(path) and os.path.getsize(path) > 1_000_000:
+            os.replace(path, path + ".old")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"--- {datetime.now():%Y-%m-%d %H:%M:%S} {where}\n{traceback.format_exc()}\n")
+    except Exception:
+        pass
+
+
 # ---------------- network helpers ----------------
 def http_get(url, timeout=10, retries=0):
     """GET with a few automatic retries for brief network blips, rate limits (429) and server errors."""
@@ -409,7 +435,7 @@ def fetch_range(coin, gran, start, end, quote="USD", note=None):
         try:
             rows.update(_fetch_bars(coin, gran, max(start, cut - gran), end + gran, quote))
         except Exception:
-            pass
+            note_error("fetch_range")
     ts = sorted(rows)
     seq = [rows[t] for t in ts]
     return dict(c=[r[0] for r in seq], h=[r[1] for r in seq], l=[r[2] for r in seq], v=[r[3] for r in seq], t=ts)
@@ -2389,7 +2415,7 @@ class Tournament:
                 try:
                     self.on_trade(v, c, t, data_now(x, [c]) if x else None)
                 except Exception:
-                    pass
+                    note_error("_run")
         e = v.sim.equity(last)
         if not self.replaying:
             if v.live_eq0 is None:
@@ -2602,6 +2628,32 @@ class Tournament:
                 d["stake"] *= v.size_mult
         self.info = info
 
+    def young(self, v):
+        """Still within its first window of decisions: too new to judge, so never dropped to make room."""
+        return self.score(v) is None and v.age < self.window_for(v.tf)
+
+    def weakest(self):
+        """Who goes first when room is needed, as (bot, score) pairs: bots that have had a full window and still
+        can't be scored (they hardly trade) first, then the scored ones from the bottom of the ranking. Bots too young
+        to judge are left alone, so new eggs get their chance and the farm doesn't fill with unjudged eggs."""
+        stuck = sorted((v for v in self.vars if self.score(v) is None and not self.young(v)), key=lambda v: len(v.sim.tbars))
+        return [(v, None) for v in stuck] + list(reversed(self.ranking()))
+
+    def trim_to_cap(self):
+        """Brings an overfull farm back down to its size (bots that can't be judged, then the weakest). -> removed"""
+        n = 0
+        while len(self.vars) > self.cap:
+            cands = [x for x, _ in self.weakest() if x not in self.active]
+            if not cands:
+                break
+            self._remove(cands[0], "farm over its size")
+            n += 1
+        return n
+
+    def nursery_full(self):
+        """True when too many bots are still too young to judge (40% of the farm): extra eggs then wait."""
+        return sum(1 for v in self.vars if self.young(v)) >= 0.4 * max(1, self.cap)
+
     def ranking(self):
         r = [(v, self.score(v)) for v in self.vars]
         if self.o.get("luck_check", True):  # breeding and culling also trust long records over short lucky ones
@@ -2763,7 +2815,7 @@ class Tournament:
             if not best:
                 continue
             if len(self.vars) >= self.cap:
-                cands = [v for v, _ in reversed(self.ranking()) if v not in self.active and v is not best]
+                cands = [v for v, _ in self.weakest() if v not in self.active and v is not best]
                 if not cands:
                     continue
                 self._remove(cands[0], "dropped to make room")
@@ -2855,7 +2907,7 @@ class Tournament:
         if v:
             ch["uid"] = v.uid
             if len(self.vars) > self.cap:
-                cands = [x for x, _ in reversed(self.ranking()) if x not in self.active and x is not v]
+                cands = [x for x, _ in self.weakest() if x not in self.active and x is not v]
                 if cands:
                     self._remove(cands[0], "dropped to make room")
 
@@ -2905,7 +2957,7 @@ class Tournament:
             parent = r[0][0]
         fam = sum(1 for x in self.vars if x.name == parent.name)
         if fam >= self.family_cap or len(self.vars) >= self.cap:
-            cands = [v for v, _ in reversed(self.ranking()) if v is not parent and v not in self.active
+            cands = [v for v, _ in self.weakest() if v is not parent and v not in self.active
                      and sum(1 for x in self.vars if x.name == v.name) > 1]
             if fam >= self.family_cap:
                 cands = [v for v in cands if v.name == parent.name]
@@ -2961,6 +3013,11 @@ class Tournament:
                 val = dv
             p[k] = int(round(val)) if isinstance(dv, int) else round(val, 2)
         fix_params(name, p)
+        if len(self.vars) >= self.cap:  # a full farm makes room first (never for a bot too young to judge)
+            cands = [x for x, _ in self.weakest() if x not in self.active]
+            if cands:
+                self._remove(cands[0], "dropped to make room")
+                self.events.append(f"Dropped {cands[0].label}")
         v = self._new(name, p, tf, risk, traits, vetoes, layers)
         self._register(v, [], origin)
         v.size_mult = min(max(float(size), 0.25), 3.0)
@@ -3024,7 +3081,7 @@ class Tournament:
         name = self.rng.choice(WILDCARD_STRATS)
         p = self._rand_params(name)
         if len(self.vars) >= self.cap:
-            cands = [v for v, _ in reversed(self.ranking()) if v not in self.active
+            cands = [v for v, _ in self.weakest() if v not in self.active
                      and sum(1 for x in self.vars if x.name == v.name) > 1]
             if cands:
                 self._remove(cands[0], "dropped to make room")
@@ -3596,7 +3653,7 @@ def warm_islands(coins, start_cash, fee, pct, evolve, params, opts, cap, retire_
         return None
     t.cap = cap
     while len(t.vars) > cap:
-        worst = [v for v, _ in reversed(t.ranking()) if v not in t.active] or \
+        worst = [v for v, _ in t.weakest() if v not in t.active] or \
             [v for v in t.vars if t.info.get(id(v), {}).get("status") == "warming up"]
         if not worst:
             break
@@ -4501,7 +4558,7 @@ def install_packages(specs, log=print):
             if os.path.isdir(u) and u not in sys.path:
                 sys.path.append(u)
         except Exception:
-            pass
+            note_error("install_packages")
         return True, "All set. The add-ons are installed and ready, no restart needed."
     if any(x in low for x in ("getaddrinfo", "connection", "timed out", "could not find a version", "no matching distribution",
                               "name or service not known", "network")):
@@ -4756,12 +4813,62 @@ def changelog_since(text, current):
     return "\n".join(out).strip()
 
 
+def latest_release(repo):
+    """The newest published GitHub release of `repo`: its version, release-zip and checksum links, and notes.
+    Updates come from releases (built and tagged by the Release workflow), never from whatever is on the main branch
+    at that moment, so a half-finished push can't reach anyone."""
+    d = json.loads(http_get(f"https://api.github.com/repos/{repo}/releases/latest", 15, retries=1))
+    tag = str(d.get("tag_name") or "")
+    assets = {a.get("name", ""): a.get("browser_download_url", "") for a in d.get("assets") or []}
+    zip_name = next((n for n in assets if n.endswith(".zip")), "")
+    return dict(version=tag.lstrip("vV"), tag=tag, zip_name=zip_name, zip_url=assets.get(zip_name, ""),
+                sha_url=assets.get(zip_name + ".sha256", ""), notes=str(d.get("body") or ""))
+
+
+def sha256_from_file(text):
+    """The checksum in a `sha256sum`-style line ("<64 hex digits>  name"), or "" if there isn't one."""
+    m = re.match(r"\s*([0-9a-fA-F]{64})\b", text or "")
+    return m.group(1).lower() if m else ""
+
+
+def download_release(rel):
+    """Downloads a release zip and checks it against the checksum published with it. Raises if anything's off,
+    so nothing is installed from a damaged or incomplete download."""
+    import hashlib
+    if not rel.get("zip_url"):
+        raise RuntimeError(f"release {rel.get('tag') or '?'} has no download attached")
+    if not rel.get("sha_url"):
+        raise RuntimeError(f"release {rel.get('tag') or '?'} has no checksum attached, so it wasn't installed")
+    want = sha256_from_file(http_get(rel["sha_url"], 20, retries=2).decode("utf-8", "replace"))
+    if not want:
+        raise RuntimeError("the release's checksum file couldn't be read, so nothing was installed")
+    data = http_get(rel["zip_url"], 120, retries=2)
+    if hashlib.sha256(data).hexdigest() != want:
+        raise RuntimeError("the download doesn't match its checksum (damaged or incomplete), so nothing was installed")
+    return data
+
+
+def _requirement_lines(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return [ln.split("#", 1)[0].strip() for ln in f if ln.split("#", 1)[0].strip()]
+    except OSError:
+        return []
+
+
+def new_requirements(backup, here):
+    """Requirement lines the freshly installed version has that the backed-up one didn't (new or changed)."""
+    old = set(_requirement_lines(os.path.join(backup, "requirements.txt")))
+    return [r for r in _requirement_lines(os.path.join(here, "requirements.txt")) if r not in old]
+
+
 UPDATE_FILES = re.compile(r"^(?:[\w.-]+\.pyw?|VERSION|README\.md|CHANGELOG\.md|requirements\.txt|[\w .-]+\.bat)$")
 
 
-def install_update(zip_bytes, here, current_version):
-    """Unpacks a GitHub branch zip over the app folder. The files being replaced are first copied to
-    here/backups/<old version>-<time>/ so the update can be undone. Returns (files written, backup folder)."""
+def install_update(zip_bytes, here, current_version, expect_version=None):
+    """Unpacks a release zip (or a GitHub branch zip) over the app folder. The files being replaced are first copied to
+    here/backups/<old version>-<time>/ so the update can be undone. With expect_version, the zip's VERSION file must
+    say the same. Returns (files written, backup folder)."""
     import io
     import zipfile
     z = zipfile.ZipFile(io.BytesIO(zip_bytes))
@@ -4772,6 +4879,10 @@ def install_update(zip_bytes, here, current_version):
             picks[rel] = name
     if "main.py" not in picks or "engine.py" not in picks:
         raise RuntimeError("the download doesn't look like this app (main.py / engine.py missing)")
+    if expect_version:
+        got = z.read(picks["VERSION"]).decode("utf-8", "replace").strip() if "VERSION" in picks else ""
+        if got != str(expect_version).strip():
+            raise RuntimeError(f"the download says it is version {got or '?'}, not {expect_version}")
     for rel in ("main.py", "engine.py"):  # never install something that doesn't even compile
         compile(z.read(picks[rel]).decode("utf-8"), rel, "exec")
     backup = os.path.join(here, "backups", f"{current_version}-{datetime.now():%Y%m%d-%H%M%S}")

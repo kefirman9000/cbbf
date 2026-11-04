@@ -115,10 +115,10 @@ dens grew, and get a **weekly report** of what it learned.
 - Farm size up to 200, learning spread over several processor cores, and it goes quiet when minimised
 
 ## More screens
-<p align="center"><img src="docs/screenshots/chart-split-candles.png" width="100%"></p>
-<p align="center"><img src="docs/screenshots/portfolio.png" width="100%"></p>
-<p align="center"><img src="docs/screenshots/watchlist.png" width="100%"></p>
-<p align="center"><img src="docs/screenshots/main-light.png" width="100%"></p>
+<p align="center"><img src="docs/screenshots/chart-split-candles.png" alt="Price chart with split candles" width="100%"></p>
+<p align="center"><img src="docs/screenshots/portfolio.png" alt="Portfolio" width="100%"></p>
+<p align="center"><img src="docs/screenshots/watchlist.png" alt="Watchlist" width="100%"></p>
+<p align="center"><img src="docs/screenshots/main-light.png" alt="The farm in the light theme" width="100%"></p>
 
 ## Your data
 Everything stays on your computer in `~/.cbbf/` (Windows: `C:\Users\<you>\.cbbf`). **File > Open data folder** opens it.

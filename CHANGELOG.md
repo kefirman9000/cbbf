@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.20.5
+- **Restart works in folders with spaces on Windows**: CBBF now restarts the way OBF does. It also keeps running as the
+  icon after an update if it was started as the icon. (There were two restart routines; the older one won.)
+- **The farm keeps to its size** (from OBF): graduates, designed eggs and woken season champions now make room first.
+  Bots too young to judge are never dropped; bots that had a full window and still can't be scored go first. A farm
+  that grew past its size is trimmed back when it loads, and Free roam holds back graduates while 40% of the farm is
+  still too young to judge.
+- **A saved farm that fails to load is kept**: a copy is saved first (`...couldnt-load-....json`), so it can't be lost.
+- **Updates come from finished releases only**, checked against a checksum published with each one, and the download
+  must say it's the version you were offered. Before, Update installed whatever was on GitHub at that moment.
+- **Updates install the add-ons a new version needs** (anything new in requirements.txt), and say so if one fails.
+- **Restoring a backup can't be undone by an autosave anymore**: CBBF restarts right after writing the restored files
+  instead of saving the old farm and settings over them on the way out.
+- Errors CBBF recovers from (a failed save, a dropped connection) are now noted in `errors.log` in the data folder.
+
 ## 1.20.4
 - **Training shows each bot's own results**: Free roam and the Training camp no longer compare bots with simply holding.
   - Free roam's "best to worst" list: tests, how many made money, average return, total trades, win rate, and each

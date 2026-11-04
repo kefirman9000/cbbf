@@ -14,13 +14,13 @@ def _stay_open(msg):
             import ctypes
             ctypes.windll.user32.MessageBoxW(None, msg, "CBBF could not start", 0x10)
         except Exception:
-            pass
+            E.note_error("_stay_open")
         sys.exit(1)
     print("\n" + "=" * 60 + "\nCBBF could not start\n" + "=" * 60 + "\n" + msg + "\n")
     try:
         input("Press Enter to close this window...")
     except Exception:
-        pass
+        E.note_error("_stay_open")
     sys.exit(1)
 
 
@@ -40,7 +40,6 @@ except ImportError as _e:
 
 import bisect
 import csv
-import io
 import json
 import math
 import os
@@ -64,7 +63,6 @@ import engine as E
 
 # ---- Update settings: change to your GitHub "user/repo" after publishing ----
 UPDATE_REPO = "kefirman9000/cbbf"
-UPDATE_BRANCH = "main"
 HERE = os.path.dirname(os.path.abspath(__file__))
 APP_SHORT = "CBBF"
 CONFIG_PATH = os.path.join(E.HOME_DIR, "config.json")
@@ -834,7 +832,23 @@ class App:
                          self.settings["trade_pct"] / 100, self.settings["evolve_every"], params=self.settings["params"],
                          opts=E.tournament_opts(self.settings), cap=int(self.settings["max_bots"]),
                          retire_steps=self.retire_steps(self.session_bar))
-        return t if t.restore(d.get("farm")) else None
+        try:
+            if not t.restore(d.get("farm")):
+                return None
+            gone = t.trim_to_cap()  # graduates and designed eggs could push a farm past its size before 1.20.5
+            if gone:
+                self.q.put(("log", (f"Your farm had grown past its size of {t.cap}; {gone} bots that couldn't be judged or "
+                                    "were weakest made room.", "info")))
+            return t
+        except Exception:
+            # never lose a farm to a bug: keep a copy of the file before anything could save over it
+            try:
+                import shutil
+                shutil.copy2(E.farm_path(self.live), E.farm_path(self.live) + f".couldnt-load-{int(time.time())}.json")
+            except OSError:
+                pass
+            self._farm_load_failed = True
+            raise
 
     def restore_last_session(self):
         """On start-up: put the last session (and its farm) back on screen, paused, exactly where it left off."""
@@ -907,14 +921,14 @@ class App:
         try:
             self.slow_save()
         except Exception:
-            pass
+            E.note_error("on_close")
         self.running = False
         self.awake.off()
         try:
             self.cfg["size"] = f"{self.root.winfo_width()}x{self.root.winfo_height()}"
             E.save_json(CONFIG_PATH, self.cfg)
         except Exception:
-            pass
+            E.note_error("on_close")
         self.save_state()
         if self.tray is not None:
             self.tray.stop()
@@ -928,13 +942,13 @@ class App:
             self.save_farm(force=True)
             self.slow_save()
         except Exception:
-            pass
+            E.note_error("on_shutdown")
         try:
             self.cfg["was_running"] = bool(self.running)
             E.save_json(CONFIG_PATH, self.cfg)
             self.save_state()
         except Exception:
-            pass
+            E.note_error("on_shutdown")
 
     def hourly(self):
         """Light housekeeping once an hour: the weekly backup, the daily recap, and (in the background) the update check."""
@@ -942,12 +956,12 @@ class App:
             try:
                 fn()
             except Exception:
-                pass
+                E.note_error("hourly")
         if self.tray_hidden():
             try:
                 self.auto_check_update()
             except Exception:
-                pass
+                E.note_error("hourly")
         self.root.after(3600 * 1000, self.hourly)
 
     def recap_base(self):
@@ -3954,7 +3968,7 @@ class App:
                             if v is not None:
                                 vols[c] = v * (bar_min if bar_min < 1 else 1)
                         except Exception:
-                            pass
+                            E.note_error("worker")
                     if vols:
                         self.q.put(("vols", vols))
                 if all(c in prices for c in coins):
@@ -3978,7 +3992,7 @@ class App:
                         self.q.put(("balances", self.read_balances(
                             E.to_dict(self.client.get_accounts(limit=250))["accounts"])))
                     except Exception:
-                        pass
+                        E.note_error("worker")
             except Exception:  # never let the feed die
                 self.q.put(("log", (self._record_error("fetching prices"), "bad")))
                 time.sleep(2)
@@ -4088,7 +4102,7 @@ class App:
             try:
                 self.write(msg, "bad")
             except Exception:
-                pass
+                E.note_error("on_cb_error")
 
     def drain(self):
         """Handles messages from background threads. One bad message can no longer stop the loop."""
@@ -5510,7 +5524,7 @@ class App:
             E.teach_from(t, res["tourn"])
             passed = [r for r in res["results"] if r["passed"]]
             grad = ""
-            if passed and self.seeded and len(t.vars) < t.cap + 2:
+            if passed and self.seeded and len(t.vars) < t.cap + 2 and not t.nursery_full():  # (eggs waiting to be judged go first)
                 g = passed[0]["genes"]
                 v = t.add_variant(g["name"], g["params"], {c: self.hist[c] for c in self.session_coins}, 1.0,
                                   note="Free roam graduate:", tf=g["tf"], origin="free roam", risk=g["risk"],
@@ -6076,7 +6090,7 @@ class App:
                     try:
                         self.add_ctx(hx, self.SLOW_GRAN, self.SLOW_HISTORY, quote)
                     except Exception:
-                        pass
+                        E.note_error("work")
                 last_ts = min(ts[c][-1] for c in coins) if L else 0
                 t = sl["t"]
                 if t is None and saved.get("farm"):
@@ -6152,7 +6166,7 @@ class App:
                     k = min(len(new[c]) for c in sl["coins"])
                     self.q.put(("call", lambda new=new, k=k: self._slow_step(new, k)))
             except Exception:
-                pass
+                E.note_error("_slow_feed")
 
     def _slow_step(self, new, k):
         sl, t = self.slow, self.slow["t"]
@@ -6303,7 +6317,7 @@ class App:
             if "Slow farm" not in self.cur_tab():
                 return  # redrawn when you open the tab
         except Exception:
-            pass
+            E.note_error("slow_refresh")
         if sl.get("status"):
             txt = sl["status"]
         elif t is None:
@@ -6632,7 +6646,7 @@ class App:
                             z.writestr("config.json", json.dumps(c_))
                             n += 1
                         except Exception:
-                            pass
+                            E.note_error("write_backup")
                         continue
                     if fn.endswith(".lock") or fn.endswith(".flag"):
                         continue
@@ -6680,6 +6694,8 @@ class App:
                 for fn in files:
                     full = os.path.join(root_, fn)
                     z.write(full, os.path.relpath(full, E.HOME_DIR))
+        # say it now: once the files are written nothing may run (a delayed autosave would undo the restore)
+        messagebox.showinfo("Restore", f"CBBF will now restore the backup and restart.\n(Safety copy: {safety})")
         with zipfile.ZipFile(p) as z:
             for m in z.namelist():
                 dest = os.path.normpath(os.path.join(E.HOME_DIR, m))
@@ -6690,17 +6706,7 @@ class App:
                 os.makedirs(os.path.dirname(dest), exist_ok=True)
                 with z.open(m) as src, open(dest, "wb") as out:
                     out.write(src.read())
-        messagebox.showinfo("Restore", f"Restored. CBBF will now restart to load it.\n(Safety copy: {safety})")
-        self.restart_app()
-
-    def restart_app(self):
-        try:
-            self._quitting = True
-            self.on_close()
-        except Exception:
-            pass
-        self.release_lock()
-        os.execv(sys.executable, [sys.executable] + sys.argv)
+        self.restart_app(save=False)
 
     def release_lock(self):
         if self.tray is not None:
@@ -7159,7 +7165,7 @@ class App:
             t.evolve_every = int(self.settings["evolve_every"])
             t.retire_steps = self.retire_steps(self.session_bar)
             while len(t.vars) > t.cap:
-                worst = [v for v, _ in reversed(t.ranking()) if v not in t.active]
+                worst = [v for v, _ in t.weakest() if v not in t.active]
                 if not worst:
                     break
                 t._remove(worst[0], "farm made smaller")
@@ -7197,7 +7203,7 @@ class App:
             try:
                 old.destroy()
             except Exception:
-                pass
+                E.note_error("_tour_step")
         if i >= len(steps):
             return
         try:
@@ -7333,7 +7339,7 @@ class App:
         if kind == "add":
             lines.append(f"Adding to {c}: the winning bots holding most of the weight are still in it.")
         elif kind == "slow":
-            lines.append(f"Only shaky bots wanted this, so it's a small, slowed-down trade.")
+            lines.append("Only shaky bots wanted this, so it's a small, slowed-down trade.")
         for v in sorted(voters, key=lambda x: -self.tourn.info.get(id(x), {}).get("weight", 0))[:5]:
             st = STATUS_TEXT.get(self.tourn.info.get(id(v), {}).get("status"), "")
             lines.append(f"- {E.bot_nickname(v.key())} ({STRAT_LABELS.get(v.name, v.name)}, {st}): "
@@ -8857,7 +8863,7 @@ class App:
             try:
                 self.root.after_cancel(old)
             except Exception:
-                pass
+                E.note_error("later")
         pend[fn.__name__] = self.root.after(ms, lambda: (pend.pop(fn.__name__, None), fn()))
 
     def soon(self, fn, ms=40):
@@ -9386,7 +9392,7 @@ class App:
                     if prices or stats:
                         self.q.put(("watch", (prices, stats)))
                 except Exception:
-                    pass
+                    E.note_error("loop")
                 time.sleep(20 if self._iconic else 5)
         self._watch_thread = threading.Thread(target=loop, daemon=True)
         self._watch_thread.start()
@@ -11107,15 +11113,19 @@ class App:
 
         def work():
             try:
-                base = f"https://raw.githubusercontent.com/{UPDATE_REPO}/{UPDATE_BRANCH}"
-                remote = E.http_get(f"{base}/VERSION", 10, retries=1).decode().strip()
+                rel = E.latest_release(UPDATE_REPO)
+                remote = rel["version"]
+                if not remote:
+                    raise RuntimeError("no release found on GitHub")
                 notes = ""
-                try:
-                    notes = E.changelog_since(E.http_get(f"{base}/CHANGELOG.md", 10).decode("utf-8", "replace"), self.version)
+                try:  # the changelog at that release's tag: every version since yours, not just the newest
+                    raw = f"https://raw.githubusercontent.com/{UPDATE_REPO}/{rel['tag']}/CHANGELOG.md"
+                    notes = E.changelog_since(E.http_get(raw, 10).decode("utf-8", "replace"), self.version)
                 except Exception:
-                    pass
+                    E.note_error("work")
+                self.update_rel = rel
                 self.q.put(("update", ("found" if E.version_tuple(remote) > E.version_tuple(self.version) else "none",
-                                       (remote, notes, silent))))
+                                       (remote, notes or rel["notes"], silent))))
             except Exception as e:
                 self.q.put(("update", ("error", (str(e), silent))))
         threading.Thread(target=work, daemon=True).start()
@@ -11156,9 +11166,16 @@ class App:
                 self.show_update()
             return
         if kind == "installed":
-            written, backup = data
+            written, backup, added, problem = data
             self.upd_btn.config(text="\u27f3 Restart to finish updating", bg=ACCENT, fg="white")
             self.write(f"Updated {len(written)} files. The old version is kept in {backup}.", "good")
+            if added and not problem:
+                self.write("Installed what the new version needs: " + ", ".join(added), "good")
+            if problem:
+                self.write(f"The new version needs {', '.join(added)}, which didn't install: {problem}", "warn")
+                messagebox.showwarning("Update", "The update is installed, but an add-on it needs didn't install:\n\n"
+                                                 f"{', '.join(added)}\n\n{problem}\n\nIf the app has trouble after "
+                                                 "restarting, Tools > Undo last update goes back.")
             if messagebox.askyesno("Update installed", "The update is installed. Restart CBBF now to use it?\n\n"
                                                        "(Your session is saved first. Tools > Undo last update goes back.)"):
                 self.restart_app()
@@ -11201,10 +11218,19 @@ class App:
 
             def work():
                 try:
-                    data = E.http_get(f"https://github.com/{UPDATE_REPO}/archive/refs/heads/{UPDATE_BRANCH}.zip", 60, retries=1)
-                    self.q.put(("update", ("installed", E.install_update(data, HERE, self.version))))
+                    rel = getattr(self, "update_rel", None) or E.latest_release(UPDATE_REPO)
+                    data = E.download_release(rel)  # the release zip, checked against its published checksum
+                    written, backup = E.install_update(data, HERE, self.version, expect_version=rel["version"])
                 except Exception as e:
-                    self.q.put(("update", ("install_fail", str(e))))
+                    return self.q.put(("update", ("install_fail", str(e))))
+                added, problem = E.new_requirements(backup, HERE), ""
+                if added:  # the new version needs add-ons this computer may not have yet
+                    try:
+                        ok, msg = E.install_packages(added, lambda line: None)
+                        problem = "" if ok else msg
+                    except Exception as e:
+                        problem = str(e)
+                self.q.put(("update", ("installed", (written, backup, added, problem))))
             threading.Thread(target=work, daemon=True).start()
         ttk.Button(b, text="Accept and install", style="Accent.TButton", command=accept).pack(side="right")
         ttk.Button(b, text="Later", command=w.destroy).pack(side="right", padx=6)
@@ -11222,21 +11248,29 @@ class App:
             return messagebox.showerror("Undo update", f"Couldn't restore: {e}")
         self.restart_app()
 
-    def restart_app(self):
+    def restart_app(self, save=True):
+        """save=False after a restore: saving now would write the old in-memory state over the files just restored."""
         self.running = False
         self.awake.off()
-        try:
-            self.save_state()
-            E.save_json(CONFIG_PATH, self.cfg)
-        except Exception:
-            pass
+        if save:
+            try:
+                self.save_state()
+                E.save_json(CONFIG_PATH, self.cfg)
+            except Exception:
+                pass
         try:
             self._gone = True
             self.root.destroy()
         except Exception:
             pass
         self.release_lock()
-        os.execv(sys.executable, [sys.executable, os.path.join(HERE, "main.py")])
+        # a fresh process (not os.execv: on Windows that doesn't quote paths, so a space in a folder name broke restarts)
+        args = [sys.executable, os.path.join(HERE, "main.py")] + [a for a in sys.argv[1:] if a == "--tray"]
+        try:
+            subprocess.Popen(args, cwd=HERE, close_fds=True)
+        except Exception:
+            os.execv(sys.executable, [f'"{a}"' if " " in a and sys.platform.startswith("win") else a for a in args])
+        os._exit(0)
 
 
 def _report_crash():

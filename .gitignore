@@ -2,3 +2,8 @@ __pycache__/
 *.pyc
 backups/
 *.new
+*.old
+dist/
+.venv/
+.pytest_cache/
+.ruff_cache/
