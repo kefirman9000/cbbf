@@ -50,3 +50,20 @@ def test_note_error_writes_errors_log():
         E.note_error("test")
     with open(os.path.join(E.HOME_DIR, "errors.log")) as f:
         assert "ValueError: boom" in f.read()
+
+
+def test_fresh_farm_can_step_through_prices():
+    """A new farm's bots can remember more decisions than its buy-and-hold record; rating them must not crash."""
+    import random
+    rng = random.Random(1)
+    syms = ["SPY", "QQQ", "IWM"] if E.KEYRING_SERVICE == "obf" else ["BTC", "ETH", "SOL"]
+    hist = {}
+    for s in syms:
+        p, hist[s] = 100.0, []
+        for _ in range(1600):
+            p *= 1 + rng.gauss(0, 0.003)
+            hist[s].append(p)
+    t = E.Tournament(syms, 1000.0, 0.006, 0.1, 24, cap=60)
+    for i in range(1500, 1560):
+        t.step({s: h[:i] for s, h in hist.items()})
+    assert t.vars

@@ -7,6 +7,8 @@
   Bots too young to judge are never dropped; bots that had a full window and still can't be scored go first. A farm
   that grew past its size is trimmed back when it loads, and Free roam holds back graduates while 40% of the farm is
   still too young to judge.
+- **Fix (from OBF): a new farm could crash while rating its bots** ("unsupported operand type(s) for -: 'float' and
+  'NoneType'") when its bots remembered more decisions than the farm's record of just holding.
 - **A saved farm that fails to load is kept**: a copy is saved first (`...couldnt-load-....json`), so it can't be lost.
 - **Updates come from finished releases only**, checked against a checksum published with each one, and the download
   must say it's the version you were offered. Before, Update installed whatever was on GitHub at that moment.
