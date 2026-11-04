@@ -290,6 +290,65 @@ class StretchPool:
         return info
 
 
+# ---------------- exams: how a bot does on stretches it never trained on ----------------
+EXAM_KEEP = 12   # exams remembered per bot
+EXAM_MIN = 3     # exams needed before a verdict
+
+
+def add_exam(v, kind, edge, n, when=None, gran=None):
+    """Records one exam (edge: % result on unseen prices, vs the market where there is one; n: its trades; gran: the
+    candle size it was tested on, which is always the candle size it lives on)."""
+    ex = list(getattr(v, "exams", None) or [])
+    ex.append(dict(k=kind, edge=round(float(edge), 3), n=int(n), at=round(time.time()), when=when, g=gran))
+    v.exams = ex[-EXAM_KEEP:]
+
+
+def exam_bar(tried):
+    """How convincing exam results must be when `tried` bots have been tried: the more bots a farm tries, the
+    luckier its best one looks by chance alone, so the bar rises (about the best of `tried` coin flips)."""
+    return math.sqrt(2 * math.log(max(2, tried))) / 2
+
+
+def exam_verdict(v, tried=100):
+    """-> (verdict, detail). verdict: 'passed', 'failed' or 'untested'. A bot passes when its exam results are
+    positive, mostly winning, and steady enough (mean / its spread x sqrt(exams)) to clear the bar for how many bots
+    the farm has tried. Exams with no trades say nothing and don't count."""
+    ex = [x for x in (getattr(v, "exams", None) or []) if x.get("n", 0) > 0]
+    k = len(ex)
+    if k == 0:
+        return "untested", dict(k=0, mean=None, score=None, bar=round(exam_bar(tried), 2), wins=0)
+    e = [x["edge"] for x in ex]
+    mean = sum(e) / k
+    sd = (sum((x - mean) ** 2 for x in e) / (k - 1)) ** 0.5 if k > 1 else 0.0
+    score = mean / sd * k ** 0.5 if sd > 1e-9 else (9.9 if mean > 0 else -9.9 if mean < 0 else 0.0)
+    wins = sum(1 for x in e if x > 0)
+    bar = exam_bar(tried)
+    d = dict(k=k, mean=round(mean, 2), score=round(score, 2), bar=round(bar, 2), wins=wins)
+    trades = sum(x["n"] for x in ex)
+    if k >= 2 and trades >= 6 and wins == 0:
+        return "failed", d
+    if k < EXAM_MIN or trades < 6:
+        return "untested", d
+    if mean <= 0 or wins * 2 < k:
+        return "failed", d
+    if score >= bar:
+        return "passed", d
+    return "untested", d
+
+
+def exam_text(v, tried=100):
+    verdict, d = exam_verdict(v, tried)
+    if not d["k"]:
+        return "no exams yet (Free roam tests it on stretches it never trained on)"
+    base = f"{d['wins']} of {d['k']} won, average {d['mean']:+.1f}%"
+    if verdict == "passed":
+        return f"passed: {base}, steady enough to beat luck (score {d['score']:.1f}, needed {d['bar']:.1f})"
+    if verdict == "failed":
+        return f"failed: {base}. It may not trade the account until it does better"
+    return f"not proven yet: {base}" + (f" (score {d['score']:.1f}, needs {d['bar']:.1f})" if d["k"] >= EXAM_MIN else
+                                        f" ({EXAM_MIN - d['k']} more exam{'s' if EXAM_MIN - d['k'] > 1 else ''} needed)")
+
+
 # ---------------- errors the app recovered from ----------------
 _noted = {}
 
@@ -1085,6 +1144,10 @@ DEFAULT_SETTINGS = {
     "luck_check": True,          # a bot's score counts for less when it rests on only a few trades        # the account trades bigger when several different strategies agree, smaller when split
     "adapt_exits": True,         # bots can evolve stops and targets that widen in wild markets and tighten in calm ones
     "mut_memory": True,          # the farm remembers which kinds of change make winners and does more of those
+    "proven_only": True,         # only bots with a real track record decide the account's trades
+    "proven_trades": 8,          # ...finished trades a bot needs first
+    "proven_exam": True,         # ...and passed exams on stretches it never trained on
+    "report_detail": False,      # Export a report also adds the detailed part (bot trades, price feed, checks)
     "multicore": True,           # warm up the islands on several processor cores at once
     "shadow_live": True,         # follow your Hall of Fame bots with pretend money in real time (Shadow Live)
     "retest_nightly": False,     # once a day, re-backtest the Hall of Fame on the latest prices; stale ones get a RUSTY badge
@@ -1424,6 +1487,8 @@ def tournament_opts(settings):
                 ctx=[c for c in (settings.get("ctx_tickers") or []) if valid_coin(c)] if settings.get("ctx_studies", True) else [],
                 post_review=bool(settings.get("post_review", True)), learn_losses=bool(settings.get("learn_losses", True)), islands=max(1, min(6, int(settings.get("islands", 3) or 1))),
                 adapt_exits=bool(settings.get("adapt_exits", True)), mut_memory=bool(settings.get("mut_memory", True)),
+                proven_only=bool(settings.get("proven_only", True)), proven_exam=bool(settings.get("proven_exam", True)),
+                proven_trades=int(settings.get("proven_trades", 8) or 0),
                 time_habits=bool(settings.get("time_habits", True)), scale_out=bool(settings.get("scale_out", True)),
                 agree_sizing=bool(settings.get("agree_sizing", True)),
                 luck_check=bool(settings.get("luck_check", True)))
@@ -1995,6 +2060,9 @@ def bot_step(v, closes, n, coins, extra=None):
                 sim.act(c, s, last[c], n)
         t = sim.last
         if t:
+            t["under_px"] = last[c]  # (for reports) the price it traded at, and for a sale how long it was held
+            if t["side"] != "buy" and c in v.since:
+                t["held"] = n - v.since[c]
             if t["side"] == "buy":
                 if v.review and c not in v.entry_flags:  # which never-rules WOULD have blocked this buy (for the review)
                     v.entry_flags[c] = [k for k, spec in VETOES.items() if spec["side"] in ("buy", "open") and k not in v.vetoes
@@ -2048,6 +2116,7 @@ class Variant:
         self.mut_kinds = []   # what changed from its parent (mutation memory)
         self.credited = False # counted as a winner in the mutation memory
         self.backtests = []   # summaries of backtests saved to its memory
+        self.exams = []       # results on stretches it never trained on: {k: kind, edge: %, n: trades, at: time, g: candle}
         self.power = 0.0      # 0..10: grows only with real money made on fresh prices while beating holding
         self.live_high = None
         self.hi, self.since, self.entries, self.sold_at, self.run_sig = {}, {}, {}, {}, {}
@@ -2815,24 +2884,87 @@ class Tournament:
     def _holding(v, c):
         return v.sim.pos.get(c, 0) > 0
 
+    def proven(self, v):
+        """May this bot help decide the account's trades? Only when it has a real track record: enough finished
+        trades, a full scoring window on the farm, money made over its lifetime and more than just holding, and (by
+        default) passed exams on stretches it never trained on. Everything else keeps training on its own pretend
+        money. With the gate off (Settings), every winning bot may."""
+        if not self.o.get("proven_only", True):
+            return True
+        return not self.proven_gaps(v)
+
+    def proven_gaps(self, v):
+        """What this bot still lacks before it may trade the account, in plain words ([] = proven)."""
+        if v.origin == "team":  # bots you picked yourself to trade with (My team / Hall of Fame only)
+            return []
+        gaps = []
+        need = int(self.o.get("proven_trades", 8) or 0)
+        closed = v.wins + v.losses
+        if closed < need:
+            gaps.append(f"{need - closed} more finished trade{'s' if need - closed != 1 else ''}")
+        window = self.window_for(v.tf)
+        if v.age < window:
+            gaps.append(f"{window - v.age} more decisions on the farm")
+        lf = self.life(v)
+        if lf["ret"] <= 0:
+            gaps.append(f"a lifetime profit (now {lf['ret'] * 100:+.1f}%)")
+        elif lf["edge"] is not None and lf["edge"] <= 0:
+            gaps.append(f"to beat just holding (now {lf['edge'] * 100:+.1f}% vs holding)")
+        if self.o.get("proven_exam", True):
+            verdict, d = exam_verdict(v, self.serial)
+            if verdict == "failed":
+                gaps.append("to stop failing its exams")
+            elif verdict != "passed":
+                gaps.append(f"passed exams ({d['k']} of at least {EXAM_MIN} taken)")
+        return gaps
+
+    def proven_bots(self):
+        return [v for v in self.vars if self.proven(v)]
+
+    def close_positions(self, prices=None):
+        """Closes every bot's open pretend holdings at what they're worth right now, as if they had never been bought:
+        the money goes back to the bot's cash, so its equity, score and record don't change, and no trade is counted.
+        Used when you reset the practice account. -> how many were closed."""
+        n = 0
+        for v in self.vars:
+            for c, q in list(v.sim.pos.items()):
+                if q > 0:
+                    S = (prices or {}).get(c) or self.last_px.get(c)
+                    v.sim.cash += q * S if S else v.sim.cost.get(c, 0.0)
+                    n += 1
+                v.sim.pos.pop(c, None)
+                v.sim.cost.pop(c, None)
+                for d in (v.entries, v.since, v.hi, v.entry_flags):
+                    d.pop(c, None)
+            v.sim.last = None
+        return n
+
     def vote(self, c):
         """-> (signal, size multiplier). Winners vote at full weight, shaky strategies at a
         small weight. A vote that only shaky strategies want must wait out a cooldown, so they
         trade slowly. When nobody has a fresh signal but strong winners are holding the coin,
         the account adds to the position now and then (self.kind[c] == "add")."""
         self.kind[c] = None
+        gate = bool(self.o.get("proven_only", True))
+        # proven only: just the winning bots with a real track record decide (shaky ones never do)
+        active = [v for v in self.active if self.proven(v)]
+        slowed = [] if gate else list(self.slowed)
         bw = sw = bs = ss = 0.0
         act_buy = act_sell = False
-        for v in self.active + self.slowed:
+        for v in active + slowed:
             d, s = self.info[id(v)], v.sig.get(c)
             is_act = d["status"] == "active"
+            w = d["weight"]
+            if gate:  # the best lifetime records lead the way: up to 3x the say for a bot far ahead of holding
+                lf = self.life(v)
+                w *= 1 + min(2.0, max(0.0, lf["edge"] if lf["edge"] is not None else lf["ret"]))
             if s == "buy":
-                bw += d["weight"]
-                bs += d["weight"] * d["stake"]
+                bw += w
+                bs += w * d["stake"]
                 act_buy = act_buy or is_act
             elif s == "sell":
-                sw += d["weight"]
-                ss += d["weight"] * d["stake"]
+                sw += w
+                ss += w * d["stake"]
                 act_sell = act_sell or is_act
         sig, mult, from_winner = None, 1.0, False
         if bw > sw:
@@ -2841,7 +2973,7 @@ class Tournament:
             sig, mult, from_winner = "sell", ss / sw, act_sell
         if sig == "buy" and self.o.get("agree_sizing", True):
             # several DIFFERENT strategies agreeing = more confidence; a split farm = less
-            kinds = {v.name for v in self.active + self.slowed if v.sig.get(c) == "buy"}
+            kinds = {v.name for v in active + slowed if v.sig.get(c) == "buy"}
             split = sw / (bw + sw) if bw + sw else 0.0
             agree = min(1.3, 0.85 + 0.15 * (len(kinds) - 1)) * (1 - 0.6 * split)
             self.agree[c] = (len(kinds), round(agree, 2), round(split, 2))
@@ -2852,9 +2984,9 @@ class Tournament:
             self.cool[c] = self.o["slow_every"]
             self.kind[c] = "slow"
         if sig is None and self.o["trade_more"] and self.add_cool.get(c, 0) == 0:
-            holders = [v for v in self.active if self._holding(v, c) and self.info[id(v)]["cons"] >= 0.75]
+            holders = [v for v in active if self._holding(v, c) and self.info[id(v)]["cons"] >= 0.75]
             hw = sum(self.info[id(v)]["weight"] for v in holders)
-            tw = sum(self.info[id(v)]["weight"] for v in self.active)
+            tw = sum(self.info[id(v)]["weight"] for v in active)
             if holders and hw * 2 > tw:  # winners with most of the weight are still in this coin
                 self.add_cool[c] = self.o["add_every"]
                 self.kind[c] = "add"
@@ -3285,7 +3417,7 @@ class Tournament:
                 "peak", "maxdd", "mood_gain", "mood_n", "live_n", "live_eq0", "hi", "since", "entries", "sold_at",
                 "fee_guard", "rt_cost", "vetoes", "veto_stats", "lost_at", "power", "live_high", "layers", "layer_stats",
                 "conf_last", "coin_pl", "twin", "island", "entry_flags", "swing_ref", "mut_kinds", "credited",
-                "backtests", "own_review")
+                "backtests", "own_review", "exams")
 
     def to_state(self):
         """Everything needed to bring this farm back exactly as it is (plain data, JSON-ready)."""
@@ -3296,7 +3428,7 @@ class Tournament:
                      sim=dict(cash=v.sim.cash, pos=v.sim.pos, cost=v.sim.cost, fees=v.sim.fees, tbars=list(v.sim.tbars)))
             bots.append(d)
         lineage = dict(list(self.lineage.items())[-600:])
-        return dict(version=1, n=self.n, serial=self.serial, cap=self.cap, coins=self.coins, start_cash=self.start_cash,
+        return dict(version=1, last_px={c: float(x) for c, x in (self.last_px or {}).items() if x}, n=self.n, serial=self.serial, cap=self.cap, coins=self.coins, start_cash=self.start_cash,
                     elders=self.elders[-40:], champions=self.champions, season=self.season,
                     review=self.review, mut_stats=self.mut_stats, evolves=self.evolves,
                     seasons_log=self.seasons_log[-50:],
@@ -3357,6 +3489,7 @@ class Tournament:
                 v.mut_kinds = list(v.mut_kinds or [])
                 v.island = int(v.island or 0) % max(1, int(self.o.get("islands", 1) or 1))
                 v.mood_gain = dict(v.mood_gain or {})
+                v.exams = [dict(x) for x in (v.exams or []) if isinstance(x, dict)][-EXAM_KEEP:]
                 v._key = None
                 v.mood_n = dict(v.mood_n or {})
                 vars_.append(v)
@@ -3376,6 +3509,7 @@ class Tournament:
         self.champions = dict(st.get("champions") or {})
         self.season = st.get("season")
         self.seasons_log = [tuple(x) for x in st.get("seasons_log") or []]
+        self.last_px = {c: float(x) for c, x in (st.get("last_px") or {}).items() if isinstance(x, (int, float)) and x > 0}
         hc = st.get("hold_curve") or [1.0]
         self.hold_curve = deque(hc, maxlen=self.W * 10 + 2)
         self._rate()
@@ -4019,13 +4153,28 @@ def list_products(quote="USD"):
 STABLES = {"USDC", "USDT", "DAI", "PYUSD", "EURC", "GUSD", "USDS", "PAX", "TUSD", "FDUSD", "RLUSD"}
 
 
-def scout_coins(products, n, min_volume=5_000_000):
-    """The bot's own coin pick: liquid coins (enough daily volume to trade without big spreads)
-    that are actually moving, skipping stablecoins. Ranked by volume x size of the 24h move."""
+ANCHOR_COINS = ("BTC", "ETH")
+
+
+def scout_coins(products, n, min_volume=5_000_000, why=None):
+    """The bot's own coin pick for a new session: liquid coins (enough daily volume to trade without big spreads)
+    that are moving, skipping stablecoins. Today's move counts, but only up to 3x, so a quiet but very busy coin
+    still competes and one wild, thin coin can't outweigh everything. One place is kept for BTC or ETH when picking
+    3 or more, so the farm always has a steady, liquid market to learn on. why (a dict) gets each pick's reason."""
     pool = [d for d in products if d["coin"] not in STABLES and (d["volume_usd"] or 0) >= min_volume
             and d["change_24h"] is not None]
-    pool.sort(key=lambda d: -((d["volume_usd"] or 0) ** 0.5 * (0.5 + min(abs(d["change_24h"]), 20))))
-    return [d["coin"] for d in pool[:n]]
+    scored = sorted(((d["volume_usd"] or 0) ** 0.5 * (1 + min(abs(d["change_24h"]), 8) / 4), d["coin"],
+                     f"${(d['volume_usd'] or 0) / 1e6:,.0f}M traded today, moved {abs(d['change_24h']):.1f}%")
+                    for d in pool)
+    scored.sort(reverse=True)
+    picks = [c for _, c, _ in scored[:n]]
+    if n >= 3 and not any(c in ANCHOR_COINS for c in picks):
+        anchor = next((c for _, c, _ in scored if c in ANCHOR_COINS), None)
+        if anchor:
+            picks = picks[:n - 1] + [anchor]
+    if why is not None:
+        why.update({c: w for _, c, w in scored if c in picks})
+    return picks
 
 
 # ---------------- alerts (Discord / Telegram) ----------------

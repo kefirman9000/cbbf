@@ -40,6 +40,7 @@ except ImportError as _e:
 
 import bisect
 import csv
+import collections
 import json
 import math
 import os
@@ -138,6 +139,10 @@ SETTING_GROUPS = [
                           "at once. Stops one bad dragon draining the account. Example: 25 with $1,000 = $250 per bot (0 = no limit)", float),
     ]),
     ("Wildcard", "How the bot treats strategies that are winning, shaky or failing.", [
+        ("proven_only", "Only proven bots trade the account (practice and LIVE): a bot needs a real track record first. "
+                        "Every other bot keeps training on its own pretend money", bool),
+        ("proven_trades", "...finished trades a bot needs before it may trade the account", int),
+        ("proven_exam", "...and it must have passed its exams (Free roam tests it on stretches it never trained on)", bool),
         ("winner_boost", "Biggest trade size a top winner can earn (1 = normal, 2.5 = 2.5 times)", float),
         ("add_every", "While a winner is holding a coin, add more every N decisions", int),
         ("slow_every", "Shaky strategies may only trade every N decisions", int),
@@ -232,6 +237,8 @@ SETTING_GROUPS = [
                        "famous strategies silver)", "eggs"),
         ("daily_recap", "Daily recap: once a day, how the bots did against just holding (in the log, and as a note on the "
                         "icon by the clock)", bool),
+        ("report_detail", "Detailed reports for Claude: Export a report also adds every bot's recent trades, the price "
+                          "feed's gaps, errors and automatic checks", bool),
         ("auto_backup", "Weekly backup: keep a copy of your bots, farms and settings in the data folder (last 4 kept, no keys)", bool),
         ("bg_mode", "Background mode: while CBBF is minimized, skip all drawing and check watchlist prices less often", bool),
         ("tray_autotrain", "Icon by the clock: start training on practice prices as soon as CBBF starts in the background "
@@ -1350,6 +1357,17 @@ class App:
         self.headline_lbl = tk.Label(root, text="", bg="#1e3a5f" if DARK else "#eff6ff", fg="#bfdbfe" if DARK else "#1e3a8a", anchor="w", justify="left",
                                      padx=14, pady=7, wraplength=1000, font=("", 10))
         self.headline_lbl.pack(fill="x")
+        self.proven_bar = tk.Frame(root, bg="#78350f" if DARK else "#fef3c7")
+        pb_bg, pb_fg = ("#78350f", "#fde68a") if DARK else ("#fef3c7", "#78350f")
+        self.proven_lbl = tk.Label(self.proven_bar, text="", bg=pb_bg, fg=pb_fg, anchor="w", justify="left", padx=14,
+                                   pady=6, wraplength=900, font=("", 10, "bold"))
+        self.proven_lbl.pack(side="left", fill="x", expand=True)
+        self.proven_roam_btn = ttk.Button(self.proven_bar, text="Turn on Free roam", style="Plain.TButton",
+                                          command=lambda: (self.toggle_roam(True), self.update_proven_bar(force=True)))
+        ttk.Button(self.proven_bar, text="Settings", style="Plain.TButton", command=self.open_settings).pack(
+            side="right", padx=(4, 10), pady=4)
+        ttk.Button(self.proven_bar, text="How to train them", style="Accent.TButton", command=self.show_training_help).pack(
+            side="right", padx=4, pady=4)
 
         body = self.body = tk.Frame(root, bg=BG, highlightthickness=0)
         body.pack(fill="both", expand=True, padx=10, pady=10)
@@ -1367,8 +1385,17 @@ class App:
         self.mode_desc.pack(fill="x")
         self.budget_lbl = tk.Label(c, text="Practice money (pretend, USD)", bg=CARD, fg=MUTED)
         self.budget_lbl.pack(anchor="w", pady=(8, 0))
-        self.cash_var = tk.StringVar(value="1000")
-        ttk.Entry(c, textvariable=self.cash_var).pack(fill="x")
+        self.cash_var = tk.StringVar(value=self.default_cash_text())
+        cash_row = tk.Frame(c, bg=CARD)
+        cash_row.pack(fill="x")
+        self.cash_default = tk.BooleanVar(value=bool(self.cfg.get("default_cash")))
+        cd = ttk.Checkbutton(cash_row, text="Default", variable=self.cash_default, style="Card.TCheckbutton",
+                             command=self.toggle_default_cash)
+        cd.pack(side="right", padx=(6, 0))
+        ttk.Entry(cash_row, textvariable=self.cash_var).pack(side="left", fill="x", expand=True)
+        Tip(cd, "Tick to make this amount your default practice money: it's filled in here whenever OBF starts, and used "
+                "for new sessions and resets. Untick to go back to the usual amount.")
+        self.cash_var.trace_add("write", lambda *a: self._sync_default_cash())
         tk.Label(c, text="Risk style", bg=CARD, fg=MUTED).pack(anchor="w", pady=(8, 0))
         self.style_var = tk.StringVar(value=self.settings.get("style", "Balanced"))
         cb = ttk.Combobox(c, textvariable=self.style_var, values=list(E.STYLES) + ["Custom"], state="readonly")
@@ -1557,10 +1584,13 @@ class App:
         nb = self.nb = ttk.Notebook(nbf)
         nb.pack(fill="both", expand=True, pady=(8, 0))
         nb.bind("<<NotebookTabChanged>>", lambda e: self.refresh_visible())
-        t0, t1, t7, tm, tt = (ttk.Frame(nb) for _ in range(5))
+        t0, t1, t7, tm, tt, tov, tbp, tsu = (ttk.Frame(nb) for _ in range(8))
+        nb.add(tov, text="  \u2630 Overview  ")
         nb.add(t0, text="  \u25c6 Bot Farm  ")
         nb.add(t7, text="  \u25c7 Slow farm  ")
         nb.add(t1, text="  Portfolio  ")
+        nb.add(tbp, text="  Bot positions  ")
+        nb.add(tsu, text="  \u2605 Success  ")
         nb.add(tm, text="  Markets  ")
         nb.add(tt, text="  Trades  ")
         # Markets = watchlist + live prices; Trades = trades + what the bot did + the strategy scoreboard
@@ -1582,6 +1612,9 @@ class App:
         self.build_grid_tab(t0)
         self.build_slow_tab(t7)
         self.build_portfolio(t1)
+        self.build_overview_tab(tov)
+        self.build_botpos_tab(tbp)
+        self.build_success_tab(tsu)
         self.build_watchlist(t6)
         tk.Label(t2, bg=CARD, fg=MUTED, justify="left", anchor="w", padx=8, pady=4, wraplength=700,
                  text="The bot tests every strategy with pretend trades. Winning = copied with bigger trades. "
@@ -1718,6 +1751,9 @@ class App:
         m.add_separator()
         m.add_command(label="Check for updates", command=self.check_update)
         m.add_command(label="Undo last update", command=self.undo_update)
+        m.add_separator()
+        m.add_command(label="Export a report for Claude...", command=self.export_report)
+        m.add_command(label="Export a detailed report for Claude...", command=lambda: self.export_report(detailed=True))
         bar.add_cascade(label="Tools", menu=m)
         m = tk.Menu(bar, tearoff=0)
         m.add_command(label="Help...", command=self.open_help)
@@ -2624,7 +2660,7 @@ class App:
             "with pretend money, so nothing real is at risk. Real trading only happens if you switch to Live "
             "and log in.")).pack(anchor="w", pady=(6, 12))
         ttk.Label(f, text="How much pretend money do you want to practice with?").pack(anchor="w")
-        cash = tk.StringVar(value="1000")
+        cash = tk.StringVar(value=self.default_cash_text())
         ttk.Entry(f, textvariable=cash, width=14).pack(anchor="w", pady=(2, 10))
         ttk.Label(f, text="What kind of trader should it be?").pack(anchor="w")
         style = tk.StringVar(value="Balanced")
@@ -3209,6 +3245,7 @@ class App:
         self.refresh_prices()
         self.chart_tick()
         self.headline_lbl.config(text=self.headline())
+        self.update_proven_bar()
 
     def refresh_board(self):
         if self.in_bg():
@@ -3642,6 +3679,45 @@ class App:
     def open_help(self, tab="How this works"):
         return self.open_hub("help", tab)
 
+    # ---------------- default practice money ----------------
+    def default_cash_text(self):
+        """The practice money OBF fills in: your saved default, or $10,000."""
+        v = self.cfg.get("default_cash")
+        try:
+            return f"{float(v):g}" if v and float(v) > 0 else "1000"
+        except (TypeError, ValueError):
+            return "1000"
+
+    def toggle_default_cash(self):
+        """The Default box next to Practice money: ticked saves the amount as the default, unticked clears it."""
+        if self.cash_default.get():
+            try:
+                v = float(str(self.cash_var.get()).replace(",", "").replace("$", ""))
+                assert v > 0
+            except (ValueError, AssertionError):
+                self.cash_default.set(False)
+                return messagebox.showinfo("Practice money", "Type an amount first (like 25000), then tick Default.")
+            self.cfg["default_cash"] = v
+            self.write(f"${v:,.2f} is now your default practice money.", "good")
+        else:
+            self.cfg.pop("default_cash", None)
+            self.write("Practice money is back to the usual default ($1,000).")
+        try:
+            E.save_json(CONFIG_PATH, self.cfg)
+        except OSError:
+            E.note_error("toggle_default_cash")
+
+    def _sync_default_cash(self):
+        """The box shows ticked only while the amount typed is your saved default."""
+        if not hasattr(self, "cash_default"):
+            return
+        try:
+            v = float(str(self.cash_var.get()).replace(",", "").replace("$", ""))
+        except ValueError:
+            v = None
+        d = self.cfg.get("default_cash")
+        self.cash_default.set(bool(d) and v is not None and abs(v - float(d)) < 1e-9)
+
     def open_reset(self):
         """One Reset window: the account, the farm (optionally keeping some of its dens), a saved copy, or a saved farm back."""
         w = tk.Toplevel(self.root)
@@ -3654,7 +3730,8 @@ class App:
         farm = tk.BooleanVar(value=False)
         what = "LIVE session tracking" if self.live else "practice account"
         ttk.Checkbutton(f, text=f"The {what}: cash, positions and trades"
-                                + ("" if self.live else " (you start again with the practice money on the left)"),
+                                + ("" if self.live else " (you start again with the practice money on the left), and "
+                                                        "the bots' own practice holdings"),
                         variable=acct).pack(anchor="w", pady=(10, 0))
         ttk.Checkbutton(f, text="The farm: fresh eggs hatch at the next Start", variable=farm).pack(anchor="w", pady=(4, 0))
         # which dens to keep when the farm is reset
@@ -3711,10 +3788,15 @@ class App:
                 if kept:
                     self.cfg["carry_bots"] = kept
                     E.save_json(CONFIG_PATH, self.cfg)
+            closed = 0
             if acct.get():
+                if not self.live and not farm.get():  # (a farm reset clears the bots anyway)
+                    closed = self.close_bot_positions()
                 self.reset(ask=False)
             self.write("Reset " + " and ".join(x for x, on in ((what, acct.get()), ("the farm", farm.get())) if on)
-                       + (f", keeping {len(kept)} bots for the new farm" if kept else "") + "." + (f" {note}" if note else "")
+                       + (f", keeping {len(kept)} bots for the new farm" if kept else "")
+                       + (f", and closed the bots' {closed} open practice holding{'s' if closed != 1 else ''}" if closed else "")
+                       + "." + (f" {note}" if note else "")
                        + " Press Start to begin again.", "good")
 
         def bring_back():
@@ -3990,6 +4072,11 @@ class App:
                 elif now - last_warn >= 600:
                     last_warn = now
                     self.q.put(("log", (f"Still no prices after {(now - down_since) / 60:.0f} min. Still trying.", "warn")))
+                if prices and all(c in prices for c in coins):
+                    try:
+                        self._find_gap(coins, bar_min, gran)
+                    except Exception:
+                        E.note_error("backfill")
                 if prices:
                     self.q.put(("prices", prices))
                 if self.live and self.client and time.time() - self.last_bal > 30:
@@ -4006,6 +4093,70 @@ class App:
                 if not alive():
                     return
                 time.sleep(0.2)
+
+    # ---------------- filling holes in the price history ----------------
+    def _find_gap(self, coins, bar_min, gran):
+        """(Price feed thread.) If the last candle is more than 3 candles old (the bot was
+        stopped, the computer slept, the connection dropped or one ticker's price didn't come back), the missing
+        candles are fetched from Alpaca's history and handed over before the next new candle, so the charts and the
+        bots' indicators have the real prices instead of a hole. The farm doesn't trade them after the fact."""
+        step = max(60.0, bar_min * 60)
+        try:
+            last = min(float(self.hx[c]["t"][-1]) for c in coins)
+        except (KeyError, IndexError, ValueError, TypeError):
+            return
+        now = time.time()
+        if now - last < 3 * step or last == getattr(self, "_gap_tried", None):
+            return
+        self._gap_tried = last  # one try per hole
+        start = max(last + 1, now - 6.5 * 3600)  # (at most a few hours back)
+        data = {}
+        for c in coins:
+            d = E.fetch_range(c, gran, start, now - step, self.quote)
+            if not d.get("t"):
+                return
+            data[c] = d
+        closes, extra = E.common_stretch(data)
+        ts = (next(iter(extra.values()), {}) or {}).get("t") or []
+        if ts:
+            self.q.put(("backfill", (closes, extra, last)))
+
+    def on_backfill(self, closes, extra, since):
+        """Adds the fetched candles (only ones newer than the last candle there is) to each ticker's history."""
+        coins = list(self.session_coins)
+        if not coins or set(closes) != set(coins):
+            return
+        try:
+            last = min(float(self.hx[c]["t"][-1]) for c in coins)
+        except (KeyError, IndexError, ValueError, TypeError):
+            return
+        ts = extra[coins[0]]["t"]
+        new = [i for i, t_ in enumerate(ts) if t_ > last + 1]
+        if not new:
+            return
+        keep = min(8000, max(2400, int(1440 / self.session_bar) + 20))
+        for c in coins:
+            h, x = self.hist[c], self.hx[c]
+            for i in new:
+                h.append(closes[c][i])
+                x["h"].append(extra[c]["h"][i])
+                x["l"].append(extra[c]["l"][i])
+                x["v"].append(extra[c]["v"][i])
+                x["t"].append(ts[i])
+            del h[:-keep]
+            for k in ("h", "l", "v", "t"):
+                del x[k][:-keep]
+        for sym, q in self.ctx_hist.items():  # watched tickers stay lined up (flat over the hole: no move read into it)
+            if q:
+                q.extend([q[-1]] * len(new))
+                del q[:-len(self.hist[coins[0]])]
+        a, b = datetime.fromtimestamp(since), datetime.fromtimestamp(ts[new[-1]])
+        self.write(f"Filled in {len(new)} missing candle{'s' if len(new) != 1 else ''} from Alpaca's history "
+                   f"({a:%H:%M} to {b:%H:%M}), so the charts have no hole. The bots didn't trade them after the fact.", "info")
+        try:
+            self.draw_chart()
+        except Exception:
+            E.note_error("on_backfill")
 
     def watchdog(self):
         """Every 5 seconds: restart the price feed if it died, and say so if prices have gone stale."""
@@ -4085,6 +4236,575 @@ class App:
             info.append("(not found)")
         return "\n".join(info)
 
+    SECRET_WORDS = ("key", "secret", "token", "password", "pass", "account", "acct", "email", "user")
+
+    def _scrub(self, d):
+        """Settings with anything that could be a login, key or account number taken out."""
+        if isinstance(d, dict):
+            return {k: ("(hidden)" if any(w in str(k).lower() for w in self.SECRET_WORDS) else self._scrub(x)) for k, x in d.items()}
+        if isinstance(d, list):
+            return [self._scrub(x) for x in d]
+        return d
+
+    def report_data(self):
+        """Everything worth knowing about what CBBF is doing and learning, as plain data (no keys or account numbers)."""
+        def tail(name, n):
+            try:
+                with open(os.path.join(E.HOME_DIR, name), encoding="utf-8", errors="replace") as f:
+                    return f.readlines()[-n:]
+            except OSError:
+                return []
+        farms = {}
+        for name, t in (("Bot Farm", self.tourn), ("Slow farm", getattr(self, "slow", {}).get("t"))):
+            if t is None:
+                continue
+            vs = list(t.vars)
+            farms[name] = dict(
+                bots=len(vs), tried=t.serial, decisions=t.n, cap=t.cap, coins=t.coins, mood=t.mood, conditions=getattr(t, "conds", []),
+                status=dict(collections.Counter(t.info.get(id(v), {}).get("status") for v in vs)),
+                breeds=dict(collections.Counter(STRAT_LABELS.get(v.name, v.name) for v in vs)),
+                exams=dict(collections.Counter(E.exam_verdict(v, t.serial)[0] for v in vs)),
+                proven=len(t.proven_bots()),
+                exam_bar=round(E.exam_bar(t.serial), 2),
+                rule_review=t.review, mutation_stats=t.mut_stats, elders=len(t.elders),
+                top_bots=self._bot_rows(t), events=list(getattr(t, "events", []))[-40:],
+                all_bots=[dict(nickname=E.bot_nickname(v.key()), strategy=v.name, tf=v.tf, origin=v.origin,
+                               status=t.info.get(id(v), {}).get("status"), age=v.age, live_n=v.live_n,
+                               eq=f"{len(v.eq)}/{v.eq.maxlen}", trades_in_window=len(v.sim.tbars), trades=v.ntrades,
+                               wins=v.wins, losses=v.losses, young=t.young(v), proven=t.proven(v),
+                               ret_pct=round((v.eq[-1] / v.sim.start - 1) * 100, 2) if v.eq and v.sim.start else None)
+                          for v in vs],
+                deaths=[dict(uid=u, why=r.get("why"), ret=r.get("ret")) for u, r in list(t.lineage.items())[-60:]
+                        if r.get("died") is not None])
+        trades = [dict(x) for x in self.trades[-300:]]
+        for x in trades:
+            for k in list(x):
+                if not isinstance(x[k], (str, int, float, bool, type(None), list, dict)):
+                    x[k] = str(x[k])
+        return dict(
+            made=datetime.now().isoformat(timespec="seconds"), version=self.version, python=sys.version.split()[0],
+            platform=sys.platform, account=dict(name="LIVE" if self.live else "PRACTICE", session=self.session, live=self.live, running=self.running,
+                                                start_cash=self.start_cash, cash=round(self.cash, 2), positions=dict(self.pos),
+                                                trades=len(self.trades), coins=self.session_coins,
+                                                bar_minutes=self.session_bar, logged_in=bool(self.client)),
+            settings=self._scrub(dict(self.settings)), switches=self._scrub({k: self.cfg.get(k) for k in self.cfg if k.endswith("_on")}),
+            farms=farms, free_roam=dict(on=bool(self.cfg.get("roam_on")), studies=getattr(self, "roam_n", 0),
+                                        log=list(getattr(self, "roam_log", []) or [])[-80:],
+                                        error=getattr(self, "roam_err", None)),
+            recent_trades=trades,
+            errors_this_run=getattr(self, "err_count", 0), crash_log=tail("crash.log", 300), activity_log=tail("activity.log", 300))
+
+    def export_report(self, detailed=None):
+        """Saves a .zip with everything worth knowing about what CBBF is doing (no keys, passwords or account numbers),
+        ready to attach in a chat with Claude. detailed (or the 'Detailed reports' setting) adds detail.json and
+        checks.txt: every bot's recent trades with what explains them, the price feed's gaps, errors, and checks."""
+        if detailed is None:
+            detailed = bool(self.settings.get("report_detail", False))
+        from tkinter import filedialog
+        import zipfile
+        name = f"CBBF-{'detailed-' if detailed else ''}report-{datetime.now():%Y-%m-%d-%H%M}.zip"
+        start = os.path.join(os.path.expanduser("~"), "Desktop")
+        path = filedialog.asksaveasfilename(title="Export a report for Claude", initialfile=name, defaultextension=".zip",
+                                            initialdir=start if os.path.isdir(start) else os.path.expanduser("~"),
+                                            filetypes=[("Zip file", "*.zip")])
+        if not path:
+            return
+        try:
+            data = self.report_data()
+            with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+                z.writestr("README.txt", "CBBF report: what the app is doing and learning, for analysis.\n"
+                                         "report.json = everything (farms, top bots and their rules, exams, Free roam log, "
+                                         "settings, recent trades, logs). summary.txt = the short version. "
+                                         + ("detail.json = the detailed part (every bot's recent trades with the prices "
+                                            "and volatility behind them, the price feed's gaps, errors, learning records); "
+                                            "bot_trades.csv = those trades as a table; checks.txt = automatic checks "
+                                            "for things that look wrong. " if detailed else "") +
+                                         "No API keys, passwords or account numbers are included.\n")
+                z.writestr("report.json", json.dumps(data, indent=1, default=str))
+                z.writestr("summary.txt", self.diagnostics_text() + "\n\n" + self._report_summary(data))
+                if detailed:
+                    det = self.report_detail()
+                    z.writestr("detail.json", json.dumps(det, indent=1, default=str))
+                    z.writestr("checks.txt", self._report_checks(det))
+                    z.writestr("bot_trades.csv", self._trades_csv(det["bot_trades"]))
+            self.write(f"Report saved: {path}. Attach it in your chat with Claude.")
+            messagebox.showinfo("Report saved", f"Saved to:\n{path}\n\nAttach this file in your chat with Claude. It has no API "
+                                                "keys, passwords or account numbers.")
+        except Exception as e:
+            self._record_error("exporting the report")
+            messagebox.showerror("Report", f"Couldn't save the report: {e}")
+
+    def report_detail(self):
+        """The detailed part of a report: what's needed to see WHY the bots do what they do."""
+        import statistics as _st
+
+        def tail(name, n):
+            try:
+                with open(os.path.join(E.HOME_DIR, name), encoding="utf-8", errors="replace") as f:
+                    return f.readlines()[-n:]
+            except OSError:
+                return []
+        names = {}
+        for t_ in (self.tourn, getattr(self, "slow", {}).get("t")):
+            for v in (t_.vars if t_ else []):
+                names[v.uid] = E.bot_nickname(v.key())
+        trades = []
+        for r in list(getattr(self, "shadow_trades", []) or [])[-3000:]:
+            x = {k: r.get(k) for k in ("time", "side", "coin", "qty", "price", "usd", "pl", "who", "strategy", "held", "why")}
+            x["bot"] = names.get(r.get("bot"), r.get("bot"))
+            try:
+                paid = float(r["usd"]) - float(r["pl"])
+                x["pl_pct"] = round(float(r["pl"]) / paid * 100, 2) if r.get("side") == "sell" and paid > 0 else None
+            except (TypeError, ValueError, KeyError):
+                x["pl_pct"] = None
+            trades.append(x)
+        sells = [x for x in trades if x.get("pl_pct") is not None]
+
+        def dist(xs):
+            xs = sorted(xs)
+            if not xs:
+                return None
+            q = lambda f: xs[min(len(xs) - 1, int(f * len(xs)))]
+            return dict(n=len(xs), median=round(_st.median(xs), 2), p10=round(q(0.1), 2), p90=round(q(0.9), 2),
+                        best=round(xs[-1], 2), worst=round(xs[0], 2), won=sum(1 for v in xs if v > 0),
+                        over_1000=sum(1 for v in xs if v > 1000))
+        by_strat = {}
+        for x in sells:
+            by_strat.setdefault(STRAT_LABELS.get(x.get("strategy"), x.get("strategy")), []).append(x["pl_pct"])
+        feed = {}
+        for c in list(self.session_coins or []):
+            ts = list((self.hx.get(c) or {}).get("t") or [])
+            if len(ts) < 3:
+                feed[c] = dict(bars=len(ts))
+                continue
+            step = sorted(b - a for a, b in zip(ts[-200:-1], ts[-199:]) if b > a)
+            step = step[len(step) // 2] if step else 60
+            day = time.time() - 86400
+            gaps = [(datetime.fromtimestamp(a).strftime("%m-%d %H:%M"), datetime.fromtimestamp(b).strftime("%H:%M"),
+                     round((b - a) / 60, 1)) for a, b in zip(ts[:-1], ts[1:]) if b >= day and b - a > 3 * step
+]
+            feed[c] = dict(bars=len(ts), candle_s=step, first=datetime.fromtimestamp(ts[0]).isoformat(timespec="minutes"),
+                           last=datetime.fromtimestamp(ts[-1]).isoformat(timespec="minutes"),
+                           last_age_s=round(time.time() - ts[-1]), gaps_today=gaps[-30:])
+        farms = {}
+        for name, t_ in (("Bot Farm", self.tourn), ("Slow farm", getattr(self, "slow", {}).get("t"))):
+            if t_ is None:
+                continue
+            sc = [t_.score(v) for v in t_.vars]
+            farms[name] = dict(bots=len(t_.vars), scored=sum(1 for x in sc if x is not None),
+                               no_trades_yet=sum(1 for v in t_.vars if not v.ntrades), proven=len(t_.proven_bots()),
+                               score_pct=dist([x * 100 for x in sc if x is not None]),
+                               departures=dict(collections.Counter(r.get("why") for r in t_.lineage.values()
+                                                                   if r.get("died") is not None)))
+        return dict(bot_trades=trades, sells_pl_pct=dist([x["pl_pct"] for x in sells]),
+                    sells_by_strategy={k: dist(v) for k, v in by_strat.items()}, price_feed=feed,
+                    farms=farms, feature_tests=getattr(self, "roam_features", {}),
+                    free_roam_log=list(getattr(self, "roam_log", []) or [])[-300:],
+                    account_trades=[dict(x) for x in self.trades[-300:]], errors_log=tail("errors.log", 300))
+
+    @staticmethod
+    def _trades_csv(rows):
+        import io as _io
+        cols = ["time", "bot", "who", "side", "coin", "qty", "price", "usd", "pl", "pl_pct", "held", "why"]
+        buf = _io.StringIO()
+        w = csv.DictWriter(buf, fieldnames=cols, extrasaction="ignore")
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: r.get(k) for k in cols})
+        return buf.getvalue()
+
+    @staticmethod
+    def _report_checks(d):
+        """Plain-English checks for things that look wrong, at the top of a detailed report."""
+        out = ["Automatic checks (things that look wrong, and what was seen)", ""]
+        sp = d.get("sells_pl_pct")
+        if sp:
+            out.append(f"- Bot trades closed: {sp['n']}, {sp['won']} won; median {sp['median']}%, best {sp['best']}%, "
+                       f"worst {sp['worst']}%.")
+            if sp["over_1000"]:
+                out.append(f"  ! {sp['over_1000']} single trades made over +1000%. That's very unusual for a short hold: "
+                           "check those trades in bot_trades.csv.")
+        for name, f in (d.get("farms") or {}).items():
+            out.append(f"- {name}: {f['bots']} bots, {f['scored']} have a score, {f['proven']} proven, "
+                       f"{f['no_trades_yet']} haven't traded yet.")
+            if f["bots"] and not f["proven"] and name == "Bot Farm":
+                out.append("  ! No bot is proven yet, so the account doesn't trade (see How to train them).")
+            if f["bots"] and f["scored"] < 0.25 * f["bots"]:
+                out.append(f"  ! Under a quarter of {name}'s bots can be judged, so the farm learns slowly.")
+        for c, x in (d.get("price_feed") or {}).items():
+            if x.get("gaps_today"):
+                g = x["gaps_today"]
+                out.append(f"  ! {c}: {len(g)} gap(s) in the last day's prices, the longest "
+                           f"{max(y[2] for y in g):.0f} min (e.g. {g[-1][0]} to {g[-1][1]}).")
+            if x.get("last_age_s", 0) > 600:
+                out.append(f"  ! {c}: no new candle for {x['last_age_s'] // 60} min.")
+        if d.get("errors_log"):
+            out.append(f"- errors.log: {sum(1 for l in d['errors_log'] if l.startswith('---'))} recent entries.")
+        if len(out) == 2:
+            out.append("Nothing looks wrong.")
+        return "\n".join(out) + "\n"
+
+    @staticmethod
+    def _report_summary(d):
+        out = ["--- account ---", json.dumps(d["account"], default=str)]
+        for name, f in d["farms"].items():
+            out += [f"--- {name} ---", f"{f['bots']} bots ({f['tried']} tried), status {f['status']}, exams {f['exams']} "
+                                       f"(bar {f['exam_bar']}), conditions now {f['conditions']}", "top bots:"]
+            out += [f"  {b['nickname']} {b['strategy']} {b['status']} score {b['score_pct']}% exam {b['exam'][0]} "
+                    f"proven {b['proven']} trades {b['lifetime']['trades']} winrate {b['lifetime']['winrate']}" for b in f["top_bots"][:10]]
+        fr = d["free_roam"]
+        out += ["--- Free roam ---", f"on {fr['on']}, {fr['studies']} studies"]
+        out += [f"  {r.get('kind')} {r.get('summary', '')}" for r in fr["log"][-25:]]
+        return "\n".join(out)
+
+    def _bot_rows(self, t, n=25):
+        out = []
+        for v, sc in t.ranking()[:n]:
+            d = t.info.get(id(v), {})
+            lf = t.life(v)
+            out.append(dict(
+                nickname=E.bot_nickname(v.key()), uid=v.uid, gen=v.gen, origin=v.origin, strategy=v.name, params=v.params,
+                tf=v.tf, status=d.get("status"), score_pct=None if sc is None else round(sc * 100, 2),
+                consistency=d.get("cons"), weight=round(d.get("weight", 0) or 0, 4), proven=t.proven(v), still_needs=t.proven_gaps(v),
+                exam=E.exam_verdict(v, t.serial), exams=v.exams,
+                lifetime=dict(ret_pct=round(lf["ret"] * 100, 2), edge_pct=None if lf["edge"] is None else round(lf["edge"] * 100, 2),
+                              trades=lf["trades"], winrate=lf["winrate"], maxdd_pct=round(lf["maxdd"] * 100, 2)),
+                best_trade_pct=v.best_tr, worst_trade_pct=v.worst_tr, risk=v.risk, traits=v.traits, vetoes=v.vetoes,
+                veto_stats=v.veto_stats, layers=v.layers, layer_stats=v.layer_stats, backtests=(v.backtests or [])[-5:],
+                rules=E.rule_stack(v)))
+        return out
+
+    def build_overview_tab(self, parent):
+        """Every farm at a glance, and tiles for what they're learning. Updated every few seconds while it's open."""
+        sf = tk.Frame(parent, bg=BG, padx=8, pady=6)
+        sf.pack(fill="both", expand=True)
+        top_ = tk.Frame(sf, bg=BG)
+        top_.pack(fill="x")
+        tk.Label(top_, text="\u2630 Overview", bg=BG, fg=TEXT, font=("", 13, "bold")).pack(side="left")
+        eb = ttk.Button(top_, text="Export a report for Claude...", style="Plain.TButton", command=self.export_report)
+        eb.pack(side="right")
+        Tip(eb, "Saves a .zip of what every farm is doing and learning (no keys, passwords or account numbers) to attach "
+                "in a chat with Claude for analysis.")
+        tk.Label(sf, text="Every farm and what it's learning, in one place.", bg=BG, fg=MUTED, font=("", 9)).pack(anchor="w")
+        cols = ("farm", "bots", "proven", "winning", "gen", "best", "breeds", "state")
+        self.ov_tree = ttk.Treeview(sf, columns=cols, show="headings", height=3)
+        for c_, lab, wd in (("farm", "Farm", 110), ("bots", "Dragons", 70), ("proven", "Proven", 70), ("winning", "Winning", 70),
+                            ("gen", "Generation", 80), ("best", "Best lifetime record", 250), ("breeds", "Breeds", 220),
+                            ("state", "Doing now", 200)):
+            self.ov_tree.heading(c_, text=lab)
+            self.ov_tree.column(c_, width=wd, anchor="w", stretch=c_ in ("best", "state"))
+        self.ov_tree.pack(fill="x", pady=(6, 6))
+        grid = tk.Frame(sf, bg=BG)
+        grid.pack(fill="both", expand=True)
+        self.ov_tiles = {}
+        tiles = (("roam", "Free roam studies"), ("exams", "Exams"), ("proven", "Proven bots"), ("feat", "Learning tested"),
+                 ("lib", "Library / Hall of Fame"), ("grad", "Graduates adopted"), ("acct", "Your account"), ("feed", "Prices"))
+        for i, (k, lab) in enumerate(tiles):
+            f = tk.Frame(grid, bg=CARD, padx=10, pady=8, highlightthickness=1, highlightbackground=LINE)
+            f.grid(row=i // 4, column=i % 4, sticky="nsew", padx=3, pady=3)
+            grid.columnconfigure(i % 4, weight=1)
+            tk.Label(f, text=lab.upper(), bg=CARD, fg=MUTED, font=("", 7, "bold")).pack(anchor="w")
+            big = tk.Label(f, text="-", bg=CARD, fg=TEXT, font=("", 12, "bold"))
+            big.pack(anchor="w")
+            small = tk.Label(f, text="", bg=CARD, fg=MUTED, font=("", 8), wraplength=240, justify="left")
+            small.pack(anchor="w")
+            self.ov_tiles[k] = (big, small)
+        self._ov_tick()
+
+    def _ov_tick(self):
+        try:
+            if "Overview" in self.cur_tab() and not self.in_bg():
+                self.refresh_overview()
+        except Exception:
+            E.note_error("_ov_tick")
+        self.root.after(5000, self._ov_tick)
+
+    def refresh_overview(self):
+        if not hasattr(self, "ov_tree"):
+            return
+        t_ = self.ov_tree
+        t_.delete(*t_.get_children())
+        for name, t, _bar in self.farms():
+            proven = t.proven_bots()
+            best = max(t.vars, key=lambda v: t.life(v)["ret"], default=None)
+            breeds = collections.Counter(STRAT_LABELS.get(v.name, v.name) for v in t.vars).most_common(3)
+            state = ("trading" if self.running and t is self.tourn else "running" if t is not self.tourn else "paused")
+            t_.insert("", "end", values=(name, len(t.vars), len(proven), len(t.active), max((v.gen for v in t.vars), default=0),
+                                         f"{E.bot_nickname(best.key())} ({t.life(best)['ret'] * 100:+.1f}%)" if best else "-",
+                                         ", ".join(f"{b} {n}" for b, n in breeds), state))
+        log = list(getattr(self, "roam_log", []) or [])
+        day = time.time() - 86400
+        tl = self.ov_tiles
+        tl["roam"][0].config(text=f"{getattr(self, 'roam_n', 0):,}")
+        tl["roam"][1].config(text=(f"{sum(1 for r in log if r.get('time', 0) >= day)} in the last 24 h"
+                                   + ("" if self.cfg.get("roam_on") else "  |  Free roam is off")))
+        t = self.tourn
+        if t:
+            ex = collections.Counter(E.exam_verdict(v, t.serial)[0] for v in t.vars)
+            tl["exams"][0].config(text=f"{ex.get('passed', 0)} passed")
+            tl["exams"][1].config(text=f"{ex.get('failed', 0)} failed, {ex.get('untested', 0)} not proven yet (Bot Farm)")
+            pv = t.proven_bots()
+            tl["proven"][0].config(text=f"{len(pv)} of {len(t.vars)}")
+            tl["proven"][1].config(text=("they lead the account's trades" if pv else
+                                         "the account waits until a bot is proven (How to train them, on the alert bar)"))
+        book = getattr(self, "roam_features", {}) or {}
+        tl["feat"][0].config(text=f"{sum(len(x) for x in book.values())} tests")
+        tl["feat"][1].config(text="Free roam > What learning is worth")
+        tl["lib"][0].config(text=f"{len(E.load_collection())} / {len(E.load_hof())}")
+        tl["lib"][1].config(text="caught dragons / your champions")
+        grads = sum(1 for r in log if r.get("graduate"))
+        tl["grad"][0].config(text=str(grads))
+        tl["grad"][1].config(text="from Free roam's practice farms")
+        if self.session:
+            eq = self.equity()
+            tl["acct"][0].config(text=f"${eq:,.2f}")
+            tl["acct"][1].config(text=f"{(eq / self.start_cash - 1) * 100 if self.start_cash else 0:+.1f}% since the start "
+                                      f"({'LIVE' if self.live else 'PRACTICE'})")
+        else:
+            tl["acct"][0].config(text="-")
+            tl["acct"][1].config(text="no session yet")
+        age = (datetime.now() - self.last_tick).total_seconds() if getattr(self, "last_tick", None) else None
+        tl["feed"][0].config(text="live" if age is not None and age < 60 else "-" if age is None else "stale")
+        tl["feed"][1].config(text=(f"last price {age:.0f}s ago" if age is not None else "no prices yet")
+                                  + (f", watching {', '.join(self.session_coins)}" if self.session_coins else ""))
+
+    def build_botpos_tab(self, parent):
+        bar = tk.Frame(parent, bg=CARD)
+        bar.pack(fill="x", padx=6, pady=(6, 2))
+        self.bp_farm = tk.StringVar(value="Both farms")
+        ttk.Combobox(bar, textvariable=self.bp_farm, values=("Both farms", "Bot Farm", "Slow farm"), width=12,
+                     state="readonly").pack(side="left")
+        for v_ in (self.bp_farm,):
+            v_.trace_add("write", lambda *a: self.refresh_botpos())
+        self.bp_sum = tk.Label(bar, text="", bg=CARD, fg=MUTED, anchor="w", font=("", 9, "bold"))
+        self.bp_sum.pack(side="left", padx=10)
+        tk.Label(parent, bg=CARD, fg=MUTED, anchor="w", padx=8, font=("", 8),
+                 text="Each bot's own pretend holdings right now. These never touch your balance; double-click a row to see "
+                      "its ticker on the chart.").pack(fill="x")
+        box = tk.Frame(parent, bg=CARD)
+        box.pack(fill="both", expand=True, padx=6, pady=(2, 6))
+        cols = ("bot", "kind", "status", "ticker", "qty", "paid", "worth", "pl", "plpct", "held", "exits", "life")
+        heads = ("Bot", "Kind", "Status", "Coin", "Amount", "Paid", "Worth now", "P/L $", "P/L %", "Held", "Exits",
+                 "Bot overall")
+        t = self.bp_tree = self.make_tree(box, cols, (130, 150, 110, 60, 90, 80, 80, 80, 60, 70, 230, 80), heads)
+        for c_ in ("bot", "kind", "status", "ticker", "exits", "held"):
+            t.column(c_, anchor="w")
+        t.tag_configure("up", foreground=GREEN)
+        t.tag_configure("down", foreground=RED)
+        t.bind("<Double-1>", lambda e: (lambda sel: self.show_on_chart(t.set(sel[0], "ticker")) if sel else None)(t.selection()))
+        self._bp_tick()
+
+    def _bp_tick(self):
+        """Keeps the open tab current (every few seconds, only while you're looking at it)."""
+        try:
+            if self.cur_tab() == "Bot positions" and not self.in_bg():
+                self.refresh_botpos()
+        except Exception:
+            E.note_error("_bp_tick")
+        self.root.after(3000, self._bp_tick)
+
+    def refresh_botpos(self):
+        t = getattr(self, "bp_tree", None)
+        if t is None:
+            return
+        farms = []
+        if self.bp_farm.get() in ("Both farms", "Bot Farm") and self.tourn:
+            farms.append(("Bot Farm", self.tourn, float(self.session_bar or self.settings.get("bar_minutes", 1))))
+        sl = getattr(self, "slow", {}).get("t")
+        if self.bp_farm.get() in ("Both farms", "Slow farm") and sl:
+            farms.append(("Slow farm", sl, self.SLOW_GRAN / 60))
+        rows, paid_all, worth_all, n_bots, unpriced = [], 0.0, 0.0, set(), 0
+        live_px = dict(getattr(self, "last", None) or {})
+        for farm, tr, bar_min in farms:
+            for v in list(tr.vars):
+                for c, q in list(v.sim.pos.items()):
+                    if q <= 0:
+                        continue
+                    S = live_px.get(c) or tr.last_px.get(c)
+                    paid = v.sim.cost.get(c, 0.0)
+                    if not S:  # no price for this coin yet: don't show it as worthless
+                        unpriced += 1
+                        n_bots.add((farm, v.uid))
+                        rows.append(((farm, 0.0), (E.bot_nickname(v.key()), STRAT_LABELS.get(v.name, v.name),
+                                     STATUS_TEXT.get(tr.info.get(id(v), {}).get("status"), ""), c, f"{q:g}", f"${paid:,.2f}",
+                                     "no price yet", "-", "-", "-", "-", f"{tr.life(v)['ret'] * 100:+.1f}%"), ""))
+                        continue
+                    worth = q * S
+                    pl = worth - paid
+                    bars = max(0, tr.n - v.since.get(c, tr.n))
+                    mins = bars * bar_min
+                    held = f"{mins:.0f} min" if mins < 120 else f"{mins / 60:.1f} hr" if mins < 2880 else f"{mins / 1440:.1f} days"
+                    exits = ", ".join(x for x in (E.risk_text(v.risk),
+                                                              "")
+                                      if x) or "its strategy decides"
+                    st = STATUS_TEXT.get(tr.info.get(id(v), {}).get("status"), "")
+                    life = tr.life(v)["ret"] * 100
+                    rows.append(((farm, -pl), (E.bot_nickname(v.key()), STRAT_LABELS.get(v.name, v.name), st, c,
+                                 f"{q:.6g}", f"${paid:,.2f}", f"${worth:,.2f}",
+                                 f"{pl:+,.2f}", f"{(pl / paid * 100) if paid else 0:+.1f}%", held, exits, f"{life:+.1f}%"),
+                                 "up" if pl >= 0 else "down"))
+                    paid_all += paid
+                    worth_all += worth
+                    n_bots.add((farm, v.uid))
+        rows.sort(key=lambda r: r[0])
+        t.delete(*t.get_children())
+        for _, vals, tag in rows:
+            t.insert("", "end", values=vals, tags=(tag,))
+        pl_all = worth_all - paid_all
+        self.bp_sum.config(text=(f"{len(n_bots)} bot{'s' if len(n_bots) != 1 else ''} holding {len(rows)} position"
+                                 f"{'s' if len(rows) != 1 else ''}   |   all bots' pretend money together: paid "
+                                 f"${paid_all:,.2f}, worth ${worth_all:,.2f}, P/L {pl_all:+,.2f} "
+                                 f"({(pl_all / paid_all * 100) if paid_all else 0:+.1f}%)"
+                                 + (f"   |   {unpriced} waiting for a price" if unpriced else ""))
+                           if rows else ("No bot holds a coin right now." if farms else "The farms haven't started yet."),
+                           fg=(GREEN if pl_all >= 0 else RED) if rows else MUTED)
+
+    SUCCESS_MODES = (
+        ("live", "Live", "On fresh prices since each bot was born (what it's doing right now)"),
+        ("life", "Lifetime", "Everything since it was born, including the recent past it replayed when it hatched"),
+        ("roam", "Free roam tests", "Its self-tests on stretches of the past (average return per test)"),
+        ("exam", "Exams", "Stretches it never trained on (average result; passing needs to beat luck)"))
+
+
+    def success_rows(self, t, mode):
+        """[(bot, result %, how many (tests / decisions), trades, win rate, best, worst, detail)] for one view, best first."""
+        out = []
+        for v in list(t.vars):
+            best, worst = v.best_tr, v.worst_tr
+            closed = v.wins + v.losses
+            wr = v.wins / closed if closed else None
+            if mode == "live":
+                if not v.live_n or not v.live_eq0 or not v.eq:
+                    continue
+                out.append((v, (v.eq[-1] / v.live_eq0 - 1) * 100, f"{v.live_n} decisions", v.ntrades, wr, best, worst,
+                            "on prices that came in after it hatched"))
+            elif mode == "life":
+                lf = t.life(v)
+                out.append((v, lf["ret"] * 100, f"{v.age} decisions", lf["trades"], lf["winrate"], best, worst,
+                            "" if lf["edge"] is None else f"{lf['edge'] * 100:+.1f}% vs the market"))
+            elif mode == "roam":
+                bts = [b for b in (v.backtests or []) if b.get("trades")]
+                if not bts:
+                    continue
+                rets = [b["ret"] for b in bts]
+                wrs = [b["winrate"] for b in bts if b.get("winrate") is not None]
+                out.append((v, sum(rets) / len(rets), f"{len(bts)} tests, {sum(1 for x in rets if x > 0)} made money",
+                            sum(b["trades"] for b in bts), (sum(wrs) / len(wrs) / 100) if wrs else None, max(rets), min(rets),
+                            f"{sum(b['edge'] for b in bts) / len(bts):+.1f}% vs the market on average"))
+            elif mode == "exam":
+                ex = [x for x in (v.exams or []) if x.get("n", 0) > 0]
+                if not ex:
+                    continue
+                e = [x["edge"] for x in ex]
+                out.append((v, sum(e) / len(e), f"{len(ex)} exams, {sum(1 for x in e if x > 0)} won", sum(x["n"] for x in ex),
+                            None, max(e), min(e), E.exam_verdict(v, t.serial)[0]))
+        return sorted(out, key=lambda x: -x[1])
+
+    def build_success_tab(self, parent):
+        """How well each bot is doing, in different views: live, lifetime, Free roam tests, exams and day replays."""
+        top = tk.Frame(parent, bg=BG)
+        top.pack(fill="x", padx=6, pady=(6, 2))
+        tk.Label(top, text="\u2605 Success", bg=BG, fg=TEXT, font=("", 12, "bold")).pack(side="left")
+        self.succ_farm = tk.StringVar(value="Bot Farm")
+        ttk.Combobox(top, textvariable=self.succ_farm, values=["Bot Farm", "Slow farm"], state="readonly",
+                     width=11).pack(side="left", padx=(12, 6))
+        self.succ_mode = tk.StringVar(value=self.cfg.get("succ_mode", "live"))
+        self.succ_btns = {}
+        for key, lab, tip in self.SUCCESS_MODES:
+            b = tk.Button(top, text=lab, relief="flat", bd=0, padx=10, pady=3, cursor="hand2", font=("", 9, "bold"),
+                          command=lambda k=key: (self.succ_mode.set(k), self.cfg.__setitem__("succ_mode", k), self.refresh_success()))
+            b.pack(side="left", padx=2)
+            Tip(b, tip)
+            self.succ_btns[key] = b
+        self.succ_farm.trace_add("write", lambda *a: self.refresh_success())
+        self.succ_note = tk.Label(parent, text="", bg=BG, fg=MUTED, anchor="w", font=("", 8), padx=8)
+        self.succ_note.pack(fill="x")
+        self.succ_cv = tk.Canvas(parent, bg=CARD, height=170, highlightthickness=0)
+        self.succ_cv.pack(fill="x", padx=6, pady=(2, 4))
+        self.succ_cv.bind("<Configure>", lambda e: self.later(self.refresh_success, 200))
+        fr = tk.Frame(parent, bg=BG)
+        fr.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        self.succ_tree = self.make_tree(fr, ("bot", "breed", "status", "res", "n", "trades", "wr", "best", "worst", "det"),
+                                        (130, 150, 80, 80, 170, 60, 70, 80, 80, 260),
+                                        ("Bot", "Breed", "Status", "Result", "Based on", "Trades", "Win rate", "Best", "Worst",
+                                         "Notes"))
+        self.succ_tree.tag_configure("good", foreground=GREEN)
+        self.succ_tree.tag_configure("bad", foreground=RED)
+        self.succ_tree.configure(selectmode="extended")
+        self.succ_vs = {}
+        bar = tk.Frame(parent, bg=BG)
+        bar.pack(fill="x", padx=6, pady=(0, 6), before=fr)
+        tk.Label(bar, text="Picked bots:", bg=BG, fg=MUTED, font=("", 8)).pack(side="left")
+        for lab_, fn in (("\u25c9 Save to Library", lambda vs: self.catch_rows(self.board_rows_of(vs), "success tab")),
+                         ("\u2605 Add to Hall of Fame", self.promote_variants),
+                         ("Add to my Bot Farm", self.add_to_main_farm),
+                         ("Details...", lambda vs: self.bot_detail(vs[0]))):
+            ttk.Button(bar, text=lab_, style="Plain.TButton",
+                       command=lambda fn=fn: self._succ_act(fn)).pack(side="left", padx=(6, 0))
+        self.succ_tree.bind("<Double-1>", lambda e: self._succ_act(lambda vs: self.bot_detail(vs[0])))
+        self._succ_tick()
+
+    def _succ_act(self, fn):
+        vs = [self.succ_vs[i] for i in self.succ_tree.selection() if i in self.succ_vs]
+        if not vs:
+            return messagebox.showinfo("Success", "Pick one or more bots in the list first (Ctrl+click picks several).")
+        fn(vs)
+
+    def _succ_tick(self):
+        try:
+            if "Success" in self.cur_tab() and not self.in_bg():
+                self.refresh_success()
+        except Exception:
+            E.note_error("_succ_tick")
+        self.root.after(5000, self._succ_tick)
+
+    def refresh_success(self):
+        if not hasattr(self, "succ_tree"):
+            return
+        mode = self.succ_mode.get()
+        for k, b in self.succ_btns.items():
+            on = k == mode
+            b.config(bg=ACCENT if on else CARD, fg="white" if on else TEXT, activebackground=ACCENT)
+        t = {"Bot Farm": self.tourn, "Slow farm": getattr(self, "slow", {}).get("t")}.get(self.succ_farm.get())
+        tree, cv = self.succ_tree, self.succ_cv
+        keep = {self.succ_vs[i].uid for i in tree.selection() if i in getattr(self, "succ_vs", {})}
+        tree.delete(*tree.get_children())
+        self.succ_vs = {}
+        cv.delete("all")
+        lab = dict((k, (l, tip)) for k, l, tip in self.SUCCESS_MODES)[mode]
+        if t is None:
+            self.succ_note.config(text=f"{self.succ_farm.get()}: not running yet.")
+            return
+        rows = self.success_rows(t, mode)
+        self.succ_note.config(text=f"{lab[1]}. {len(rows)} of {len(t.vars)} bots have results here."
+                                   + ("" if rows else "  (Nothing yet: Free roam fills the test and exam views.)"))
+        pc = lambda x: "-" if x is None else f"{x:+.1f}%"
+        for v, res, n, trades, wr, best, worst, det in rows:
+            d = t.info.get(id(v), {})
+            iid = tree.insert("", "end", tags=("good" if res > 0 else "bad" if res < 0 else "",), values=(
+                E.bot_nickname(v.key()), STRAT_LABELS.get(v.name, v.name), STATUS_TEXT.get(d.get("status"), d.get("status") or "-"),
+                pc(res), n, trades, "-" if wr is None else f"{wr * 100:.0f}%", pc(best), pc(worst), det))
+            self.succ_vs[iid] = v
+            if v.uid in keep:
+                tree.selection_add(iid)  # (it refreshes every few seconds: what you picked stays picked)
+        W, H = max(200, cv.winfo_width()), int(cv.cget("height"))
+        top = rows[:12]
+        if not top:
+            return
+        hi = max(abs(x[1]) for x in top) or 1
+        mid = W * 0.45
+        bh = (H - 10) / len(top)
+        cv.create_line(mid, 4, mid, H - 4, fill=LINE)
+        for i, (v, res, *_x) in enumerate(top):
+            y = 6 + i * bh
+            L = (W * 0.5 - 70) * abs(res) / hi
+            x0, x1 = (mid, mid + L) if res >= 0 else (mid - L, mid)
+            cv.create_rectangle(x0, y + 1, x1, y + bh - 2, fill=GREEN if res >= 0 else RED, outline="")
+            cv.create_text(mid - 6 if res >= 0 else x0 - 6, y + bh / 2, anchor="e", fill=TEXT, font=("", 8),
+                           text=E.bot_nickname(v.key()))
+            cv.create_text((x1 + 6) if res >= 0 else (mid + 6), y + bh / 2, anchor="w", fill=MUTED, font=("", 8),
+                           text=f"{res:+.1f}%")
+
     def show_diagnostics(self, parent=None):
         if parent is None:  # it lives as a tab in the system window
             return self.open_hub('system', 'Diagnostics')
@@ -4156,6 +4876,9 @@ class App:
         elif kind == "prices":
             if self.running:
                 self.on_prices(data)
+        elif kind == "backfill":
+            if self.running:
+                self.on_backfill(*data)
         elif kind == "connected":
             self.client, self.balances = data
             self.usd_avail = self.avail()
@@ -5275,7 +5998,7 @@ class App:
         b_lib.config(command=save_lib)
 
     # ---------------- free roam (self-study) ----------------
-    ROAM_CANDLES = (300, 900, 3600, 21600, 86400)  # 5 min to 1 day: the farm picks one each study
+    ROAM_CANDLES = (60, 300, 900, 3600, 21600, 86400)  # 5 min to 1 day: the farm picks one each study
 
     # ---------------- feature tests: what each kind of learning is worth ----------------
     @staticmethod
@@ -5301,7 +6024,7 @@ class App:
         key = E.pick_feature(E.feature_candidates(self.settings, self.learning_switches()), book, rng)
         if not key:  # every switch is off: nothing to compare
             return self._roam_check(t)
-        closes, extra, info = self._roam_pick(rng, 700)
+        closes, extra, info = self._roam_pick(rng, 700, prefer=self.farm_gran())
         lead = t.active[:4] or t.vars[:4]
         seeds = [E._genes(v) for v in lead]
         label = self.switch_label(key)
@@ -5399,6 +6122,10 @@ class App:
                 w.after(15000, tick)
         w.after(15000, tick)
 
+    def farm_gran(self):
+        """The candle size the farm lives on (seconds), which is what its bots must be studied and examined on."""
+        return E.candle_gran(float(getattr(self, "session_bar", 0) or self.settings.get("bar_minutes", 1)))
+
     def roam_path(self):
         return os.path.join(E.HOME_DIR, "free-roam.json")
 
@@ -5490,7 +6217,7 @@ class App:
         closes, extra, info = self._roam_fetch(rng, min_bars, **kw)
         return closes, extra, pool.add(key, reuse, closes, extra, info)
 
-    def _roam_fetch(self, rng, min_bars=400):
+    def _roam_fetch(self, rng, min_bars=400, prefer=None):
         """The farm chooses where to learn: a candle size, then a stretch of history it has studied least, but only
         stretches where every coin really traded on Coinbase (checked against each coin's daily history first)."""
         coins = list(self.session_coins)
@@ -5532,7 +6259,9 @@ class App:
                     break
                 dset = set(days)
                 fits = [g for g in self.ROAM_CANDLES if room(days) * E.bars_per_day(g) / (1.02 / 1.0) * 0.9 >= min_bars]
-            gran = rng.choice(fits or self.ROAM_CANDLES[:1])
+            # the farm's own candle size first: a bot that decides every 15 one-minute candles learns nothing true
+            # about itself on daily candles (and only tests on its own candles count as exams)
+            gran = prefer if prefer in fits and _attempt < 6 else rng.choice(fits or self.ROAM_CANDLES[:1])
             most = int(room(days) * E.bars_per_day(gran) / (1.02) * 0.9)  # never longer than the shared history
             n = rng.randint(min(min_bars, most), max(min(min_bars, most), min(1500, most)))
             span = n / E.bars_per_day(gran) * 1.02 * 86400
@@ -5597,8 +6326,12 @@ class App:
         vars_ = list(t.vars)
         if not vars_:
             return
-        picks = list(dict.fromkeys(([t.active[0]] if t.active else []) + rng.sample(vars_, min(3, len(vars_)))))
-        closes, extra, info = self._roam_pick(rng)
+        closes, extra, info = self._roam_pick(rng, prefer=self.farm_gran())
+        ranked = [v for v, _ in t.ranking()]
+        # the ones that most need an exam first: the winners and the top of the ranking that haven't proven themselves
+        need = [v for v in list(t.active) + ranked[:12] if E.exam_verdict(v, t.serial)[0] == "untested"]
+        picks = list(dict.fromkeys(([t.active[0]] if t.active else []) + need[:3]
+                                   + rng.sample(vars_, min(2, len(vars_)))))[:6]
         names = [E.bot_nickname(v.key()) for v in picks]
         self.roam_now = dict(info, kind="Self-test", phase="study", text=f"{len(picks)} bots are testing themselves",
                              bots=names, done=0, total=len(picks), t0=time.time())
@@ -5624,15 +6357,19 @@ class App:
             if self.tourn is not t:
                 return
             res = []
+            exams = 0
             for v, r in out:
                 if v in t.vars:
                     E.remember_backtest(v, r, t)
+                    if info["gran"] == self.farm_gran() and not info.get("revisit"):  # unseen prices, its own candles
+                        E.add_exam(v, "self-test", r["edge"] * 100, r.get("closed", r["trades"]), info["start"], info["gran"])
+                        exams += 1
                 res.append((E.bot_nickname(v.key()), round(r["ret"] * 100, 2), r["trades"], round(r["ret"] * 100, 2),
                             r.get("closed", 0), r.get("wins", 0), r.get("best_trade"), r.get("worst_trade")))
             good = sum(1 for x in res if x[1] > 0)
             rec = dict(time=time.time(), kind="Self-test", revisit=bool(info.get("revisit")), start=info["start"], end=info["end"], gran=info["gran"],
                        bars=info["bars"], hold=round(info["hold"] * 100, 2), mood=info["mood"], results=res,
-                       summary=f"{good} of {len(res)} made money")
+                       summary=f"{good} of {len(res)} made money" + (f"; {exams} exams" if exams else ""))
             self._roam_finish(rec, cur)
             if False:
                 self.write(f"◇ Free roam: {len(res)} bots tested themselves on {self._when(info['start'], True)} to "
@@ -5644,7 +6381,7 @@ class App:
         lessons and adopts its best graduate."""
         import random as _r
         rng = _r.Random()
-        closes, extra, info = self._roam_pick(rng, 700)
+        closes, extra, info = self._roam_pick(rng, 700, prefer=self.farm_gran())
         lead = t.active[:4] or t.vars[:4]
         seeds = [E._genes(v) for v in lead]
         self.roam_now = dict(info, kind="Practice farm", phase="study", text="A practice farm is living through this stretch",
@@ -7631,7 +8368,8 @@ class App:
                     time=stamp, mode="bot", side=t["side"], coin=t["coin"], qty=round(t["qty"], 8),
                     price=round(t["price"], 6), usd=round(t["usd"], 2),
                     pl="" if t["pl"] is None else round(t["pl"], 2), reason="bot-test",
-                    who=friendly_label(t["name"], t["params"], t.get("tf", 1), self.session_bar)))
+                    who=friendly_label(t["name"], t["params"], t.get("tf", 1), self.session_bar),
+                    bot=t.get("uid"), strategy=t.get("name"), held=t.get("held"), why=str(t.get("why") or "")[:160]))
             del self.shadow_trades[:-4000]
             if new:
                 if self.cur_tab() == "Trades":
@@ -7643,8 +8381,131 @@ class App:
             if note:
                 self.write(note, "bad")
 
+    # ---------------- nobody proven yet: say so, and how to train them ----------------
+    def no_proven_bots(self):
+        """(nothing can trade the account, the farm, the closest bots with what they still lack) while the bot runs."""
+        t = self.tourn
+        if not (self.running and self.seeded and self.wild and t and self.settings.get("proven_only", True)):
+            return False, t, []
+        if self.roster() != "farm" and any(v.origin == "team" for v in t.vars):
+            return False, t, []  # trading with your own team / Hall of Fame bots
+        if t.proven_bots():
+            return False, t, []
+        near = sorted(((len(g), E.bot_nickname(v.key()), g) for v in t.vars for g in [t.proven_gaps(v)]),
+                      key=lambda x: x[0])
+        return True, t, near[:3]
+
+    def update_proven_bar(self, force=False):
+        if not hasattr(self, "proven_bar"):
+            return
+        if not force and time.time() - getattr(self, "_pb_at", 0) < 5:
+            return
+        self._pb_at = time.time()
+        try:
+            none, t, near = self.no_proven_bots()
+        except Exception:
+            E.note_error("update_proven_bar")
+            return
+        if not none:
+            if self.proven_bar.winfo_ismapped():
+                self.proven_bar.pack_forget()
+                self.write("A bot is proven now, so the account can trade again (it follows the proven winners).", "good")
+            return
+        closest = "; ".join(f"{nm} needs {', '.join(g[:2])}" for _, nm, g in near[:2])
+        self.proven_lbl.config(text=f"No bot is proven yet, so the account won't trade. {len(t.vars)} bots are training "
+                                    f"on their own pretend money." + (f" Closest: {closest}." if closest else ""))
+        if self.cfg.get("roam_on"):
+            self.proven_roam_btn.pack_forget()
+        elif not self.proven_roam_btn.winfo_ismapped():
+            self.proven_roam_btn.pack(side="right", padx=4, pady=4)
+        if not self.proven_bar.winfo_ismapped():
+            self.proven_bar.pack(fill="x", after=self.headline_lbl)
+            if not self.cfg.get("proven_help_seen"):  # the first time ever: say it out loud, once
+                self.cfg["proven_help_seen"] = True
+                try:
+                    E.save_json(CONFIG_PATH, self.cfg)
+                except OSError:
+                    pass
+                self.notify("OBF", "No bot is proven yet, so the account won't trade. Click 'How to train them'.")
+                self.root.after(500, self.show_training_help)
+
+    def show_training_help(self):
+        """How to get bots proven: what proven means, the steps, and buttons for each."""
+        w = tk.Toplevel(self.root)
+        w.title("How to train your bots")
+        w.configure(bg=BG)
+        f = tk.Frame(w, bg=BG, padx=16, pady=12)
+        f.pack(fill="both", expand=True)
+        st = self.settings
+        need = [f"at least {int(st.get('proven_trades', 8) or 0)} finished trades",
+                "at least one full scoring window on the farm", "money made over its lifetime, and more than just holding"]
+        if st.get("proven_exam", True):
+            need.append("passed exams on stretches it never trained on (Free roam gives those)")
+        tk.Label(f, text="Only proven bots trade the account", bg=BG, fg=TEXT, font=("", 13, "bold")).pack(anchor="w")
+        tk.Label(f, bg=BG, fg=MUTED, justify="left", wraplength=620, anchor="w", text=(
+            "Your practice account and LIVE only follow bots with a real track record. A bot is proven "
+            "when it has: " + "; ".join(need) + ". Until then it trains on its own pretend money, which never touches "
+            "your account.")).pack(anchor="w", pady=(2, 10))
+        steps = [
+            ("Keep the bot running", "Every minute it runs, the bots trade their own pretend money on real prices and "
+                                     "build up their records. Leave it running through market hours.", None, None),
+            ("Turn on Free roam", "It tests bots on stretches of the past they never trained on: those are the exams a "
+                                  "bot must pass. It also runs practice farms there and breeds from what worked.",
+             "Free roam is ON" if self.cfg.get("roam_on") else "Turn on Free roam", lambda: self.toggle_roam(True)),
+            ("Run the Training camp", "A whole farm lives through weeks or months of history several times over, then "
+                                      "sits a final exam. The ones that pass can join your farm straight away.",
+             "Open the Training camp", lambda: self.open_learning("Training camp")),
+            ("Give them room to trade", "Each bot spends your practice money x Trade size %. Busy coins that move give them "
+                                        "the most chances to trade and build a record (Bot picks chooses those).", None, None),
+            ("Or choose who trades", "Pick bots yourself (My team or Hall of Fame only), or loosen the rules in "
+                                     "Settings > Wildcard (trades needed, exams required).",
+             "Open Settings", self.open_settings),
+        ]
+        for i, (head, body, btn, fn) in enumerate(steps, 1):
+            row = tk.Frame(f, bg=CARD, padx=10, pady=8, highlightthickness=1, highlightbackground=LINE)
+            row.pack(fill="x", pady=3)
+            tk.Label(row, text=f"{i}. {head}", bg=CARD, fg=TEXT, font=("", 10, "bold"), anchor="w").pack(anchor="w")
+            tk.Label(row, text=body, bg=CARD, fg=MUTED, justify="left", wraplength=600, anchor="w").pack(anchor="w")
+            if btn:
+                b = ttk.Button(row, text=btn, style="Plain.TButton", command=lambda fn=fn: (fn(), self.update_proven_bar(True)))
+                b.pack(anchor="e", pady=(4, 0))
+                if btn == "Free roam is ON":
+                    b.state(["disabled"])
+        try:
+            _, t, near = self.no_proven_bots()
+        except Exception:
+            near = []
+        if near:
+            tk.Label(f, text="Closest to proven right now", bg=BG, fg=TEXT, font=("", 10, "bold")).pack(anchor="w", pady=(10, 2))
+            for _, nm, g in near:
+                tk.Label(f, text=f"{nm}: needs {', '.join(g)}", bg=BG, fg=MUTED, anchor="w", justify="left",
+                         wraplength=620).pack(anchor="w")
+        ttk.Button(f, text="Close", command=w.destroy).pack(anchor="e", pady=(12, 0))
+
     def update_wild_msg(self):
         n, top, scored = self.tourn.summary()
+        if self.settings.get("proven_only", True):
+            t = self.tourn
+            proven = t.proven_bots()
+            leading = [v for v in t.active if v in proven]
+            need = f"{int(self.settings.get('proven_trades', 8) or 0)}+ finished trades, made money over its lifetime, " \
+                   f"beat just holding" + (", passed its exams" if self.settings.get("proven_exam", True) else "")
+            if leading:
+                best = max(leading, key=lambda v: t.life(v)["ret"])
+                msg = (f"The account follows {len(leading)} proven winner{'s' if len(leading) != 1 else ''} "
+                       f"({len(proven)} proven in all). Best lifetime record: {E.bot_nickname(best.key())} "
+                       f"({t.life(best)['ret'] * 100:+.1f}% since it hatched).")
+            elif proven:
+                msg = (f"{len(proven)} bot{'s are' if len(proven) != 1 else ' is'} proven, but none is winning right now, "
+                       "so the account waits.")
+            else:
+                msg = (f"No bot is proven yet ({need}), so the account doesn't trade. The farm keeps training on its own "
+                       "pretend money.")
+            self.wild_msg = msg
+            if msg != self.last_wild_msg:
+                self.write(msg)
+                self.last_wild_msg = msg
+            return
         if n:
             info = self.tourn.info[id(top)]
             slow = len(self.tourn.slowed)
@@ -9390,6 +10251,12 @@ class App:
         if tab == "Trades" and getattr(self, "_trades_dirty", False):
             self._trades_dirty = False
             self.refresh_trades()
+        elif tab == "Bot positions":
+            self.refresh_botpos()
+        elif "Overview" in tab:
+            self.refresh_overview()
+        elif "Success" in tab:
+            self.refresh_success()
         elif tab == "Strategy scoreboard" and getattr(self, "_board_dirty", False):
             self._board_dirty = False
             self.refresh_board()
@@ -10185,16 +11052,89 @@ class App:
         self.roster_var.set(labels[self.roster()])
 
     # ---------------- Hall of Fame: only what you pick ----------------
+    # ---------------- bots on any farm ----------------
+    def farms(self):
+        """[(name, farm, minutes per decision bar)] for every farm that's running."""
+        out = []
+        if self.tourn is not None:
+            out.append(("Bot Farm", self.tourn, float(self.session_bar or self.settings.get("bar_minutes", 1))))
+        sl = (getattr(self, "slow", None) or {}).get("t")
+        if sl is not None:
+            out.append(("Slow farm", sl, self.SLOW_GRAN / 60))
+        return out
+
+    def farm_of(self, v):
+        """(name, farm, minutes per bar) of the farm this bot lives on, or (None, None, None)."""
+        return next(((n, t, b) for n, t, b in self.farms() if v in t.vars), (None, None, None))
+
+    def board_rows_of(self, vs):
+        """Scoreboard rows for these bots, from whichever farm each lives on (ready for export_bots / catch_rows).
+        Before, only the Bot Farm was looked at, so a Slow farm or Scalp lab bot quietly came back as nothing."""
+        want = {id(v) for v in vs}
+        rows = []
+        for _, t, bar in self.farms():
+            rows += [dict(r, bar_minutes=bar) for r in t.board() if id(r["v"]) in want]
+        return rows
+
+    # ---------------- Hall of Fame: only what you pick ----------------
     def promote_variants(self, vs):
-        if not vs or not self.tourn:
-            return
-        ids = {id(v) for v in vs}
-        rows = [dict(r, bar_minutes=self.session_bar) for r in self.tourn.board() if id(r["v"]) in ids]
+        rows = self.board_rows_of(vs or [])
+        if not rows:
+            return messagebox.showinfo("Hall of Fame", "That bot isn't on any farm any more, so it couldn't be added.")
         entries = E.export_bots(rows, self.version, note="picked by you")["bots"]
         self.catch_rows(entries, "hall of fame")  # Hall of Fame bots are always in the Library too
         E.induct(entries, self.version)
-        self.write(f"\u2605 Added {', '.join(E.bot_nickname(v.key()) for v in vs)} to the Hall of Fame.", "good")
+        self.write(f"\u2605 Added {', '.join(E.bot_nickname(r['v'].key()) for r in rows)} to the Hall of Fame.", "good")
         self.after_hof_change()
+
+    def add_to_main_farm(self, vs):
+        """Copies bots from the Slow farm into the Bot Farm as new eggs, genes and rule evidence and
+        all. A Slow farm bot's pace is turned from hourly candles into the nearest pace on your farm's candles."""
+        if not self.tourn or not self.seeded:
+            return messagebox.showinfo("Add to farm", "Start your Bot Farm first (press Start once), then add bots to it.")
+        added, skipped = [], []
+        for v in vs:
+            name, t, bar = self.farm_of(v)
+            nm = E.bot_nickname(v.key())
+            if t is None or t is self.tourn:
+                skipped.append(nm)
+                continue
+            g = E._genes(v)
+            tf = g["tf"]
+            if name == "Slow farm":
+                want = g["tf"] * bar / max(1e-9, float(self.session_bar or 1))
+                tf = min(E.TIMEFRAMES, key=lambda x: abs(x - want))
+            nv = self.tourn.add_variant(g["name"], g["params"], {c: self.hist[c] for c in self.session_coins}, 1.0,
+                                        note=f"From the {name}:", tf=tf, origin=name.lower(), risk=g["risk"],
+                                        traits=g["traits"], vetoes=g["vetoes"], layers=g["layers"])
+            if nv:
+                nv.layer_stats = {k: list(x) for k, x in (v.layer_stats or {}).items()}
+                nv.veto_stats = {k: list(x) for k, x in (v.veto_stats or {}).items()}
+                added.append(nm)
+        if added:
+            self.write(f"Added {', '.join(added)} to your Bot Farm. They start as eggs there and have to prove themselves.",
+                       "good")
+            self.refresh_board()
+        if skipped and not added:
+            messagebox.showinfo("Add to farm", "Those bots are already on your Bot Farm.")
+
+    def close_bot_positions(self):
+        """Practice reset: the bots' own open pretend holdings (Bot positions) close at what they're worth now, on the
+        Bot Farm and the Slow farm. Their scores and learning don't change. -> how many were closed."""
+        n = 0
+        for t_ in (self.tourn, (getattr(self, "slow", None) or {}).get("t")):
+            if t_ is not None:
+                n += t_.close_positions(dict(self.last or {}))
+        if n:
+            try:
+                self.save_farm(force=True)
+            except Exception:
+                E.note_error("close_bot_positions")
+        try:
+            self.refresh_botpos()
+        except Exception:
+            E.note_error("close_bot_positions")
+        return n
 
     def promote_entries(self, entries):
         if not entries:
@@ -10277,7 +11217,7 @@ class App:
         self.refresh_board()
 
     def _team_from_variants(self, vs):
-        caught = self.catch_rows([r for r in self.tourn.board() if r["v"] in vs], "team")
+        caught = self.catch_rows(self.board_rows_of(vs), "team")
         size, full = E.set_team([E.bot_key(b) for b in caught], True)
         self.write(f"Team: {size}/{E.TEAM_MAX}." + (f" {full} didn't fit (the team is full)." if full else ""))
         self.update_team_label()
@@ -10619,7 +11559,9 @@ class App:
 
     def bot_detail(self, v=None, quiet=False):
         v = v or self.selected_variant()
-        if not v or not self.tourn:
+        T = self.farm_of(v)[1] if v else None  # the farm this bot lives on (the Slow farm too)
+        T = T or self.tourn
+        if not v or not T:
             if quiet:
                 return None
             return messagebox.showinfo("Bot details", "Click a bot on the farm or the scoreboard first.")
@@ -10666,11 +11608,11 @@ class App:
         def paint(_=None):
             if not w.winfo_exists():
                 return
-            lf = self.tourn.life(v)
-            d = self.tourn.info.get(id(v), {})
-            st = STATUS_TEXT.get(d.get("status"), d.get("status", "removed")) if v in self.tourn.vars else "Removed"
+            lf = T.life(v)
+            d = T.info.get(id(v), {})
+            st = STATUS_TEXT.get(d.get("status"), d.get("status", "removed")) if v in T.vars else "Removed"
             hrs = v.win_steps * self.session_bar / 60
-            parents = self.tourn.lineage.get(v.uid, {}).get("parents", [])
+            parents = T.lineage.get(v.uid, {}).get("parents", [])
             fam = {"starter": "starter bot", "classic": f"famous strategy: {v.classic}", "bred": f"bred from #{' and #'.join(map(str, parents))}",
                    "tweaked": f"tweaked copy of #{parents[0]}" if parents else "tweaked copy"}.get(v.origin, v.origin or "-")
             vals = {"Status": st, "Recent gain": pct_txt(d.get("score")), "vs holding (recent)": pct_txt(d.get("edge")),
@@ -10680,14 +11622,14 @@ class App:
                     "Time winning": f"{hrs:.1f} h" if hrs >= 1 else f"{hrs * 60:.0f} min",
                     "Best market": MOOD_TEXT.get(lf["best_mood"], "not sure yet") if lf["best_mood"] else "not sure yet",
                     "Own stops": E.risk_text(v.risk) or "none", "Family": f"#{v.uid}, {fam}, generation {v.gen}",
-                    "Health / power": f"{self.tourn.health(v) * 100:.0f}% health, power {v.power:.1f} / 10",
+                    "Health / power": f"{T.health(v) * 100:.0f}% health, power {v.power:.1f} / 10",
                     "Never-rules": E.vetoes_text(v.vetoes, v.veto_stats) or "none",
                     "Twin test": "not run yet" if v.twin is None else
                     (f"passed ({v.twin * 100:+.1f}% vs holding on older prices)" if v.twin > 0 else
                      f"failed ({v.twin * 100:+.1f}%): maybe just lucky, counts for less"),
                     "Skips coins": ", ".join(c_ for c_, x in v.coin_pl.items() if x[0] >= 3 and x[1] < -1.5) or "none",
                     "Badges": ", ".join(f"{n}" for n, _ in self.achievements(v, lf)) or "none yet",
-                    "Island": f"{v.island + 1} of {int(self.tourn.o.get('islands', 1) or 1)}",
+                    "Island": f"{v.island + 1} of {int(T.o.get('islands', 1) or 1)}",
                     "Backtests": ("; ".join(f"{b_['ret']:+.1f}% ({b_['edge']:+.1f}% vs hold, {b_['segments_passed']}/{b_['segments']} parts)"
                                             for b_ in v.backtests[-2:]) if v.backtests else "none saved"),
                     "Traits": (E.traits_text(v.traits) or "none yet") + (
@@ -10705,7 +11647,7 @@ class App:
                 cv.create_text(W // 2, H // 2, text="No price history yet", fill=MUTED)
                 return
             L = len(self.hist.get(c, []))
-            first_n = self.tourn.n - (len(h) - 1)
+            first_n = T.n - (len(h) - 1)
             marks = [(n - first_n, side, px) for n, cc, side, px in v.log if cc == c and n >= first_n]
             lo, hi = min(h + [m[2] for m in marks]), max(h + [m[2] for m in marks])
             pad = (hi - lo) * 0.08 or hi * 0.001 or 1
@@ -10738,7 +11680,7 @@ class App:
             p = filedialog.asksaveasfilename(title="Export bot", defaultextension=".json", parent=w,
                                              initialfile=f"{v.name.lower().replace(' ', '-')}-bot.json", filetypes=[("Bot file", "*.json")])
             if p:
-                rows = [dict(r, bar_minutes=self.session_bar) for r in self.tourn.board() if r["v"] is v]
+                rows = self.board_rows_of([v])
                 E.save_bots_file(p, E.export_bots(rows, self.version))
                 self.write(f"Exported {title} to {p}")
 
@@ -10748,7 +11690,7 @@ class App:
 
         def size(d):
             v.size_mult = round(min(max(v.size_mult + d, 0.25), 3.0), 2)
-            self.tourn._rate()
+            T._rate()
             self.refresh_board()
             self.write(f"{title} trade size is now {v.size_mult:.2f}x.")
         ttk.Button(b, text="Export this bot...", command=export_one).pack(side="left")
@@ -10756,7 +11698,7 @@ class App:
         ttk.Button(b, text="Backtest...", command=lambda: self.open_backtest(v)).pack(side="left", padx=(6, 0))
         ttk.Button(b, text="Add to Hall of Fame", command=to_hof).pack(side="left", padx=6)
         ttk.Button(b, text="Catch!", style="Accent.TButton", command=lambda: self.catch_rows(
-            [r for r in self.tourn.board() if r["v"] is v], "detail card")).pack(side="left", padx=(0, 6))
+            self.board_rows_of([v]), "detail card")).pack(side="left", padx=(0, 6))
         ttk.Button(b, text="Size -", command=lambda: size(-0.25)).pack(side="left")
         ttk.Button(b, text="Size +", command=lambda: size(0.25)).pack(side="left", padx=(4, 0))
         ttk.Button(b, text="Show on main chart", command=lambda: (
@@ -10938,7 +11880,9 @@ class App:
 
         def work():
             try:
-                picks = E.scout_coins(E.list_products(self.cur_quote()), int(self.settings["auto_coins"]))
+                why = {}
+                picks = E.scout_coins(E.list_products(self.cur_quote()), int(self.settings["auto_coins"]), why=why)
+                self._scout_why = why
                 self.q.put(("scouted", (picks, None)))
             except Exception as e:
                 self.q.put(("scouted", ([], str(e))))
@@ -10952,7 +11896,8 @@ class App:
             for c, v in self.coin_vars.items():
                 v.set(False)
             self.add_coins(picks)
-            self.write(f"The bot picked {', '.join(picks)}.", "good")
+            why = getattr(self, "_scout_why", {}) or {}
+            self.write(f"The bot picked {', '.join(picks)}." + "".join(f" {c}: {why[c]}." for c in picks if c in why), "good")
         self._scouted = True
         self.toggle()
 

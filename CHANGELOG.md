@@ -1,5 +1,31 @@
 # Changelog
 
+## 1.22.0
+Everything from OBF's latest updates that fits a crypto app.
+- **Only proven bots trade the account.** Your practice account and LIVE only follow bots with a real track record:
+  at least 8 finished trades, a full scoring window on the farm, money made over their lifetime and more than just
+  holding, and passed exams on stretches they never trained on. Shaky and new bots get no say; among the proven
+  ones, the best lifetime records get the biggest say (up to 3x). Everything else keeps training on its own pretend
+  money. Settings > Wildcard to change it; bots you pick for My team or Hall of Fame only aren't held back.
+- **Exams**: Free roam's self-tests now count as exams when they're on the farm's own candles (1-minute candles were
+  added to Free roam for that), and they examine the winners and top bots that haven't proven themselves first.
+- **An alert when no bot may trade**: an amber bar under the top line, with what the closest bots still need, and
+  How to train them (a short guide with a button for each step).
+- **New tabs**: Overview (every farm at a glance, with tiles for what they're learning), Bot positions (each bot's
+  own pretend holdings, with a total) and Success (how every bot is doing: live, lifetime, Free roam tests and exams,
+  with Save to Library, Add to Hall of Fame, Add to my Bot Farm and Details for the bots you pick).
+- **Reports for Claude**: Tools > Export a report for Claude... (also on the Overview), and Export a detailed report
+  (every bot's recent trades, the price feed's gaps, errors and automatic checks). No keys or account numbers.
+- **Fix: Slow farm bots couldn't be added to the Hall of Fame** (or saved, added to your team or exported from their
+  card): those actions only looked on the Bot Farm and still said they'd worked. Their detail cards now show their own
+  farm's figures.
+- **Default practice money**: a Default box next to Practice money.
+- **Resetting the practice account** also closes the bots' own pretend holdings (without changing their records), and
+  a restarted farm keeps its last prices.
+- **Charts fill their holes**: if prices stop for a while, the missing candles are fetched from Coinbase's history.
+- **Bot picks**: today's move counts up to 3x (so a thin coin with a wild move can't outweigh everything), one place
+  is kept for BTC or ETH, and the log says why each coin was picked.
+
 ## 1.21.0
 - **What learning is worth**: Free roam now measures what each learning switch in Settings is worth. About one study
   in seven, the same practice farm lives through the same stretch twice, with one switch on and then off (same bots,
