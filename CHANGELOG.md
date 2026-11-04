@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.21.0
+- **What learning is worth**: Free roam now measures what each learning switch in Settings is worth. About one study
+  in seven, the same practice farm lives through the same stretch twice, with one switch on and then off (same bots,
+  same luck), and its best bots, picked by how they trained, sit an exam on prices they never saw. Each switch builds
+  up a record and gets a verdict once the difference is steady: helps, hurts, leans one way, or no clear effect. The
+  bar is high on purpose: with about 30 switches, a few will look good by luck. Switches a practice farm never uses
+  are marked as such instead of "no effect". See Free roam > What learning is worth, or Tools > What learning is
+  worth. Nothing is changed for you; turn the tests off in Settings > Learning.
+
 ## 1.20.5
 - **Free roam downloads much less**: each stretch of history it downloads is now studied 3 times before it
   fetches a new one (Settings > Learning, "Free roam studies each stretch..."; 1 = always new). Only the first

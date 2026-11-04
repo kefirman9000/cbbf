@@ -186,6 +186,8 @@ SETTING_GROUPS = [
         ("roam_reuse", "Free roam studies each stretch of history it downloads this many times before downloading a "
                        "new one (1 = always new). Only the first visit can promote bots (exams, graduates); repeat "
                        "visits only teach", int),
+        ("feature_tests", "Free roam tests what each kind of learning is worth: the same practice farm with one switch on, "
+                          "then off (results: Free roam > What learning is worth). Nothing is changed for you", bool),
     ]),
     ("Library & Hall of Fame", "The Bot Library keeps every bot you save, plus long-term winners the farm saves for you. "
                                "The Hall of Fame holds only the bots you promote yourself (right-click a bot).", [
@@ -1696,6 +1698,7 @@ class App:
         m = tk.Menu(bar, tearoff=0)
         m.add_command(label="Learning: backtests, Training camp, Free roam...", command=self.open_learning, accelerator="Ctrl+L")
         m.add_command(label="Insights: market context, calendar, report, replay...", command=self.open_insights)
+        m.add_command(label="What learning is worth (feature tests)...", command=self.open_learning_report)
         m.add_separator()
         m.add_command(label="Bot Library...", command=self.open_collection, accelerator="Ctrl+B")
         m.add_command(label="Hall of Fame...", command=self.open_hof, accelerator="Ctrl+H")
@@ -5274,6 +5277,128 @@ class App:
     # ---------------- free roam (self-study) ----------------
     ROAM_CANDLES = (300, 900, 3600, 21600, 86400)  # 5 min to 1 day: the farm picks one each study
 
+    # ---------------- feature tests: what each kind of learning is worth ----------------
+    @staticmethod
+    def learning_switches():
+        """The on/off learning switches from Settings (Wildcard and Learning) a feature test can try."""
+        return [f[0] for g, _, fields in SETTING_GROUPS if g in ("Wildcard", "Learning") for f in fields
+                if f[0] and f[2] is bool]
+
+    @staticmethod
+    def switch_label(key):
+        """A short name for a learning switch: its Settings text up to the first colon."""
+        text = next((f[1] for f in SETTING_FIELDS if f[0] == key), key)
+        head = text.split(":")[0] if ":" in text[:60] else text
+        return head if len(head) <= 70 else head[:67].rstrip() + "..."
+
+    def _roam_features(self, t):
+        """Feature test: the same practice farm lives through the same stretch twice, with one learning switch on and
+        then off, and its best bots (by training) sit an exam on prices they never saw. The difference goes into the
+        feature book, which the 'What learning is worth' report reads. Settings are never changed."""
+        import random as _r
+        rng = _r.Random()
+        book = self.__dict__.setdefault("roam_features", {})
+        key = E.pick_feature(E.feature_candidates(self.settings, self.learning_switches()), book, rng)
+        if not key:  # every switch is off: nothing to compare
+            return self._roam_check(t)
+        closes, extra, info = self._roam_pick(rng, 700)
+        lead = t.active[:4] or t.vars[:4]
+        seeds = [E._genes(v) for v in lead]
+        label = self.switch_label(key)
+        self.roam_now = dict(info, kind="Feature test", phase="study", text=f"Testing what '{label}' is worth",
+                             bots=[], done=0, total=1, t0=time.time())
+        cur = self.roam_now  # this study's own status (a newer study replaces self.roam_now)
+        self.roam_feed.append(dict(kind="sep", text=f"Feature test ({label}) on {self._when(info['start'], True)} to "
+                                                    f"{self._when(info['end'], True)}  ({E.fmt_bar(info['gran'] / 60)} candles)"))
+        fee, slip = E.cost_model(self.settings)
+
+        def prog(done, total, text):
+            cur.update(done=done, total=total, text=f"{label}: {text}")
+        r = E.feature_test(closes, extra, dict(self.settings), key, E.tournament_opts, seed=rng.randrange(1 << 30),
+                           progress=prog, cap=20, passes=1, exam_frac=0.25, seed_genes=seeds, start_cash=self.start_cash,
+                           fee=fee, pct=self.settings["trade_pct"] / 100, evolve=int(self.settings["evolve_every"]),
+                           params=self.settings["params"], stop=lambda: self.tourn is not t or not self.cfg.get("roam_on"))
+
+        def apply():
+            judged = E.record_feature(book, key, r["on"], r["off"])
+            fv = E.feature_verdict(book.get(key))
+            if judged:
+                summary = (f"{label}: the farm's picks did {r['on'] * 100:+.1f}% with it and {r['off'] * 100:+.1f}% without, "
+                           f"vs holding, on prices they hadn't seen. After {fv['n']} test(s): "
+                           f"{E.FEATURE_VERDICT_TEXT[fv['verdict']].split(':')[0].lower()}")
+            else:
+                summary = f"{label}: couldn't be judged this time (one run's picks hardly traded)"
+            rec = dict(time=time.time(), kind="Feature test", revisit=bool(info.get("revisit")), start=info["start"],
+                       end=info["end"], gran=info["gran"], bars=info["bars"], hold=round(info["hold"] * 100, 2),
+                       mood=info["mood"], results=[], feature=key, on=r["on"], off=r["off"], summary=summary)
+            self._roam_finish(rec, cur)
+        self.q.put(("call", apply))
+
+    def feature_rows(self):
+        """One row per learning switch for the report: (key, label, verdict dict), most useful first."""
+        book = getattr(self, "roam_features", None)
+        if book is None:
+            book = dict((E.load_json(self.roam_path(), {}) or {}).get("features") or {})
+        keys = list(dict.fromkeys(E.feature_candidates(self.settings, self.learning_switches()) + list(book)))
+        order = {"helps": 0, "leans helps": 1, "no clear effect": 2, "testing": 3, "leans hurts": 4, "hurts": 5, "unused": 6}
+        rows = [(k, self.switch_label(k), E.feature_verdict(book.get(k))) for k in keys]
+        return sorted(rows, key=lambda x: (order[x[2]["verdict"]], -(x[2]["mean"] or 0), x[1]))
+
+    def build_feature_report(self, parent):
+        """The 'What learning is worth' table, inside `parent`. -> a function that refreshes it."""
+        tk.Label(parent, bg=BG, fg=MUTED, justify="left", wraplength=900, anchor="w", text=(
+            "Free roam tests the learning switches one at a time: the same practice farm lives through the same stretch "
+            "twice, with the switch on and then off, and its best bots (picked by how they trained, as the farm would "
+            "pick them) sit an exam on prices they never saw. 'With vs without' is how much better (+) or worse (-) "
+            "those picks did with it on, in % points, on average. A verdict needs at least 4 tests and a steady "
+            "difference, because with about 30 switches a few will look good by luck alone. Nothing is changed for "
+            "you: switch things off in Settings > Learning if you decide to.")).pack(fill="x", pady=(6, 4))
+        box = tk.Frame(parent, bg=BG)
+        box.pack(fill="both", expand=True)
+        tree = self.make_tree(box, ("what", "n", "diff", "why"), (330, 60, 120, 470),
+                              ("Learning", "Tests", "With vs without", "Verdict"))
+        tree.configure(height=16)
+        tree.column("what", anchor="w")
+        tree.tag_configure("good", foreground=GREEN)
+        tree.tag_configure("bad", foreground=RED)
+        tree.tag_configure("dim", foreground=MUTED)
+        note = tk.Label(parent, bg=BG, fg=MUTED, anchor="w", justify="left", wraplength=900)
+        note.pack(fill="x", pady=(4, 0))
+
+        def fill():
+            tree.delete(*tree.get_children())
+            rows = self.feature_rows()
+            for key, label, fv in rows:
+                v = fv["verdict"]
+                tag = "good" if v in ("helps", "leans helps") else "bad" if v in ("hurts", "leans hurts") else \
+                    "dim" if v in ("testing", "unused") else ""
+                tree.insert("", "end", values=(label, fv["n"], "-" if fv["mean"] is None else f"{fv['mean']:+.2f} pts",
+                                               E.FEATURE_VERDICT_TEXT[v]), tags=(tag,))
+            done = sum(fv["n"] for _, _, fv in rows)
+            on = self.cfg.get("roam_on") and self.settings.get("feature_tests", True)
+            note.config(text=(f"{done} feature tests so far. " + (
+                "They run as part of Free roam, about one study in seven." if on else
+                "They run as part of Free roam: switch Free roam on (and 'Free roam tests what each kind of learning is "
+                "worth' in Settings > Learning) to add more.")))
+        fill()
+        return fill
+
+    def open_learning_report(self):
+        w = tk.Toplevel(self.root)
+        w.title("What learning is worth")
+        w.configure(bg=BG)
+        f = tk.Frame(w, bg=BG, padx=14, pady=10)
+        f.pack(fill="both", expand=True)
+        tk.Label(f, text="What each kind of learning is worth", bg=BG, fg=TEXT, font=("", 13, "bold")).pack(anchor="w")
+        fill = self.build_feature_report(f)
+        ttk.Button(f, text="Close", command=w.destroy).pack(anchor="e", pady=(8, 0))
+
+        def tick():
+            if w.winfo_exists():
+                fill()
+                w.after(15000, tick)
+        w.after(15000, tick)
+
     def roam_path(self):
         return os.path.join(E.HOME_DIR, "free-roam.json")
 
@@ -5285,6 +5410,7 @@ class App:
             return
         saved = E.load_json(self.roam_path(), {}) or {}
         self.roam_log = list(saved.get("log") or [])[-300:]
+        self.roam_features = dict(saved.get("features") or {})  # learning switch -> [[with, without, when], ...]
         self.roam_n = int(saved.get("n", len(self.roam_log)))
         self.roam_now = None
         self.roam_err = None
@@ -5303,7 +5429,9 @@ class App:
                     if time.time() - getattr(self, "_roam_last", 0) < wait:
                         continue
                     k += 1
-                    if k % 3 == 0:
+                    if self.settings.get("feature_tests", True) and k % 7 == 6:
+                        self._roam_features(t)
+                    elif k % 3 == 0:
                         self._roam_camp(t)
                     else:
                         self._roam_check(t)
@@ -5458,7 +5586,7 @@ class App:
         if cur is None or self.roam_now is cur:  # a newer study may already be under way: leave its status alone
             self.roam_now = None
         try:
-            E.save_json(self.roam_path(), dict(n=self.roam_n, log=self.roam_log))
+            E.save_json(self.roam_path(), dict(n=self.roam_n, log=self.roam_log, features=getattr(self, "roam_features", {})))
         except OSError:
             pass
 
@@ -5704,6 +5832,9 @@ class App:
         nb.add(t1, text="  Bots it tested: best to worst  ")
         nb.add(t2, text="  Study log  ")
         nb.add(t3, text="  What the results do  ")
+        t4 = tk.Frame(nb, bg=BG)
+        nb.add(t4, text="  What learning is worth  ")
+        fill_feats = self.build_feature_report(t4)
         bots = self.make_tree(t1, ("who", "n", "wins", "avg", "best", "worst", "mode", "why"),
                               (130, 50, 90, 90, 70, 70, 90, 420),
                               ("Bot", "Tests", "Made money", "Avg return", "Trades", "Win rate", "Best trade", "Worst trade", "Now",
@@ -5715,7 +5846,7 @@ class App:
         fr.pack(fill="x", pady=(4, 2))
         tk.Label(fr, text="Show", bg=BG, fg=MUTED).pack(side="left")
         flt = tk.StringVar(value="All")
-        ttk.Combobox(fr, textvariable=flt, values=["All", "Good finds", "Bad results", "Self-tests", "Practice farms"],
+        ttk.Combobox(fr, textvariable=flt, values=["All", "Good finds", "Bad results", "Self-tests", "Practice farms", "Feature tests"],
                      state="readonly", width=14).pack(side="left", padx=6)
         lb = tk.Frame(t2, bg=BG)
         lb.pack(fill="both", expand=True)
@@ -5786,12 +5917,15 @@ class App:
                 st["n"], st["flt"] = len(L_), flt.get()
                 fill_log()
                 fill_bots()
+                fill_feats()
             w.after(500, paint)
 
         def verdict(r):
             res = r.get("results") or []
             if r["kind"] == "Practice farm":
                 return "good" if r.get("passed") else "bad"
+            if r["kind"] == "Feature test":
+                return "mixed"  # a measurement, not a find
             good = sum(1 for x in res if self.roam_result(r, x)["ret"] > 0)
             return "good" if good * 2 > len(res) else "bad" if good == 0 else "mixed"
 
@@ -5801,7 +5935,8 @@ class App:
             for r in reversed(self.roam_log[-300:]):
                 v_ = verdict(r)
                 if (f_ == "Good finds" and v_ != "good") or (f_ == "Bad results" and v_ != "bad") or \
-                        (f_ == "Self-tests" and r["kind"] != "Self-test") or (f_ == "Practice farms" and r["kind"] != "Practice farm"):
+                        (f_ == "Self-tests" and r["kind"] != "Self-test") or (f_ == "Practice farms" and r["kind"] != "Practice farm") or \
+                        (f_ == "Feature tests" and r["kind"] != "Feature test"):
                     continue
                 ex = r["summary"] + (":  " + ",  ".join(f"{x['name']} {x['ret']:+.1f}%" for x in (self.roam_result(r, x) for x in r.get("results", [])[:4]))
                                      if r.get("results") else "")

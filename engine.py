@@ -3,6 +3,7 @@ historical candles and local storage. No GUI code lives here."""
 import bisect
 import csv
 import json
+import math
 import threading
 import os
 import importlib
@@ -150,6 +151,110 @@ def clamp_tf(tf):
     except (TypeError, ValueError):
         return 1
     return min(TIMEFRAMES, key=lambda t: abs(t - tf))
+
+
+# ---------------- feature tests: what each kind of learning is worth ----------------
+FEATURE_KEEP = 40      # results kept per learning switch
+FEATURE_MIN = 4        # tests before a verdict
+FEATURE_CLEAR = 2.5    # how convincing a clear verdict must be (high: ~30 switches are tested, so some look good by luck)
+FEATURE_LEAN = 1.5
+# switches that act outside practice farms (Free roam's hindsight studies, live trading, exams from Free roam):
+# a practice farm can't show what they're worth, so they're not tested this way
+FEATURE_SKIP = {"hindsight", "prove_live", "exam_gate"}
+
+
+def feature_candidates(settings, keys):
+    """The learning switches (from `keys`) that are on and actually change how a practice farm learns."""
+    base = tournament_opts(settings)
+    out = [k for k in keys if k not in FEATURE_SKIP and settings.get(k) is True
+           and tournament_opts(dict(settings, **{k: False})) != base]
+    tournament_opts(settings)  # (it also sets a few shared values: put them back)
+    return out
+
+
+def pick_feature(cands, book, rng):
+    """The switch tested least so far (ties at random), so every switch gets its turn."""
+    live = [k for k in cands if feature_verdict(book.get(k))["verdict"] != "unused"] or cands  # (no turns for unused)
+    if not live:
+        return None
+    n = {k: len(book.get(k) or []) for k in live}
+    low = min(n.values())
+    return rng.choice([k for k in live if n[k] == low])
+
+
+def farm_pick_score(res, top=5):
+    """How a practice farm's own picks did on prices they never saw: the mean exam edge over holding of its top
+    `top` bots, ranked by TRAINING results the way the farm itself would choose them (ranking them by the exam
+    would let luck on the exam pick the winners). None if too few of them traded."""
+    rs = [r for r in res.get("results") or [] if r.get("exam_edge") is not None and (r.get("trades") or 0) >= 3]
+    rs.sort(key=lambda r: -(r["train_edge"] if r.get("train_edge") is not None else (r.get("train_ret") or 0)))
+    rs = rs[:top]
+    return sum(r["exam_edge"] for r in rs) / len(rs) if len(rs) >= 2 else None
+
+
+def feature_test(closes, extra, settings, key, make_opts, seed=None, progress=None, **train_kw):
+    """Runs the same practice farm twice on the same stretch, from the same seed bots and random seed: once as the
+    settings are, once with `key` switched off. -> dict(key, on, off) (exam scores, see farm_pick_score), with
+    on/off None when that run's picks didn't trade enough to judge."""
+    out = dict(key=key)
+    for i, (arm, s) in enumerate((("on", settings), ("off", dict(settings, **{key: False})))):
+        def prog(done, total, text, i=i):
+            if progress:
+                progress(i * total + done, 2 * total, f"run {i + 1} of 2 ({'with' if i == 0 else 'without'} it): {text}")
+        res = train_farm(closes, extra, make_opts(s), seed=seed, progress=prog, **train_kw)
+        out[arm] = farm_pick_score(res)
+    make_opts(settings)  # (put the shared values back)
+    return out
+
+
+def record_feature(book, key, on, off, when=None, keep=FEATURE_KEEP):
+    """Adds one paired result to the feature book (plain data, saved with Free roam). False if it couldn't be judged."""
+    if on is None or off is None:
+        return False
+    rows = book.setdefault(key, [])
+    rows.append([round(on, 6), round(off, 6), int(when or time.time())])
+    del rows[:-keep]
+    return True
+
+
+def feature_verdict(rows):
+    """-> dict(n, mean, t, verdict) for one switch. mean: how much better (+) or worse (-) the farm's picks did on
+    their exam with it on than off, in % points. verdict: 'testing' (too few tests), 'helps', 'hurts',
+    'leans helps', 'leans hurts', 'no clear effect', or 'unused' (it never made the slightest difference: practice
+    farms don't seem to use it)."""
+    d = [(a - b) * 100 for a, b, *_ in rows or []]
+    n = len(d)
+    if n == 0:
+        return dict(n=0, mean=None, t=None, verdict="testing")
+    mean = sum(d) / n
+    sd = (sum((x - mean) ** 2 for x in d) / (n - 1)) ** 0.5 if n > 1 else 0.0
+    t = mean / sd * n ** 0.5 if sd > 1e-12 else (0.0 if abs(mean) < 1e-12 else math.copysign(9.9, mean))
+    if n < FEATURE_MIN:
+        v = "testing"
+    elif all(abs(x) < 1e-9 for x in d):
+        v = "unused"
+    elif t >= FEATURE_CLEAR:
+        v = "helps"
+    elif t <= -FEATURE_CLEAR:
+        v = "hurts"
+    elif t >= FEATURE_LEAN:
+        v = "leans helps"
+    elif t <= -FEATURE_LEAN:
+        v = "leans hurts"
+    else:
+        v = "no clear effect"
+    return dict(n=n, mean=round(mean, 2), t=round(t, 2), verdict=v)
+
+
+FEATURE_VERDICT_TEXT = {
+    "helps": "Helps: the farm picks better bots with it",
+    "hurts": "Hurts: the farm picks better bots without it",
+    "leans helps": "Leans helps: looks useful, needs more tests to be sure",
+    "leans hurts": "Leans hurts: looks costly, needs more tests to be sure",
+    "no clear effect": "No clear effect so far",
+    "testing": "Still testing",
+    "unused": "Not used by practice farms (it never changed a result), so it can't be measured this way",
+}
 
 
 # ---------------- Free roam: reuse downloaded history ----------------
@@ -991,6 +1096,7 @@ DEFAULT_SETTINGS = {
     "free_roam": False,          # when the farm is idle, it backtests its own bots and runs small training camps by itself
     "free_roam_running": False,  # ...also while the bot runs (uses a little more computer power and network)
     "roam_reuse": 3,             # Free roam studies each downloaded stretch this many times before fetching a new one
+    "feature_tests": True,       # Free roam tests what each learning switch is worth (reported, never changed for you)
     "slow_trades_account": False,  # the slow farm (hourly candles) may also trade your account
     "slow_size": 30,             # bots on the slow farm
     "coin_prefs": True,          # bots learn which coins they're bad at and skip them (re-checked in hindsight)
