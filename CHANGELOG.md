@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.22.1
+- **Donate button**: a pink **Donate** button in the top right (and Tools > Donate) opens CBBF's GitHub Sponsors page.
+  CBBF stays free; donations pay for new breeds, new tricks and more time to build them.
+- **Fix: "no history" isn't a crash any more.** When Free roam finds nothing to study (a holiday, a gap in the
+  data) it notes it and moves on, instead of adding an entry to crash.log and the error counter.
+- **New README and screenshots**: the page now explains how the farm trains, breeds and tests its dragons, with
+  fresh dark-mode screenshots of the farm, the BEASTS den, Overview, a dragon's card, Free roam, Bloodlines, the Library,
+  Portfolio, Bot positions and Success.
+
 ## 1.22.0
 Everything from OBF's latest updates that fits a crypto app.
 - **Only proven bots trade the account.** Your practice account and LIVE only follow bots with a real track record:

@@ -64,6 +64,7 @@ import engine as E
 
 # ---- Update settings: change to your GitHub "user/repo" after publishing ----
 UPDATE_REPO = "kefirman9000/cbbf"
+DONATE_URL = "https://github.com/sponsors/kefirman9000"  # the Donate button (top right)
 HERE = os.path.dirname(os.path.abspath(__file__))
 APP_SHORT = "CBBF"
 CONFIG_PATH = os.path.join(E.HOME_DIR, "config.json")
@@ -1329,10 +1330,16 @@ class App:
         self.kill_btn.pack(side="left", padx=(6, 0))
         Tip(self.kill_btn, "Kill switch: stops the bot, cancels waiting orders, sells everything at market and locks LIVE "
                            "mode until you unlock it.")
+        self.donate_btn = tk.Button(header, text="\u2665 Donate", command=lambda: webbrowser.open(DONATE_URL),
+                                    relief="flat", bd=0, bg="#db2777", fg="white", activebackground="#be185d",
+                                    activeforeground="white", padx=12, pady=3, cursor="hand2", font=("", 9, "bold"))
+        self.donate_btn.pack(side="right", padx=(0, 14))  # packed first, so it sits in the top-right corner
+        Tip(self.donate_btn, "CBBF is free and made in spare time. Donations (GitHub Sponsors) pay for new breeds, new "
+                             "tricks and more time to build them. Opens in your browser.")
         self.theme_btn = tk.Button(header, text="Light mode" if DARK else "Dark mode", command=lambda: self.set_dark(not DARK),
                                    relief="flat", bd=0, bg=LINE, fg=TEXT, activebackground=LINE, activeforeground=TEXT,
                                    padx=10, pady=3, cursor="hand2")
-        self.theme_btn.pack(side="right", padx=(0, 14))
+        self.theme_btn.pack(side="right", padx=(0, 8))
         self.mute_btn = tk.Button(header, text="\u266a off" if self.cfg.get("muted") else "\u266a", command=self.toggle_mute,
                                   relief="flat", bd=0, bg=CARD, fg=TEXT, activebackground=CARD, cursor="hand2", font=("", 11))
         self.mute_btn.pack(side="right", padx=(0, 8))
@@ -1750,6 +1757,7 @@ class App:
         m.add_command(label="Install add-ons (setup)...", command=self.open_setup)
         m.add_separator()
         m.add_command(label="Check for updates", command=self.check_update)
+        m.add_command(label="Donate (GitHub Sponsors)...", command=lambda: webbrowser.open(DONATE_URL))
         m.add_command(label="Undo last update", command=self.undo_update)
         m.add_separator()
         m.add_command(label="Export a report for Claude...", command=self.export_report)
@@ -6166,6 +6174,10 @@ class App:
                     self._roam_last = time.time()
                 except E.TrainingStopped:  # the farm changed (reset, new session): just move on
                     self.roam_now = None
+                except E.NoHistory as e:  # nothing to study there (a holiday, a gap in the data): not a crash
+                    self.roam_now = None
+                    self.roam_err = (time.time(), str(e))
+                    self._roam_last = time.time() - max(0, self.roam_wait() - 60)
                 except Exception as e:
                     self.roam_now = None
                     msg = str(e) or e.__class__.__name__
