@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.23.0
+- **Proven bots are reachable now.** Almost no bot ever earned a vote, so the account never traded. Two reasons:
+  bots were replaced faster than they could finish a record (about half the farm in two hours), and trades from Free
+  roam's exams didn't count. Now:
+  - Trades a bot makes in its exams (days it never trained on) count toward the finished trades it needs.
+  - Bots on course to earn a vote (passed exams, or exams so far positive and not behind holding) aren't retired or
+    dropped to make room, up to a third of the farm, so they live long enough to finish their record.
+  - The rules themselves are unchanged: exams, lifetime profit and beating just holding are still required.
+
 ## 1.22.1
 - **Donate button**: a pink **Donate** button in the top right (and Tools > Donate) opens CBBF's GitHub Sponsors page.
   CBBF stays free; donations pay for new breeds, new tricks and more time to build them.

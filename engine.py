@@ -295,6 +295,11 @@ EXAM_KEEP = 12   # exams remembered per bot
 EXAM_MIN = 3     # exams needed before a verdict
 
 
+def exam_trades(v):
+    """Trades a bot made in its exams (Free roam tests and day replays on days it never trained on)."""
+    return sum(int(x.get("n", 0) or 0) for x in (getattr(v, "exams", None) or []) if isinstance(x, dict))
+
+
 def add_exam(v, kind, edge, n, when=None, gran=None):
     """Records one exam (edge: % result on unseen prices, vs the market where there is one; n: its trades; gran: the
     candle size it was tested on, which is always the candle size it lives on)."""
@@ -2843,12 +2848,45 @@ class Tournament:
         """Still within its first window of decisions: too new to judge, so never dropped to make room."""
         return self.score(v) is None and v.age < self.window_for(v.tf)
 
+    def contender(self, v):
+        """How close this bot is to earning a vote, or None when it isn't on course: it passed its exams, or its
+        exams so far are positive and it isn't behind just holding. Bigger = closer."""
+        if v.origin == "team":
+            return None
+        verdict, d = exam_verdict(v, self.serial)
+        if verdict == "failed" or not d.get("k"):
+            return None
+        lf = self.life(v)
+        if verdict == "passed":
+            return 10.0 + (d.get("score") or 0.0)
+        if (d.get("mean") or 0) <= 0 or (lf["edge"] is not None and lf["edge"] < 0):
+            return None
+        return float(d.get("mean") or 0.0) + 0.1 * (v.wins + v.losses + exam_trades(v))
+
+    def protected(self):
+        """Bots on course to earn a vote, kept off the retirement and make-room lists so they live long enough to
+        finish their record (at most a third of the farm, closest first, so the farm keeps evolving)."""
+        key = (self.n, len(self.vars), self.serial)
+        if getattr(self, "_prot_key", None) == key:
+            return self._prot
+        if not self.o.get("proven_only", True):
+            out = set()
+        else:
+            c = [(self.contender(v), v) for v in self.vars]
+            c = sorted(((x, v) for x, v in c if x is not None), key=lambda xv: -xv[0])
+            out = {id(v) for _, v in c[:max(1, self.cap // 3)]}
+        self._prot_key, self._prot = key, out
+        return out
+
     def weakest(self):
         """Who goes first when room is needed, as (bot, score) pairs: bots that have had a full window and still
         can't be scored (they hardly trade) first, then the scored ones from the bottom of the ranking. Bots too young
-        to judge are left alone, so new eggs get their chance and the farm doesn't fill with unjudged eggs."""
-        stuck = sorted((v for v in self.vars if self.score(v) is None and not self.young(v)), key=lambda v: len(v.sim.tbars))
-        return [(v, None) for v in stuck] + list(reversed(self.ranking()))
+        to judge are left alone, so new eggs get their chance and the farm doesn't fill with unjudged eggs, and so are
+        contenders for a vote (see protected)."""
+        keep = self.protected()
+        stuck = sorted((v for v in self.vars if self.score(v) is None and not self.young(v) and id(v) not in keep),
+                       key=lambda v: len(v.sim.tbars))
+        return [(v, None) for v in stuck] + [(v, x) for v, x in reversed(self.ranking()) if id(v) not in keep]
 
     def trim_to_cap(self):
         """Brings an overfull farm back down to its size (bots that can't be judged, then the weakest). -> removed"""
@@ -2899,7 +2937,7 @@ class Tournament:
             return []
         gaps = []
         need = int(self.o.get("proven_trades", 8) or 0)
-        closed = v.wins + v.losses
+        closed = v.wins + v.losses + exam_trades(v)  # trades on days it never trained on count: they're the best evidence
         if closed < need:
             gaps.append(f"{need - closed} more finished trade{'s' if need - closed != 1 else ''}")
         window = self.window_for(v.tf)
@@ -3059,7 +3097,10 @@ class Tournament:
             elif st == "slowed":
                 v.strikes += 0.5
         retired = 0
+        keep = self.protected()
         for v in sorted(self.vars, key=lambda x: -x.strikes):
+            if id(v) in keep:  # on course to earn a vote: let it finish its record
+                continue
             if v.strikes >= self.retire_after and sum(1 for x in self.vars if x.name == v.name) > 1:
                 self._remove(v, "retired (kept losing)")
                 retired += 1
