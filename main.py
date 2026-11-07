@@ -140,6 +140,8 @@ SETTING_GROUPS = [
                           "at once. Stops one bad dragon draining the account. Example: 25 with $1,000 = $250 per bot (0 = no limit)", float),
     ]),
     ("Wildcard", "How the bot treats strategies that are winning, shaky or failing.", [
+        ("keep_veterans", "Keep proven veterans: a bot with 8+ finished trades that made money over its life and beat just "
+                          "holding survives a bad patch (it's benched, not retired) until its lifetime record turns", bool),
         ("proven_only", "Only proven bots trade the account (practice and LIVE): a bot needs a real track record first. "
                         "Every other bot keeps training on its own pretend money", bool),
         ("proven_trades", "...finished trades a bot needs before it may trade the account", int),
@@ -980,7 +982,7 @@ class App:
     def recap_base(self):
         beasts = sum(1 for r in self.tourn.board() if self.tier(r) == "beast") if self.tourn else 0
         return dict(day=date.today().isoformat(), eq=self.equity(), hold=self.bench_equity(), beasts=beasts,
-                    live=bool(self.live))
+                    live=bool(self.live), sid=[float(self.start_cash), sorted(self.session_coins)])
 
     def daily_recap(self):
         """Once a day: how the bots did yesterday against just holding (a note on the icon, and in the log)."""
@@ -990,7 +992,11 @@ class App:
         today = date.today().isoformat()
         if isinstance(base, dict) and base.get("day") == today and base.get("live") == bool(self.live):
             return
+        if not self.last_tick or (datetime.now() - self.last_tick).total_seconds() > 600:
+            return  # no fresh prices (not logged in, offline, market closed): values would be wrong, try later
         now = self.recap_base()
+        if isinstance(base, dict) and base.get("sid") != now["sid"]:
+            base = None  # a different session since (reset, new money or coins): start a fresh recap from here
         if isinstance(base, dict) and base.get("live") == bool(self.live) and base.get("eq"):
             got = (now["eq"] / base["eq"] - 1) * 100
             hold = (now["hold"] / base["hold"] - 1) * 100 if base.get("hold") else 0.0

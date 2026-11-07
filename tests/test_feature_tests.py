@@ -108,5 +108,5 @@ def test_paired_runs_differ_only_by_the_switch():
     base = E.farm_pick_score(E.train_farm(closes, extra, make_opts(S), seed=2, **kw))
     r = E.feature_test(closes, extra, S, "crossbreed", make_opts, seed=2, **kw)
     assert base is not None and r["on"] == base  # the "with it" run is exactly the farm as it is
-    assert r["off"] is not None and r["off"] != r["on"]
+    assert r["off"] != r["on"]  # the "without it" run differs (its picks may even trade too little to score: None)
     assert E.tournament_opts(S) == E.tournament_opts(dict(E.DEFAULT_SETTINGS))  # shared values put back
