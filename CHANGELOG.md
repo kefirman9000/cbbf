@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.24.1
+- **Essentials only button** (top bar, next to Check for updates): one click switches off everything that downloads
+  extra history or works the disk in the background: Free roam, the Slow farm, background exams, the automatic
+  economic calendar refresh and weekly backups. Normal trading and its prices keep running. While it's on, those modes
+  can't start by themselves; starting one by hand asks whether to switch Essentials only off. Click again to allow them.
+
 ## 1.24.0
 - **Limit orders by default**: Coinbase's maker fee is 0.4% instead of 0.6% plus the spread, and fees were most of
   what bot trades lost (the typical trade lost 1.19%, about two market orders' worth). Your setting switches once, with
