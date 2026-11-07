@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.25.0
+- **Auto camp** (the farm toolbar, next to Free roam): while your farm runs, it keeps picking stretches of past prices
+  by itself and runs a practice farm through each one, at most 1,500 farm decisions per stretch (longer stretches are cut
+  to their latest 1,500 candles). After each stretch your farm learns its lessons and the best bot that passed the
+  exam joins your farm. It pauses a minute between stretches, starts OFF each time the app opens, waits while Free
+  roam is on (Free roam runs its own camps), and Essentials only keeps it off.
+
 ## 1.24.2
 - **Reset account button**, like OBF and SBF have: one click puts the account back to its starting money with no
   positions and no trades, and closes the bots' own practice holdings at what they're worth. The farm, its bots and
