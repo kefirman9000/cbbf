@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.24.2
+- **Reset account button**, like OBF and SBF have: one click puts the account back to its starting money with no
+  positions and no trades, and closes the bots' own practice holdings at what they're worth. The farm, its bots and
+  everything they've learned are kept. The old Reset menu is still there as "More reset options".
+
 ## 1.24.1
 - **Essentials only button** (top bar, next to Check for updates): one click switches off everything that downloads
   extra history or works the disk in the background: Free roam, the Slow farm, background exams, the automatic

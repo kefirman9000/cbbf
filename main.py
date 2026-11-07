@@ -1684,7 +1684,11 @@ class App:
         self._new_after = self.btn
         Tip(self.new_btn, "Start a fresh session instead of continuing the saved one. Your trade history stays in the "
                           "Trades tab and trades.csv.")
-        self.reset_btn = ttk.Button(left, text="Reset \u25be", style="Plain.TButton")
+        self.acct_reset_btn = ttk.Button(left, text="Reset account", style="Plain.TButton", command=self.reset_account)
+        self.acct_reset_btn.pack(fill="x", pady=(0, 4))
+        Tip(self.acct_reset_btn, "Puts the account back to its starting money with no positions and no trades. "
+                                 "Your farms, bots and everything they've learned are kept.")
+        self.reset_btn = ttk.Button(left, text="More reset options \u25be", style="Plain.TButton")
         self.reset_btn.configure(command=self.open_reset)
         self.reset_btn.pack(fill="x", pady=(0, 4))
         Tip(self.reset_btn, "Start over: reset the practice account (cash and trades), the farm (fresh eggs), or both. "
@@ -4026,6 +4030,45 @@ class App:
         self.__dict__.pop("tier_seen", None)
         self.refresh_board()
         self.write("The farm was reset: fresh eggs hatch when you press Start.", "good")
+
+    def reset_account(self):
+        """Reset account: starting money again, no positions, no trades. The farm and everything it learned stay."""
+        if self.pending:
+            return messagebox.showinfo("Reset account", "An order is on its way. Try again in a moment.")
+        try:
+            cash = float(self.cash_var.get())
+        except ValueError:
+            cash = self.start_cash or 1000.0
+        name = "LIVE" if self.live else "Practice"
+        msg = (f"Reset the {name} account to ${cash:,.2f}?\n\nOpen positions and the trade list are cleared. "
+               "Your farms, bots and everything they've learned are kept.")
+        if not self.live:
+            msg += "\n\nThe bots' own practice holdings (Bot positions) are closed too, at what they're worth now."
+        if self.session and self.live and any(q > 0 for q in self.pos.values()):
+            msg += ("\n\nThis only resets what CBBF tracks: coins it bought stay on your Coinbase account, and you can "
+                    "sell them there.")
+        if not messagebox.askyesno("Reset account", msg):
+            return
+        self.start_cash = self.cash = cash
+        self.pos, self.cost = {}, {}
+        self.trades, self.curve = [], []
+        self.bench_units, self.high, self.bought_at, self.bot_alloc = {}, {}, {}, {}
+        self.pending_who, self.pending_detail, self.pending_voters = {}, {}, {}
+        self.trade_marks, self.curve_n, self.fees_paid = [], 0, 0.0
+        self.day, self.day_eq, self.halted_day = None, None, None
+        self.shadow_live, self.shadow_curve = None, []
+        self.start_px = dict(self.last) if self.last else {}
+        self.cfg.pop("recap_base", None)  # the daily recap starts over from the new money
+        if self.session:
+            self.save_state(force=True)
+        for fn in (self.refresh_trades, self.update_status, self.refresh_view, self.refresh_board, self.draw_chart):
+            try:
+                fn()
+            except Exception:
+                E.note_error("reset_account")
+        closed = 0 if self.live else self.close_bot_positions()
+        self.write(f"Account reset to ${cash:,.2f}. The farm and its learning are kept"
+                   + (f"; the bots' {closed} open practice holding{'s' if closed != 1 else ''} were closed." if closed else "."))
 
     def reset(self, ask=True):
         if ask and (self.trades or self.pos):
