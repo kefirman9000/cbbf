@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.25.2
+- Fixed: Auto camp's (or the exam pass's) first stretch after the app started could fail with "no attribute roam_log"
+  when Free roam hadn't loaded its study log yet; it then waited 5 minutes before trying again. The log now loads
+  whenever any of them needs it.
+- Auto camp says when a stretch is a repeat visit. Each stretch is studied 3 times (Settings > Learning > Free roam
+  reuse); repeat visits teach your farm, but only a first visit can bring an exam-passing bot over.
+
 ## 1.25.1
 - **Bot picks really picks again.** It only chose coins when a brand-new session started, and CBBF carries on with your
   saved session every time it opens, so the same coins stayed for good. Now:
