@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.25.1
+- **Bot picks really picks again.** It only chose coins when a brand-new session started, and CBBF carries on with your
+  saved session every time it opens, so the same coins stayed for good. Now:
+  - **New picks** (next to Bot picks) scouts fresh coins on the spot. Your whole farm comes along (every bot keeps its
+    genes and lessons; a copy of the old farm is saved too), and the practice account starts again on the new coins.
+  - When Bot picks is on and the coins are 3+ days old, pressing Start offers fresh picks (at most once a day; never for
+    LIVE, never in background mode).
+  - Picks vary more: coins it picked last time count a little less, and a dash of chance breaks near-ties, so the farm
+    gets to learn on new markets. BTC or ETH still keeps one place as the steady market.
+
 ## 1.25.0
 - **Auto camp** (the farm toolbar, next to Free roam): while your farm runs, it keeps picking stretches of past prices
   by itself and runs a practice farm through each one, at most 1,500 farm decisions per stretch (longer stretches are cut

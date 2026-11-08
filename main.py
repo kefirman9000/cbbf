@@ -1703,6 +1703,10 @@ class App:
         ab.pack(side="left", padx=(8, 0))
         Tip(ab, "Wildcard only: when you press Start, the bot scouts Coinbase and trades the busiest coins that are "
                 "actually moving (no stablecoins). How many: Settings > Wildcard.")
+        rb = ttk.Button(crow, text="\u21bb New picks", style="Plain.TButton", command=self.repick_coins)
+        rb.pack(side="left", padx=(8, 0))
+        Tip(rb, "Practice: scout fresh coins now. The whole farm comes along (every bot keeps its genes and lessons); the "
+                "practice account starts again on the new coins. Bot picks also offers this by itself every few days.")
 
         # --- market context card: coins the bots watch but never trade
         f, c = self.card(left, "MARKET CONTEXT (WATCHED)")
@@ -3607,6 +3611,12 @@ class App:
         if (not self.session and not resuming and self.wild_var.get() and int(self.settings.get("auto_coins", 0)) > 0
                 and not getattr(self, "_scouted", False)):
             return self.scout_then_start()
+        if self.repick_due() and messagebox.askyesno(
+                "Bot picks", f"Bot picks chose {', '.join(self.session_coins)} "
+                f"{self.picked_age_text()}. Scout fresh coins now?\n\nYour whole farm comes along (every bot keeps its "
+                "genes and lessons); the practice account starts again with fresh money on the new coins.\n\n"
+                "No = carry on with the same coins (it asks again in a few days)."):
+            return self.repick_coins(ask=False)
         self._scouted = False
         if self.session:
             coins = self.session_coins
@@ -12210,24 +12220,87 @@ class App:
 
     # ---------------- bot picks coins ----------------
     def scout_then_start(self):
-        self.write(f"Scouting Coinbase for {self.settings['auto_coins']} busy coins that are moving...")
+        n_pick = max(2, int(self.settings.get("auto_coins") or self.cfg.get("last_auto_coins", 4) or 4))
+        self.write(f"Scouting Coinbase for {n_pick} busy coins that are moving...")
         self.btn.config(state="disabled")
 
         def work():
             try:
                 why = {}
-                picks = E.scout_coins(E.list_products(self.cur_quote()), int(self.settings["auto_coins"]), why=why)
+                recent = {c for p_ in (self.cfg.get("pick_history") or [])[:2] for c in p_}
+                picks = E.scout_coins(E.list_products(self.cur_quote()), n_pick, why=why, recent=recent)
                 self._scout_why = why
                 self.q.put(("scouted", (picks, None)))
             except Exception as e:
                 self.q.put(("scouted", ([], str(e))))
         threading.Thread(target=work, daemon=True).start()
 
+    REPICK_DAYS = 3
+
+    def picked_age_text(self):
+        t = float(self.cfg.get("picked_at", 0) or 0)
+        if not t:
+            return "a while ago"
+        d = (time.time() - t) / 86400
+        return "today" if d < 1 else f"{d:.0f} day{'s' if d >= 1.5 else ''} ago"
+
+    def repick_due(self):
+        """Bot picks is on, a practice session is paused on its old picks for a few days: offer fresh coins (asked at
+        most once a day, never for LIVE, never while starting quietly in the background)."""
+        if (not self.session or self.live or self.running or int(self.settings.get("auto_coins", 0) or 0) <= 0
+                or not self.wild_var.get() or getattr(self, "_auto_resume", False) or self.tray_hidden()):
+            return False
+        if time.time() - float(self.cfg.get("picked_at", 0) or 0) < self.REPICK_DAYS * 86400:
+            return False
+        today = date.today().isoformat()
+        if self.cfg.get("repick_asked") == today:
+            return False
+        self.cfg["repick_asked"] = today
+        return True
+
+    def repick_coins(self, ask=True):
+        """Bot picks, again: fresh coins for a new practice session, with the whole farm carried over."""
+        if self.live or self.mode_var.get() == "live":
+            return messagebox.showinfo("New picks", "New picks is for Practice. For LIVE, sell what you hold, then start a "
+                                                    "new session with the coins you want.")
+        if self.pending:
+            return messagebox.showinfo("New picks", "An order is on its way. Try again in a moment.")
+        if ask and not messagebox.askyesno(
+                "New picks", "Scout fresh coins now?\n\nYour whole farm comes along (every bot keeps its genes and "
+                "lessons); the practice account starts again with fresh money on the new coins."):
+            return
+        t = self.tourn or (self.load_farm() if self.session else None)
+        carry = []
+        if t is not None and t.vars:
+            try:
+                t._rate()
+                rows = t.board()[:int(self.settings.get("max_bots", 60))]
+                carry = E.export_bots(rows, self.version, note="carried to new coins")["bots"]
+            except Exception:
+                E.note_error("repick_coins")
+            if carry:
+                self.save_farm_copy()  # (the old farm, just in case: More reset options > Bring back a saved farm)
+        if self.running:
+            self.toggle()
+        self.reset(ask=False)
+        if carry:
+            self.cfg["carry_bots"] = carry
+        if int(self.settings.get("auto_coins", 0) or 0) <= 0:
+            self.auto_coin_var.set(True)
+            self.toggle_auto_coins()
+        self.wild_var.set(True)
+        E.save_json(CONFIG_PATH, self.cfg)
+        self.write(f"New picks: scouting fresh coins; {len(carry)} bots come along to the new session.", "good")
+        self.scout_then_start()
+
     def on_scouted(self, picks, err):
         self.btn.config(state="normal")
         if err or not picks:
             self.write(f"Couldn't scout coins ({err or 'nothing liquid enough'}). Using your ticked coins.", "warn")
         else:
+            self.cfg["picked_at"] = time.time()
+            self.cfg["pick_history"] = ([list(picks)] + list(self.cfg.get("pick_history") or []))[:3]
+            E.save_json(CONFIG_PATH, self.cfg)
             for c, v in self.coin_vars.items():
                 v.set(False)
             self.add_coins(picks)

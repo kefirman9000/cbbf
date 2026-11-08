@@ -3512,16 +3512,22 @@ def list_products(quote="USD"):
 ANCHOR_COINS = ("BTC", "ETH")
 
 
-def scout_coins(products, n, min_volume=5_000_000, why=None):
+def scout_coins(products, n, min_volume=5_000_000, why=None, recent=None, rng=None):
     """The bot's own coin pick for a new session: liquid coins (enough daily volume to trade without big spreads)
     that are moving, skipping stablecoins. Today's move counts, but only up to 3x, so a quiet but very busy coin
     still competes and one wild, thin coin can't outweigh everything. One place is kept for BTC or ETH when picking
-    3 or more, so the farm always has a steady, liquid market to learn on. why (a dict) gets each pick's reason."""
+    3 or more, so the farm always has a steady, liquid market to learn on. why (a dict) gets each pick's reason.
+    recent: coins it picked last time, which count for a little less, and a dash of chance (rng) breaks near-ties, so
+    the farm gets to learn on new markets instead of the same few every time."""
     pool = [d for d in products if d["coin"] not in STABLES and (d["volume_usd"] or 0) >= min_volume
             and d["change_24h"] is not None]
     scored = sorted(((d["volume_usd"] or 0) ** 0.5 * (1 + min(abs(d["change_24h"]), 8) / 4), d["coin"],
                      f"${(d['volume_usd'] or 0) / 1e6:,.0f}M traded today, moved {abs(d['change_24h']):.1f}%")
                     for d in pool)
+    recent = set(recent or [])
+    if recent or rng is not None:
+        r = rng or random.Random()
+        scored = [((sc * (0.75 if c in recent else 1.0) * r.uniform(0.85, 1.2)), c, w) for sc, c, w in scored]
     scored.sort(reverse=True)
     picks = [c for _, c, _ in scored[:n]]
     if n >= 3 and not any(c in ANCHOR_COINS for c in picks):
