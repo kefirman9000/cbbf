@@ -2,6 +2,19 @@
 
 
 
+
+## 1.29.0
+- **Studies on their own processor cores.** Training camps, Auto camp, Free roam's studies, hindsight and backtests now
+  run in separate worker processes, so they use other cores instead of sharing one with the window. Stopping them
+  and their progress bars work as before, and if a worker can't start, the study simply runs inside CBBF as it used
+  to. Settings > Studies on their own cores (on). (The farm's own decisions were measured too: about 6 ms per
+  decision even with 175 bots, so they stay where they are.)
+- **Fix: double-clicking CBBF.pyw could open a second copy of the app** in the background whenever a study ran on
+  another core (the scalp scan did this already); the launcher now only starts the app itself.
+- **One shared farm engine.** 39 farm methods that were identical in CBBF, OBF and SBF (ranking, farm size, families,
+  replays, seasons, health...) now live once in farmcore.py, about 360 lines per app, so a fix there reaches all
+  three apps.
+
 ## 1.28.0
 - **Silent-bot loosening and the farm doctor's checks are shared** with OBF and SBF (one copy in farmcore.py).
 - The farm-protection test now matches the design (contenders take a third of the farm, proven veterans up to a
