@@ -1,6 +1,12 @@
 # Changelog
 
 
+
+## 1.28.0
+- **Silent-bot loosening and the farm doctor's checks are shared** with OBF and SBF (one copy in farmcore.py).
+- The farm-protection test now matches the design (contenders take a third of the farm, proven veterans up to a
+  sixth more).
+
 ## 1.27.0
 - **Farm doctor** (top bar, next to Essentials only): checks the farm and the app every minute and offers a fix
   where there is one: a farm far past its size (one click trims it), most bots unjudged, no bot proven for hours,
