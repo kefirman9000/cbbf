@@ -840,6 +840,7 @@ def tournament_opts(settings):
                 adapt_exits=bool(settings.get("adapt_exits", True)), mut_memory=bool(settings.get("mut_memory", True)),
                 proven_only=bool(settings.get("proven_only", True)), keep_veterans=bool(settings.get("keep_veterans", True)), keep_variety=bool(settings.get("keep_variety", True)), proven_exam=bool(settings.get("proven_exam", True)),
                 proven_trades=int(settings.get("proven_trades", 8) or 0),
+                standin_n=int(settings.get("standin_n", 3) or 0), standin_size=float(settings.get("standin_size", 0.5) or 0.5),
                 time_habits=bool(settings.get("time_habits", True)), scale_out=bool(settings.get("scale_out", True)),
                 agree_sizing=bool(settings.get("agree_sizing", True)),
                 luck_check=bool(settings.get("luck_check", True)))
@@ -2149,6 +2150,12 @@ class Tournament(FarmMixin):
         gate = bool(self.o.get("proven_only", True))
         # proven only: just the winning bots with a real track record decide (shaky ones never do)
         active = [v for v in self.active if self.proven(v)]
+        standin = False
+        if gate and not active:
+            # nobody is proven yet: the best few winners stand in, at a smaller size, until one is
+            active = self.standins()
+            standin = bool(active)
+        self.standin_on = standin
         slowed = [] if gate else list(self.slowed)
         bw = sw = bs = ss = 0.0
         act_buy = act_sell = False
@@ -2192,8 +2199,8 @@ class Tournament(FarmMixin):
                 self.add_cool[c] = self.o["add_every"]
                 self.kind[c] = "add"
                 avg = sum(self.info[id(v)]["weight"] * self.info[id(v)]["stake"] for v in holders) / hw
-                return "buy", 0.5 * avg
-        return sig, mult
+                return "buy", 0.5 * avg * (float(self.o.get("standin_size", 0.5) or 0.5) if standin else 1.0)
+        return sig, (mult * float(self.o.get("standin_size", 0.5) or 0.5) if standin and sig else mult)
 
 
     def _board(self):
