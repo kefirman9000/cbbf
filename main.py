@@ -61,7 +61,7 @@ from decimal import Decimal
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 import engine as E
-from farmcore import FarmAppMixin, LIMIT_SETTINGS  # safety limits and the farm doctor, shared by the apps
+from farmcore import CoreRunner, FarmAppMixin, LIMIT_SETTINGS  # safety limits and the farm doctor, shared by the apps
 
 # ---- Update settings: change to your GitHub "user/repo" after publishing ----
 UPDATE_REPO = "kefirman9000/cbbf"
@@ -197,6 +197,8 @@ SETTING_GROUPS = [
         ("learn_losses", "Learn from its own losses: a bot takes on a never-rule that would have stopped several of its "
                          "losing trades (and few winners)", bool),
         ("multicore", "Learn on several processor cores at once at the start (faster warm-up)", bool),
+        ("study_cores", "Studies on their own cores: training camps, Free roam's studies, hindsight and backtests run in "
+                        "separate processes, so they use other processor cores and the window stays smooth", bool),
         ("roam_reuse", "Free roam studies each stretch of history it downloads this many times before downloading a "
                        "new one (1 = always new). Only the first visit can promote bots (exams, graduates); repeat "
                        "visits only teach", int),
@@ -687,6 +689,7 @@ def read_version():
 
 class App(FarmAppMixin):
     def __init__(self, root, tray=False):
+        self.cores = CoreRunner(enabled=lambda: bool(self.settings.get("study_cores", True)))  # studies on other cores
         self.tray_mode, self.tray = bool(tray), None  # tray: started in the background (icon by the clock)
         # Background learning (Free roam, Slow farm, Training camp) shares Python with the window. Handing control
         # back more often keeps the window responsive while they crunch numbers (default is every 5 ms).
@@ -968,6 +971,7 @@ class App(FarmAppMixin):
         if self.tray is not None:
             self.tray.stop()
         self._gone = True
+        self.cores.shutdown()  # (a study still running in another process ends too)
         self.root.destroy()
 
     def on_shutdown(self):
@@ -1135,7 +1139,7 @@ class App(FarmAppMixin):
             opts = E.opts_for_bars(opts, info["gran"])
         fee, slip = E.cost_model(self.settings)
         self.camp_status = f"Auto camp: a practice farm is living through {self._when(info['start'], True)} ({info['bars']:,} candles)"
-        res = E.train_farm(closes, extra, opts, cap=20, passes=1, exam_frac=0.25, seed_genes=seeds,
+        res = self.cores.call(E.train_farm, closes, extra, opts, cap=20, passes=1, exam_frac=0.25, seed_genes=seeds,
                            start_cash=self.start_cash, fee=fee, pct=self.settings["trade_pct"] / 100,
                            evolve=int(self.settings["evolve_every"]), params=self.settings["params"],
                            stop=lambda: self.tourn is not t or not self.cfg.get("auto_camp") or bool(self.cfg.get("essentials")))
@@ -1194,7 +1198,7 @@ class App(FarmAppMixin):
                 closes, extra, info = self._roam_pick(_r.Random(), prefer=gran)
                 if info.get("revisit") or info.get("gran") != gran:
                     return  # only first visits at their own candle size count as exams
-                out = [(v, E.backtest_bot(v, closes, extra, cash, fee, pct, slip)) for v in picks]
+                out = [(v, self.cores.call(E.backtest_bot, v, closes, extra, cash, fee, pct, slip)) for v in picks]
 
                 def apply():
                     if self.tourn is not t:
@@ -5566,7 +5570,7 @@ class App(FarmAppMixin):
             res = []
             for b in hof:
                 try:
-                    r = E.backtest_bot(b, closes, extra, self.start_cash, fee, pct, slip)
+                    r = self.cores.call(E.backtest_bot, b, closes, extra, self.start_cash, fee, pct, slip)
                     res.append((E.bot_key(b), b, r))
                 except Exception:
                     continue
@@ -5841,7 +5845,7 @@ class App(FarmAppMixin):
                 try:
                     closes, extra, info = self.load_stretch(coins, gran, a, b, note, self.BT_MAX)
                     note(f"Testing on {info['bars']:,} candles...")
-                    r = E.backtest_bot(src[1], closes, extra, cash, fee, pct, slip)
+                    r = self.cores.call(E.backtest_bot, src[1], closes, extra, cash, fee, pct, slip)
                     t = next(iter(extra.values()))["t"]
                     self.q.put(("call", lambda: show(src, r, closes, gran, info, t)))
                 except Exception as e:
@@ -6048,7 +6052,7 @@ class App(FarmAppMixin):
         def work():
             for b in hof:
                 try:
-                    res.append((b, E.backtest_bot(b, closes, extra, cash, fee, pct, slip)))
+                    res.append((b, self.cores.call(E.backtest_bot, b, closes, extra, cash, fee, pct, slip)))
                 except Exception:
                     continue
             self.q.put(("call", fill))
@@ -6256,7 +6260,7 @@ class App(FarmAppMixin):
                         limit_for(n_pass))
                     if info["bars"] < 300:
                         raise RuntimeError(f"only {info['bars']} candles in that period: pick a longer period or smaller candles")
-                    res = E.train_farm(closes, extra, opts, cap=cap, passes=n_pass, exam_frac=ex, seed_genes=seeds,
+                    res = self.cores.call(E.train_farm, closes, extra, opts, cap=cap, passes=n_pass, exam_frac=ex, seed_genes=seeds,
                                        start_cash=cash, fee=fee, pct=pct, evolve=evolve, params=params,
                                        retire_steps=retire, progress=prog, stop=lambda: st["stop"])
                     res["gran"] = gran
@@ -6855,7 +6859,7 @@ class App(FarmAppMixin):
                 self.roam_check_on(t)
                 if cur:
                     cur["done"] = i + d / max(1, n)
-            out.append((v, E.backtest_bot(v, closes, extra, self.start_cash, fee, self.settings["trade_pct"] / 100, slip,
+            out.append((v, self.cores.call(E.backtest_bot, v, closes, extra, self.start_cash, fee, self.settings["trade_pct"] / 100, slip,
                                           progress=prog,
                                           on_trade=lambda c, tr, ts, nm=names[i]: self._roam_feed(nm, c, tr, ts, "test"))))
 
@@ -6904,7 +6908,7 @@ class App(FarmAppMixin):
         def on_trade(v, c, tr, ts):
             nm = names.get(id(v)) or names.setdefault(id(v), E.bot_nickname(v.key()))
             self._roam_feed(nm, c, tr, ts, "farm")
-        res = E.train_farm(closes, extra, E.tournament_opts(self.settings), cap=20, passes=1, exam_frac=0.25,
+        res = self.cores.call(E.train_farm, closes, extra, E.tournament_opts(self.settings), cap=20, passes=1, exam_frac=0.25,
                            seed_genes=seeds, start_cash=self.start_cash, fee=fee, pct=self.settings["trade_pct"] / 100,
                            evolve=int(self.settings["evolve_every"]), params=self.settings["params"], progress=prog,
                            stop=lambda: self.tourn is not t or not self.cfg.get("roam_on"), on_trade=on_trade)
@@ -7681,7 +7685,7 @@ class App(FarmAppMixin):
 
         def work():
             try:
-                res = E.train_farm(hist, hx, dict(E.tournament_opts(self.settings), risk_caps=dict(E.SLOW_RISK), window=72),
+                res = self.cores.call(E.train_farm, hist, hx, dict(E.tournament_opts(self.settings), risk_caps=dict(E.SLOW_RISK), window=72),
                                    cap=len(t.vars), passes=2, exam_frac=0.2,
                                    seed_genes=seeds, start_cash=t.start_cash, fee=fee, pct=t.pct, evolve=24,
                                    params=self.settings["params"], retire_steps=24 * 14, progress=prog)
@@ -12948,6 +12952,7 @@ class App(FarmAppMixin):
                 pass
         try:
             self._gone = True
+            self.cores.shutdown()  # (a study still running in another process ends too)
             self.root.destroy()
         except Exception:
             pass
