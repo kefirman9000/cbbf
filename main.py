@@ -61,6 +61,7 @@ from decimal import Decimal
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 import engine as E
+from farmcore import FarmAppMixin, LIMIT_SETTINGS  # safety limits and the farm doctor, shared by the apps
 
 # ---- Update settings: change to your GitHub "user/repo" after publishing ----
 UPDATE_REPO = "kefirman9000/cbbf"
@@ -134,6 +135,7 @@ SETTING_GROUPS = [
                          "Safety stops still sell at any time (0 = off)", float),
         ("daily_loss", "Daily loss limit: stop trading for the rest of the day if the account falls this % since "
                        "midnight. Open coins are kept, not sold (0 = off). The TODAY tile shows how close you are", float),
+        *LIMIT_SETTINGS,
         ("max_spread_pct", "Thin-market filter: LIVE buys skip a coin when the gap between its bid and ask is wider than "
                            "this % of its price (thin coins fill badly). Example: 1 (0 = off)", float),
         ("bot_allowance", "Allowance per bot: the most of your starting money that one bot's buy votes may have tied up "
@@ -683,7 +685,7 @@ def read_version():
         return "0.0.0"
 
 
-class App:
+class App(FarmAppMixin):
     def __init__(self, root, tray=False):
         self.tray_mode, self.tray = bool(tray), None  # tray: started in the background (icon by the clock)
         # Background learning (Free roam, Slow farm, Training camp) shares Python with the window. Handing control
@@ -867,6 +869,7 @@ class App:
         try:
             if not t.restore(d.get("farm")):
                 return None
+            t.cap = int(self.settings["max_bots"])  # loading stretches the size to fit everyone: back to your setting
             gone = t.trim_to_cap()  # graduates and designed eggs could push a farm past its size before 1.20.5
             if gone:
                 self.q.put(("log", (f"Your farm had grown past its size of {t.cap}; {gone} bots that couldn't be judged or "
@@ -1607,6 +1610,7 @@ class App:
         self.ess_btn = tk.Button(header, command=self.toggle_essentials, relief="flat", bd=0, padx=10, pady=3,
                                  cursor="hand2", font=("", 9, "bold"))
         self.ess_btn.pack(side="right", padx=(0, 8))
+        self.build_doctor_button(header)
         Tip(self.ess_btn, "Essentials only: switches off everything that downloads extra history or works the disk in "
                           "the background (Free roam, Auto camp, the Slow farm, background exams, the economic "
                           "calendar refresh, weekly backups). Normal trading and its prices keep running.")
@@ -9092,6 +9096,8 @@ class App:
 
     def buy(self, c, px, reason="signal", mult=1.0):
         spend = self.trade_size(c, mult)
+        if self.limit_blocked(c, spend):
+            return
         if self.live:
             if spend < MIN_LIVE_ORDER:
                 return
@@ -9128,6 +9134,8 @@ class App:
         self.log_trade("sell", c, qty, px, proceeds, pl, reason)
 
     def log_trade(self, side, c, qty, px, usd, pl, reason):
+        if side == "sell" and pl is not None:
+            self.limit_note_close(pl)
         row = dict(time=datetime.now().isoformat(timespec="seconds"), mode="live" if self.live else "paper",
                    side=side, coin=c, qty=round(qty, 8), price=round(px, 6), usd=round(usd, 2),
                    pl="" if pl is None else round(pl, 2), reason=reason, who=self.pending_who.pop(c, ""))
@@ -10927,7 +10935,10 @@ class App:
                             stats = None
                     if prices or stats:
                         self.q.put(("watch", (prices, stats)))
-                except Exception:
+                except Exception as e:
+                    if isinstance(e, getattr(E, "NeedLogin", ())) or getattr(e, "code", None) in (401, 403):
+                        time.sleep(30)  # not logged in (or the key was rejected): wait quietly, it's not an error
+                        continue
                     E.note_error("loop")
                 time.sleep(20 if self._iconic else 5)
         self._watch_thread = threading.Thread(target=loop, daemon=True)
